@@ -1,0 +1,2 @@
+# FFmpeg patches are applied by GNU patch in MSYS2; keep their LF endings.
+*.patch text eol=lf

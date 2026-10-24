@@ -1,0 +1,73 @@
+name: Bug report
+description: Something in Refarter doesn't work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. The details below help us reproduce the problem on our own PCs.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: |
+        1. Chose the game window as the source and enabled replay
+        2. Pressed the save shortcut in game
+        3. Expected a clip, but nothing was saved
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Refarter version
+      description: Shown in the bottom-right corner of the window, for example "refarter v1.0.0".
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How do you run it?
+      options:
+        - Installer
+        - Portable zip
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version and build
+      description: Press Win+R and run `winver`, for example "Windows 11 24H2, build 26100.4061".
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      description: For example "NVIDIA GeForce RTX 3060 Ti, driver 581.57". On laptops, name both GPUs.
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Recording settings
+      description: From the recording page. Leave out what you don't know.
+      value: |
+        - Source (game window or monitor, and the game):
+        - Fullscreen, borderless or windowed:
+        - Resolution, frame rate, quality, codec:
+        - Replay length:
+        - Desktop audio, microphone, Discord:
+  - type: textarea
+    id: log
+    attributes:
+      label: Diagnostic log and crash dump
+      description: |
+        If you can, turn on **settings → app → diagnostic logging**, reproduce the problem, and attach `session.log` from `%LOCALAPPDATA%\Refarter\logs`. It contains no window titles, file names or key presses.
+        If Refarter crashed, attach the newest `.dmp` file from `%LOCALAPPDATA%\Refarter\crashes` (zip it if GitHub refuses the file type). Unlike the log, a dump can contain bits of window titles, clip names or folder paths that Refarter had in memory; attach it only if you are fine with that. If there is no dump, open Event Viewer → Windows Logs → Application and copy the "Application Error" entry for Refarter.exe.
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else?
+      description: Screenshots, a short clip, or whether it worked in an earlier version.

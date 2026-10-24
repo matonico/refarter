@@ -1,0 +1,8 @@
+/build/
+# FFmpeg, dav1d and their build tools from scripts/build-ffmpeg.ps1.
+/.deps/
+/out/
+/.vs/
+*.user
+# Side-by-side crops from perf/compare_video.ps1 are large; share them directly.
+/perf/results/*/crops/

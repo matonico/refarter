@@ -1,0 +1,48 @@
+name: windows build
+
+# Only merged work is built: every feature branch is tested locally before
+# its pull request is merged, and Actions minutes are limited.
+on:
+  push:
+    branches: [main, 'release/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: release x64
+    runs-on: windows-2022
+    timeout-minutes: 45 # The first FFmpeg build takes a while; later runs restore it.
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The player's static FFmpeg and dav1d: rebuilt only when the script
+      # (versions, hashes, options) or its FFmpeg patch changes. Uses the runner's MSYS2.
+      - name: restore ffmpeg
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .deps/ffmpeg
+            .deps/downloads/*.tar.xz
+          key: ffmpeg-${{ hashFiles('scripts/build-ffmpeg.ps1', 'scripts/ffmpeg-*.patch') }}
+
+      - name: ffmpeg
+        run: .\scripts\build-ffmpeg.ps1
+
+      - name: configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+
+      - name: build
+        run: cmake --build build --config Release --parallel
+
+      - name: unit tests
+        run: ctest --test-dir build -C Release --output-on-failure --no-tests=error

@@ -1,0 +1,91 @@
+--- a/libavcodec/mf_utils.c
++++ b/libavcodec/mf_utils.c
+@@ -549,12 +549,15 @@
+ 
+ // Find and create a IMFTransform with the given input/output types. When done,
+ // you should use ff_free_mf() to destroy it, which will also uninit COM.
++// Candidates before index "first" are skipped, so a caller can move on to the
++// next MFT when one fails later; AVERROR_ENCODER_NOT_FOUND means none are left.
+ int ff_instantiate_mf(void *log,
+                       MFFunctions *f,
+                       GUID category,
+                       MFT_REGISTER_TYPE_INFO *in_type,
+                       MFT_REGISTER_TYPE_INFO *out_type,
+                       int use_hw,
++                      int first,
+                       IMFTransform **res)
+ {
+     HRESULT hr;
+@@ -593,7 +596,14 @@
+     }
+ 
+     *res = NULL;
+-    for (n = 0; n < num_activate; n++) {
++    if (first >= num_activate) {
++        for (n = 0; n < num_activate; n++)
++            IMFActivate_Release(activate[n]);
++        CoTaskMemFree(activate);
++        // mf_close owns MF/COM cleanup, including failed initialisation.
++        return AVERROR_ENCODER_NOT_FOUND;
++    }
++    for (n = first; n < num_activate; n++) {
+         if (log)
+             av_log(log, AV_LOG_VERBOSE, "activate MFT %d\n", n);
+         hr = IMFActivate_ActivateObject(activate[n], &IID_IMFTransform,
+--- a/libavcodec/mf_utils.h
++++ b/libavcodec/mf_utils.h
+@@ -188,7 +188,7 @@
+ int ff_instantiate_mf(void *log, MFFunctions *f, GUID category,
+                       MFT_REGISTER_TYPE_INFO *in_type,
+                       MFT_REGISTER_TYPE_INFO *out_type,
+-                      int use_hw, IMFTransform **res);
++                      int use_hw, int first, IMFTransform **res);
+ void ff_free_mf(MFFunctions *f, IMFTransform **mft);
+ 
+ #endif
+--- a/libavcodec/mfenc.c
++++ b/libavcodec/mfenc.c
+@@ -64,6 +64,7 @@
+     int opt_enc_quality;
+     int opt_enc_scenario;
+     int opt_enc_hw;
++    int opt_enc_mft_index;
+     AVD3D11VADeviceContext* device_hwctx;
+ } MFContext;
+ 
+@@ -1203,7 +1204,7 @@
+ }
+ 
+ static int mf_create(void *log, MFFunctions *f, IMFTransform **mft,
+-                     const AVCodec *codec, int use_hw)
++                     const AVCodec *codec, int use_hw, int first)
+ {
+     int is_audio = codec->type == AVMEDIA_TYPE_AUDIO;
+     const CLSID *subtype = ff_codec_to_mf_subtype(codec->id);
+@@ -1226,7 +1227,7 @@
+         category = MFT_CATEGORY_VIDEO_ENCODER;
+     }
+ 
+-    if ((ret = ff_instantiate_mf(log, f, category, NULL, &reg, use_hw, mft)) < 0)
++    if ((ret = ff_instantiate_mf(log, f, category, NULL, &reg, use_hw, first, mft)) < 0)
+         return ret;
+ 
+     return 0;
+@@ -1256,7 +1257,8 @@
+ 
+     c->main_subtype = *subtype;
+ 
+-    if ((ret = mf_create(avctx, &c->functions, &c->mft, avctx->codec, use_hw)) < 0)
++    if ((ret = mf_create(avctx, &c->functions, &c->mft, avctx->codec, use_hw,
++                         use_hw ? c->opt_enc_mft_index : 0)) < 0)
+         return ret;
+ 
+     if ((ret = mf_unlock_async(avctx)) < 0)
+@@ -1461,6 +1463,7 @@
+ 
+     {"quality",       "Quality", OFFSET(opt_enc_quality), AV_OPT_TYPE_INT, {.i64 = -1}, -1, 100, VE},
+     {"hw_encoding",   "Force hardware encoding", OFFSET(opt_enc_hw), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VE},
++    {"mft_index",     "Index of the first hardware MFT to try", OFFSET(opt_enc_mft_index), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, VE},
+     {NULL}
+ };
+ 

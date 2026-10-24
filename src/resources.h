@@ -1,0 +1,5 @@
+#pragma once
+#define IDI_REFARTER 101
+#define IDW_SAVE_CHIME 102
+#define IDR_CONFIG_TEMPLATE 103
+#define IDW_FAILED_CHIME 104

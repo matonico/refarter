@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Common problems
+    url: https://github.com/matonico/Refarter#faq
+    about: SmartScreen warnings, a shortcut that doesn't save, black clips, Windows "N" editions, and where files, logs and crash dumps live.

@@ -1,0 +1,30 @@
+#include "resources.h"
+#include "version.h"
+#include <winver.h>
+IDI_REFARTER ICON "refarter.ico"
+IDW_SAVE_CHIME WAVE "save-chime.wav"
+IDW_FAILED_CHIME WAVE "failed-chime.wav"
+IDR_CONFIG_TEMPLATE RCDATA "refarter.ini"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION REFARTER_VERSION_MAJOR, REFARTER_VERSION_MINOR, REFARTER_VERSION_PATCH, 0
+PRODUCTVERSION REFARTER_VERSION_MAJOR, REFARTER_VERSION_MINOR, REFARTER_VERSION_PATCH, 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "ProductName", "Refarter"
+            VALUE "FileDescription", "Refarter"
+            VALUE "OriginalFilename", "Refarter.exe"
+            VALUE "FileVersion", REFARTER_VERSION_FULL_STRING
+            VALUE "ProductVersion", REFARTER_VERSION_FULL_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
