@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cwctype>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -20,6 +21,20 @@ inline std::wstring friendlySourceName(std::wstring_view title, std::wstring_vie
     std::wstring name(title.empty() ? trim(executable) : title);
     name = lower(name);
     return name;
+}
+
+// The app in front when a whole-monitor clip or screenshot is requested.
+struct ForegroundApp {
+    bool listed = false;    // Its executable is on the auto-capture list.
+    bool onMonitor = false; // Its window is on the recorded monitor.
+    std::wstring title, executable;
+};
+
+// A whole-monitor save is named after the game in front, as a capture of its window would be, when the user listed it
+// and it is on the recorded monitor. Otherwise (nothing, Refarter, another app or monitor in front) after the monitor.
+inline std::wstring monitorSaveName(std::wstring_view monitor, const std::optional<ForegroundApp>& front) {
+    if (front && front->listed && front->onMonitor) return friendlySourceName(front->title, front->executable);
+    return lower(std::wstring(monitor));
 }
 
 struct SourceName { std::wstring title, executable; };

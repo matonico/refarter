@@ -2,6 +2,7 @@
 
 #include "clip_library.h"
 #include "clip_selection.h"
+#include "player/clip_preview.h"
 
 #include "theme.h"
 
@@ -34,6 +35,7 @@ public:
     static constexpr WORD clipMenu = 0x8003;   // target() and menuPoint(): show the clip's menu.
     static constexpr WORD noteChanged = 0x8004; // note() changed: repaint the strip under the grid.
     static constexpr WORD askChanged = 0x8005;  // The question's "don't ask again" box was used: read askBeforeBinning().
+    static constexpr WORD coloursChanged = 0x8006; // A game colour arrived or changed: read gameColour() again.
 
     const std::filesystem::path& target() const { return target_; }
     // The line shown under a clip's name ("yesterday · 21:42"), or empty for a clip not listed.
@@ -55,6 +57,7 @@ public:
     void favouriteSelection(std::optional<bool> add = std::nullopt); // Adds the mark to all, or removes it when all have it (or as told).
     bool copySelection();       // Puts the files on the clipboard.
     void setOpenClip(const std::filesystem::path& path) { open_ = path; } // The clip open in the player: never binned.
+    const std::filesystem::path& openClip() const { return open_; }
     void setTrimSource(const std::filesystem::path& path) { pendingTrimSource_ = path; } // Protected through trim compression.
     void say(std::wstring text) { showNote(std::move(text)); } // A short note beside the folder size.
     // Every clip in the folder, newest first, as of the last scan (compressed copies and favourites included).
@@ -76,6 +79,17 @@ public:
     // Renames a clip's file (the player's rename too): checks the name, keeps its star and its folder. Returns what
     // went wrong (empty on success or when nothing changed); `renamed` is the new file, or empty.
     std::wstring renameClip(const std::filesystem::path& path, const std::wstring& text, std::filesystem::path& renamed);
+    // A game window's clip was saved as `game`: its folder shows the icon of `executable` (game_icons.h). The library
+    // worker writes it down and reads icons; the tile keeps the plain folder mark until one has arrived.
+    void rememberGame(const std::wstring& game, const std::filesystem::path& executable);
+    // Game colours (Settings → app): a folder's edge and a tile's hover outline take the colour of its game's icon. On,
+    // icons are also read for the games of clip tiles, not only for folders.
+    void setGameColours(bool on);
+    // The colour of a clip's game (for the player's progress bar), while game colours are on and its icon gives one.
+    std::optional<COLORREF> gameColour(const std::filesystem::path& clip) const;
+    // The auto-capture list (label → executable): folders of listed games show the icon even before a clip of them
+    // was saved from the game's window. Given again whenever the list changes; folders still without one are asked anew.
+    void setListedGames(const std::vector<std::pair<std::wstring, std::wstring>>& games);
     // A new file made from `from` (a trim or a compressed copy) goes into the same folder once a scan lists it.
     void inheritSource(const std::filesystem::path& clip, const std::filesystem::path& from);
     // Folders: the tab's clips sorted by game. The overview shows a tile per folder; opening one shows its clips under
@@ -111,6 +125,14 @@ public:
     // folder. Empty shows everything. count() is then the number of matches.
     void setSearch(const std::wstring& text);
     bool searching() const { return !search_.empty(); }
+    // The sort menu: the order of the tiles (and of the folders, by their first clip), and a date filter, in every
+    // tab, folder and search. Sorting by length asks the library worker for lengths not known yet and sorts again
+    // once they have all arrived; until then those clips follow the others.
+    void setOrder(ClipOrder order);
+    ClipOrder order() const { return order_; }
+    void setPeriod(ClipPeriod period);
+    ClipPeriod period() const { return period_; }
+    bool filtering() const { return period_ != ClipPeriod::Any; }
     // Tiles on show: none while an open folder has no match, although count() is not zero.
     bool hasTiles() const { return items() > 0; }
     // Focus is moving to the grid by a key (the search field's Enter or Down): show the focus border on the keyboard place.
@@ -126,8 +148,9 @@ private:
     struct Details { ClipFile clip; std::optional<std::uint64_t> duration; };
     struct Folder {
         std::wstring key, name; // key: the game in lower case, or "*" for clips without one ("other").
-        std::vector<ClipFile> covers; // Its newest clips, up to four: shown 2 × 2 on the tile; the first gives the date.
+        std::vector<ClipFile> covers; // Its first clips in the library's order, up to four: shown 2 × 2 on the tile.
         std::size_t count = 0;
+        FILETIME newest{};            // Its newest clip's time: the date on the tile, whatever the order.
     };
     struct PendingSource { std::filesystem::path clip; std::wstring source; int scans = 3; };
 
@@ -188,6 +211,15 @@ private:
     void requestThumbnails(int first, int last);
     void paint(HDC dc);
     void clearThumbnails();
+    void askIcons();   // Folder icons not asked for yet, for the overview's folders.
+    void clearIcons();
+    // Hover preview: the pointer resting on a clip's picture asks for a few of its keyframes (player::ClipPreview), and
+    // moving across the picture shows the one for that place. Mouse only; keyboard focus keeps the thumbnail.
+    void hoverPreview(int index, POINT point);
+    void startPreview();
+    void clearPreview();
+    void receivePreview();
+    HBITMAP previewPicture(int index) const; // The picture to show on tile `index` now, or null for the thumbnail.
 
     HWND window_ = nullptr;
     theme::BackBuffer buffer_; // Paint buffer, kept between paints.
@@ -220,6 +252,9 @@ private:
     std::wstring favouritesError_;
     ClipView view_ = ClipView::All;
     std::wstring search_; // Trimmed; empty when nothing is searched for.
+    ClipOrder order_;
+    ClipPeriod period_ = ClipPeriod::Any;
+    std::unordered_set<std::wstring> lengthsAsked_; // Clips whose length the worker is reading for the order.
     bool savingFavourite_ = false, pressedFavourite_ = false, starHover_ = false;
     bool moreHover_ = false, pressedMore_ = false;
     bool nameHover_ = false, pencilHover_ = false, pressedPencil_ = false;
@@ -244,6 +279,19 @@ private:
     std::unordered_map<std::wstring, std::size_t> index_;
     std::unordered_map<std::wstring, Thumbnail> thumbnails_;
     std::unordered_set<std::wstring> missing_; // Windows has no thumbnail for these.
+    std::unordered_map<std::wstring, HBITMAP> icons_; // Folder key → its game's icon (premultiplied, iconSize_ square).
+    std::unordered_set<std::wstring> iconsAsked_;     // Asked once per key and size; a game with a new executable anew.
+    std::unordered_map<std::wstring, std::filesystem::path> rememberedGames_; // This session's saves: key → executable.
+    std::unordered_map<std::wstring, COLORREF> accents_; // Folder key → the colour its icon gives (game_icons.h).
+    int iconSize_ = 0;
+    bool gameColours_ = true;
+    std::optional<COLORREF> tileColour(int index) const; // The game colour of a tile, while game colours are on.
+    std::unique_ptr<player::ClipPreview> preview_; // Made on the first preview; its thread sleeps between requests.
+    std::filesystem::path previewClip_;            // The clip asked for (or about to be, while the pointer rests).
+    std::uint64_t previewRequest_ = 0;             // 0 until it was asked for.
+    std::vector<HBITMAP> previewPictures_;         // Left to right across the picture; null until decoded.
+    SIZE previewSize_{};
+    int previewSlice_ = -1;                        // The slice under the pointer, -1 while it is off the picture.
     std::unordered_map<std::wstring, Details> details_;
     // Geometry in pixels.
     int columns_ = 1, tileWidth_ = 0, thumbHeight_ = 0, tileHeight_ = 0, gap_ = 0, pad_ = 0, content_ = 0, scroll_ = 0;

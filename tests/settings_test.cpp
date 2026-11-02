@@ -47,9 +47,11 @@ int main() {
     changed.clipFolder = L"D:\\Clips \u00fcber alles";
     changed.smallTiles = true;
     changed.groupFolders = true;
+    changed.clipOrder = {ClipSort::Length, false};
     changed.askBeforeBinning = false;
     changed.playerVolume = 35;
     changed.compressCopyAfterTrim = true;
+    changed.gameColours = false;
     changed.closeToTray = true;
     changed.startWithWindows = true;
     changed.startMinimised = false;
@@ -82,7 +84,7 @@ int main() {
         L"[video]\nresolution = 8k\nfps = 45\nquality = HIGH\nbitrate_mbps = 900\ncodec = vp9\n"
         L"[audio]\ndesktop = maybe\nmicrophone = ON\ndesktop_volume = 300\nmic_volume = 0\nchime_volume = 101\ngate_open_db = -60\ngate_close_db = -50\n"
         L"gate_attack_ms = 1\ngate_hold_ms = 1\ngate_release_ms = 1\n"
-        L"[library]\ndensity = tiny\n"
+        L"[library]\ndensity = tiny\nsort = colour\nsort_order = sideways\n"
         L"[window]\nsidebar = narrow\n"));
     const UserSettings defaults;
     check(bad.replaySeconds == defaults.replaySeconds, "replay length out of range ignored");
@@ -102,11 +104,15 @@ int main() {
     check(!bad.diagnosticLogging, "old settings leave diagnostic logging off");
     check(bad.askBeforeBinning, "old settings still ask before binning");
     check(!bad.compressCopyAfterTrim, "old settings leave compress & copy off");
+    check(bad.gameColours, "old settings show game colours");
     check(bad.autoCapture && bad.autoCapturePrompt, "auto-capture switches default on; the list itself starts empty");
     check(bad.chimePercent == 100, "chime above 100% ignored");
     check(bad.micFilters.gateOpenDb == defaults.micFilters.gateOpenDb &&
           bad.micFilters.gateAttackMs == defaults.micFilters.gateAttackMs, "close above open drops the whole gate set");
     check(!bad.smallTiles, "unknown density is large tiles");
+    check(bad.clipOrder == ClipOrder{}, "an unknown sort or order is newest first");
+    check(readSettings(parseConfig(L"[library]\nsort = name\n")).clipOrder == ClipOrder{ClipSort::Name, false},
+          "a sort without its order takes the key's usual direction (names a to z)");
     check(!bad.sidebarCollapsed, "unknown sidebar value is expanded");
     const auto removed = readSettings(parseConfig(L"[audio]\ngame_track = 0\nhide_discord = on\n"));
     check(removed.hideDiscord, "the removed game_track key is ignored and its neighbours still load");

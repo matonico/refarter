@@ -19,8 +19,8 @@ bool same(const std::wstring& a, const std::wstring& b) { return _wcsicmp(a.c_st
 bool clean(const std::wstring& text) { return text.find_first_of(L"\r\n\0", 0, 3) == std::wstring::npos; }
 } // namespace
 
-bool exitedAutoCapture(bool automatic, HANDLE process) {
-    return automatic && process && WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
+bool capturedProcessExited(HANDLE process) {
+    return process && WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
 }
 
 const AutoCaptureGame* AutoCaptureList::find(const std::wstring& path) const {

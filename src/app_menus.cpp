@@ -15,6 +15,23 @@
 
 namespace refarter {
 
+namespace {
+// The source picker's windows, enumerated only while a menu opens: sorted, with a distinct menu label in displayName.
+std::vector<RecordingTarget> runningWindows() {
+    std::vector<RecordingTarget> targets;
+    EnumWindows([](HWND window, LPARAM param) -> BOOL {
+        if (auto target = windowTarget(window)) reinterpret_cast<std::vector<RecordingTarget>*>(param)->push_back(std::move(*target));
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&targets));
+    std::stable_sort(targets.begin(), targets.end(), [](const auto& a, const auto& b) { return a.displayName < b.displayName; });
+    std::vector<SourceName> names;
+    for (const auto& target : targets) names.push_back({target.title, target.name});
+    auto labels = sourceLabels(names);
+    for (size_t i = 0; i < targets.size(); ++i) targets[i].displayName = std::move(labels[i]);
+    return targets;
+}
+} // namespace
+
 void App::chooseResolution() {
     PopupMenu styled;
     const auto menu = styled.root;
@@ -111,19 +128,10 @@ void App::chooseCodec() {
 }
 
 void App::chooseSource() {
-    std::vector<RecordingTarget> targets;
-    EnumWindows([](HWND window, LPARAM param) -> BOOL {
-        if (auto target = windowTarget(window)) reinterpret_cast<std::vector<RecordingTarget>*>(param)->push_back(std::move(*target));
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&targets));
-    std::stable_sort(targets.begin(), targets.end(), [](const auto& a, const auto& b) { return a.displayName < b.displayName; });
-    std::vector<SourceName> names;
-    for (const auto& target : targets) names.push_back({target.title, target.name});
-    auto labels = sourceLabels(names);
+    auto targets = runningWindows();
     PopupMenu styled;
     const auto menu = styled.root;
     for (size_t i = 0; i < targets.size(); ++i) {
-        targets[i].displayName = std::move(labels[i]);
         // Games on the auto-capture list say so, so the picker shows what starts by itself.
         styled.append(menu, static_cast<UINT>(i + 1),
                       targets[i].displayName + (autoCapture_.find(targets[i].path) ? L" · auto-capture" : L""),
@@ -198,7 +206,7 @@ void App::chooseAudioDevice(bool desktop) {
 }
 
 void App::chooseAutoCapture() {
-    enum { ThisGame = 1, Automatic, Offers, UseAutomatic, FirstGame = 100 };
+    enum { ThisGame = 1, Automatic, Offers, UseAutomatic, FirstGame = 100, FirstRunning = 10'000 };
     PopupMenu styled;
     const auto menu = styled.root;
     const bool game = target_.source.window && !target_.path.empty();
@@ -206,10 +214,22 @@ void App::chooseAutoCapture() {
     // Copies: an auto-start while the menu is open may change the source.
     const auto path = target_.path, label = target_.displayName;
     const auto games = autoCapture_.games;
+    std::vector<RecordingTarget> running;
     const UINT editable = autoCaptureReadable_ ? MFS_ENABLED : MFS_DISABLED;
     if (!autoCaptureReadable_) styled.append(menu, 0, L"the auto-capture list could not be read · nothing is changed", MFS_DISABLED);
     if (game) styled.append(menu, ThisGame, L"auto-capture " + lower(target_.displayName), editable | (listed ? MFS_CHECKED : 0));
-    else if (target_.source.monitor) styled.append(menu, 0, L"a whole monitor is never auto-captured", MFS_DISABLED);
+    else if (target_.source.monitor) {
+        // Listed games name monitor clips (App::saveName); they start replay themselves only after "use auto-capture".
+        // No game window is the source here, so running windows are offered instead, read once as the menu opens.
+        styled.append(menu, 0, L"games on this list also name monitor clips", MFS_DISABLED);
+        running = runningWindows();
+        const auto add = styled.submenu();
+        for (size_t i = 0; i < running.size(); ++i)
+            styled.append(add, static_cast<UINT>(FirstRunning + i), running[i].displayName,
+                          editable | (autoCapture_.find(running[i].path) ? MFS_CHECKED : 0));
+        if (running.empty()) styled.append(add, 0, L"no available game windows · open your game and try again", MFS_DISABLED);
+        styled.append(menu, 0, L"add a running game", MFS_ENABLED, add);
+    }
     else styled.append(menu, 0, L"choose a game window to add it", MFS_DISABLED);
     styled.append(menu, UseAutomatic, L"use auto-capture", canUseAutoCapture() ? MFS_ENABLED : MFS_DISABLED);
     styled.separator(menu);
@@ -224,7 +244,11 @@ void App::chooseAutoCapture() {
     const auto selected = trackMenu(menu, rect.left, rect.bottom);
     if (selected == UseAutomatic) useAutoCapture();
     else if (selected == ThisGame) setAutoCaptured(path, label, !listed);
-    else if (selected >= FirstGame && selected - FirstGame < games.size()) {
+    else if (selected >= FirstRunning && selected - FirstRunning < running.size()) {
+        // A ticked game is removed, as from the list below; the label is the plain name, without the picker's suffixes.
+        const auto& window = running[selected - FirstRunning];
+        setAutoCaptured(window.path, friendlySourceName(window.title, window.name), !autoCapture_.find(window.path));
+    } else if (selected >= FirstGame && selected - FirstGame < games.size()) {
         setAutoCaptured(games[selected - FirstGame].path, {}, false);
     } else if (selected == Automatic) {
         autoCaptureOn_ = !autoCaptureOn_;
@@ -233,6 +257,38 @@ void App::chooseAutoCapture() {
         autoCapturePrompt_ = !autoCapturePrompt_;
         auto_.updateHook();
     }
+}
+
+void App::chooseClipOrder() {
+    enum { FirstSort = 1, First = 10, Second, FirstPeriod = 20 };
+    PopupMenu styled;
+    const auto menu = styled.root;
+    const auto order = clipGrid_.order();
+    for (int i = 0; i < static_cast<int>(std::size(clipSortNames)); ++i)
+        styled.append(menu, FirstSort + i, std::wstring(L"sort by ") + clipSortNames[i], static_cast<int>(order.by) == i ? MFS_CHECKED : MFS_ENABLED);
+    styled.separator(menu);
+    // The key's usual direction first ("newest first", then "oldest first"; "a → z" before "z → a").
+    const bool usual = naturallyDescending(order.by);
+    styled.append(menu, First, clipOrderLabel({order.by, usual}), order.descending == usual ? MFS_CHECKED : MFS_ENABLED);
+    styled.append(menu, Second, clipOrderLabel({order.by, !usual}), order.descending != usual ? MFS_CHECKED : MFS_ENABLED);
+    styled.separator(menu);
+    // The date filter is for this session only, like the search.
+    for (int i = 0; i < static_cast<int>(std::size(clipPeriodNames)); ++i)
+        styled.append(menu, FirstPeriod + i, std::wstring(L"from ") + clipPeriodNames[i],
+                      static_cast<int>(clipGrid_.period()) == i ? MFS_CHECKED : MFS_ENABLED);
+    RECT rect{}; GetWindowRect(control(SortClips), &rect);
+    const auto selected = static_cast<int>(trackMenu(menu, rect.left, rect.bottom));
+    if (selected >= FirstSort && selected < FirstSort + static_cast<int>(std::size(clipSortNames))) {
+        const auto by = static_cast<ClipSort>(selected - FirstSort);
+        state_.clipOrder = {by, by == order.by ? order.descending : naturallyDescending(by)};
+    } else if (selected == First || selected == Second) {
+        state_.clipOrder = {order.by, selected == First ? usual : !usual};
+    } else if (selected >= FirstPeriod && selected < FirstPeriod + static_cast<int>(std::size(clipPeriodNames))) {
+        clipGrid_.setPeriod(static_cast<ClipPeriod>(selected - FirstPeriod));
+        InvalidateRect(control(SortClips), nullptr, FALSE); // Shown as active while a date filter is set.
+        InvalidateRect(window_, nullptr, FALSE);           // The empty state's wording follows the filter.
+    }
+    clipGrid_.setOrder(state_.clipOrder);
 }
 
 UINT App::trackMenu(HMENU menu, int x, int y) {

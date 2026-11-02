@@ -7,6 +7,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace refarter::player {
@@ -132,7 +133,7 @@ ID3D11Texture2D* VideoConverter::upload(const AVFrame* frame) {
     return uploaded_.get();
 }
 
-bool VideoConverter::convert(const AVFrame* frame, ID3D11Texture2D* target) {
+bool VideoConverter::convert(const AVFrame* frame, ID3D11Texture2D* target, const Crop& part) {
     if (!frame || !target || !videoContext_) return false;
     D3D11_TEXTURE2D_DESC out{};
     target->GetDesc(&out);
@@ -177,7 +178,11 @@ bool VideoConverter::convert(const AVFrame* frame, ID3D11Texture2D* target) {
     colour.Nominal_Range = frame->color_range == AVCOL_RANGE_JPEG ? D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255 :
         D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
     videoContext_->VideoProcessorSetStreamColorSpace(processor_.get(), 0, &colour);
-    const RECT source{0, 0, frame->width, frame->height};
+    // The zoom's part of the frame, at least a pixel wide; the whole frame at 1×.
+    const auto edge = [](float fraction, int size) { return static_cast<LONG>(std::lround(std::clamp(fraction, 0.f, 1.f) * size)); };
+    RECT source{edge(part.left, frame->width), edge(part.top, frame->height), edge(part.right, frame->width), edge(part.bottom, frame->height)};
+    source.right = std::max(source.right, source.left + 1);
+    source.bottom = std::max(source.bottom, source.top + 1);
     const RECT destination{0, 0, static_cast<LONG>(out.Width), static_cast<LONG>(out.Height)};
     videoContext_->VideoProcessorSetStreamSourceRect(processor_.get(), 0, TRUE, &source);
     videoContext_->VideoProcessorSetStreamDestRect(processor_.get(), 0, TRUE, &destination);
@@ -281,7 +286,7 @@ winrt::com_ptr<ID2D1Bitmap1> Renderer::wrap(ID3D11Texture2D* texture) {
     return SUCCEEDED(context_->CreateBitmapFromDxgiSurface(surface.get(), &properties, bitmap.put())) ? bitmap : nullptr;
 }
 
-ID2D1Bitmap1* Renderer::picture(const AVFrame* frame, UINT width, UINT height) {
+ID2D1Bitmap1* Renderer::picture(const AVFrame* frame, UINT width, UINT height, const Crop& part) {
     if (!frame || !width || !height) return nullptr;
     D3D11_TEXTURE2D_DESC desc{};
     if (pictureTexture_) pictureTexture_->GetDesc(&desc);
@@ -291,13 +296,42 @@ ID2D1Bitmap1* Renderer::picture(const AVFrame* frame, UINT width, UINT height) {
         pictureBitmap_ = wrap(pictureTexture_.get());
     }
     if (!pictureBitmap_) return nullptr;
-    // Convert once per picture and size; redraws of the interface reuse it.
-    if (resized || frame != pictureFrame_ || frame->best_effort_timestamp != pictureStamp_) {
-        if (!converter_->convert(frame, pictureTexture_.get())) return nullptr;
+    // Convert once per picture, size and zoomed part; redraws of the interface reuse it.
+    const bool moved = part.left != picturePart_.left || part.top != picturePart_.top || part.right != picturePart_.right || part.bottom != picturePart_.bottom;
+    if (resized || moved || frame != pictureFrame_ || frame->best_effort_timestamp != pictureStamp_) {
+        if (!converter_->convert(frame, pictureTexture_.get(), part)) return nullptr;
         pictureFrame_ = frame;
         pictureStamp_ = frame->best_effort_timestamp;
+        picturePart_ = part;
     }
     return pictureBitmap_.get();
+}
+
+std::optional<std::wstring> Renderer::readPicture(const AVFrame* frame, std::vector<std::uint8_t>& pixels, UINT& width, UINT& height) {
+    if (!frame || frame->width <= 0 || frame->height <= 0) return L"no picture to save yet";
+    width = static_cast<UINT>(frame->width);
+    height = static_cast<UINT>(frame->height);
+    // The whole decoded frame at its own size, never the zoomed part or the window's size.
+    const auto full = createPictureTexture(device_.get(), width, height);
+    const auto staging = createTexture(device_.get(), width, height, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ);
+    if (!full || !staging || !converter_->convert(frame, full.get())) return L"frame not saved · the graphics card could not convert it";
+    winrt::com_ptr<ID3D11DeviceContext> context;
+    device_->GetImmediateContext(context.put());
+    context->CopyResource(staging.get(), full.get());
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) return L"frame not saved · the graphics card did not hand over the picture";
+    std::optional<std::wstring> error;
+    try {
+        // Rows packed to the picture's width: the copy leaves the GPU mapping straight away.
+        pixels.resize(static_cast<std::size_t>(width) * 4 * height);
+        for (UINT y = 0; y < height; ++y)
+            std::memcpy(pixels.data() + static_cast<std::size_t>(y) * width * 4,
+                        static_cast<const std::uint8_t*>(mapped.pData) + static_cast<std::size_t>(y) * mapped.RowPitch, width * 4);
+    } catch (const std::bad_alloc&) {
+        error = L"frame not saved · not enough memory";
+    }
+    context->Unmap(staging.get(), 0);
+    return error;
 }
 
 ID2D1DeviceContext* Renderer::begin() {

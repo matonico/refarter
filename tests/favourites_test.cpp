@@ -1,6 +1,8 @@
 #include "clip_sources.h"
 #include "favourites.h"
+#include "game_icons.h"
 #include <objbase.h>
+#include <winrt/base.h>
 #include <fstream>
 #include <iostream>
 
@@ -74,6 +76,40 @@ int main() {
     check(readClipSources(sourcesFile) == std::optional(ClipSources{}), "a zero-byte sources file reads as empty");
     check(writeClipSources(sourcesFile, games) && readClipSources(sourcesFile) == std::optional(games), "a zero-byte sources file is rewritten");
     std::filesystem::remove(sourcesFile);
+
+    // The executable behind each game folder, and its cached icon.
+    const auto gamesFile = folder / L"games.dat";
+    check(readGameExecutables(gamesFile) == std::optional(GameExecutables{}), "missing game executables start empty");
+    const GameExecutables executables{{L"apex legends", L"C:\\Games\\Apex \"Legends\"\\r5apex.exe"}, {L"caf\u00e9 \U0001F430", L"D:\\x.exe"}};
+    check(writeGameExecutables(gamesFile, executables) && readGameExecutables(gamesFile) == std::optional(executables), "game executables round trip");
+    { std::ofstream junk(gamesFile, std::ios::binary | std::ios::trunc); junk << "nonsense"; }
+    check(!readGameExecutables(gamesFile), "corrupt game executables are reported rather than treated as empty");
+    std::filesystem::remove(gamesFile);
+    const auto icons = folder / L"icons";
+    check(gameIconCachePath(icons, L"C:\\Games\\A.exe", 22) == gameIconCachePath(icons, L"c:\\games\\a.EXE", 22) &&
+          gameIconCachePath(icons, L"C:\\Games\\A.exe", 22) != gameIconCachePath(icons, L"C:\\Games\\A.exe", 33) &&
+          gameIconCachePath(icons, L"C:\\Games\\A.exe", 22) != gameIconCachePath(icons, L"C:\\Games\\B.exe", 22), "one cache file per executable and size");
+    if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        winrt::com_ptr<IWICImagingFactory> wic;
+        CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(wic.put()));
+        wchar_t self[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, self, MAX_PATH);
+        const HBITMAP icon = gameIcon(wic.get(), self, 22, icons);
+        const auto cached = gameIconCachePath(icons, self, 22);
+        BITMAP shape{};
+        check(icon && GetObjectW(icon, sizeof(shape), &shape) && shape.bmWidth == 22 && shape.bmBitsPixel == 32, "an executable's icon at the size asked");
+        check(std::filesystem::exists(cached), "the icon is cached as a PNG");
+        std::error_code error;
+        const auto made = std::filesystem::last_write_time(cached, error);
+        if (icon) DeleteObject(icon);
+        const HBITMAP again = gameIcon(wic.get(), self, 22, icons);
+        check(again && std::filesystem::last_write_time(cached, error) == made, "a cached icon is not extracted again");
+        if (again) DeleteObject(again);
+        check(!gameIcon(wic.get(), folder / L"gone.exe", 22, icons), "a missing executable has no icon");
+        wic = nullptr;
+        CoUninitialize();
+    }
+    std::filesystem::remove_all(icons);
     std::filesystem::remove(folder);
     return failures ? 1 : 0;
 }

@@ -36,15 +36,22 @@ Layout computeLayout(float w, float h, const View& view, const ClipInfo& status)
     l.scale = s;
     const auto d = [s](float value) { return value * s; };
     l.card = {0, 0, w, h};
-    // The trim bar's right side: save, replace, cancel and the "compress & copy" slot. The audio sources need room
-    // between the time and that slot (the icon switches a fixed width, the pill of a plain multi-track file about 110 px):
-    // shorten the compress label, then move its box to its own row.
+    // The trim bar is one row, right to left: save, replace, cancel, the "compress & copy" slot, the mute button with the
+    // volume rail, then the audio sources (the icon switches a fixed width, the pill of a plain multi-track file 110 px)
+    // up to the time. The sources decide what the trim keeps, so they never give way: shorten the compress label, then
+    // move its box to its own row; only below the window's minimum width drop the rail, then the mute button.
+    // The budget counts the same widths and gaps as the placement further down, so the two cannot disagree.
     const float margin = view.fullscreen ? d(28) : d(12);
+    const float button = d(34), volumeRail = d(80), muteAndRail = button + d(4) + volumeRail;
     const float fixedRight = d(72.f + 8 + 72 + 8 + 84 + 10), timeRight = margin + d(38.f + 14 + 132 + 8);
     const int sourceCount = status.toggles ? std::min<int>(static_cast<int>(status.tracks.size()), maxSources) : 0;
     const float groupWidth = sourceCount > 0 ? d(sourceGroupWidth(sourceCount)) : 0;
     const bool pill = !status.toggles && status.tracks.size() > 1;
-    const float roomFor = (w - margin) - fixedRight - timeRight - (sourceCount > 0 ? groupWidth + d(8) : pill ? d(110) : 0);
+    const float pillWidth = d(110); // While trimming; playback lets the pill grow to 180 px.
+    const float sourcesWidth = sourceCount > 0 ? groupWidth : pill ? pillWidth : 0;
+    // What the slot may take: the width less the sources, the mute button with its rail and the 10 px gaps either side of them
+    // (the gap before the time is in timeRight).
+    const float roomFor = (w - margin) - fixedRight - timeRight - sourcesWidth - (muteAndRail + d(10)) - d(10);
     const bool ownRow = view.editing && roomFor < d(104);
     l.compressShort = view.editing && roomFor < d(142);
     const float controlsHeight = d(52), barHeight = view.editing ? d(ownRow ? 102.f : 70.f) : d(26);
@@ -83,11 +90,12 @@ Layout computeLayout(float w, float h, const View& view, const ClipInfo& status)
     l.play = centred(l.controls.left + d(19), cy, d(38), d(38));
     l.time = {l.play.right + d(14), cy - d(12), l.play.right + d(14) + d(view.editing ? 132.f : 112.f), cy + d(12)};
     float x = l.controls.right;
-    const float button = d(34);
     if (!view.editing) {
         l.fullscreen = {x - button, cy - button / 2, x, cy + button / 2};
         x -= button + d(4);
         l.folder = {x - button, cy - button / 2, x, cy + button / 2};
+        x -= button + d(4);
+        l.frame = {x - button, cy - button / 2, x, cy + button / 2};
         x -= button + d(4);
         l.trim = {x - button, cy - button / 2, x, cy + button / 2};
         x -= button + d(14);
@@ -95,6 +103,8 @@ Layout computeLayout(float w, float h, const View& view, const ClipInfo& status)
         x -= d(80) + d(4);
         l.mute = {x - button, cy - button / 2, x, cy + button / 2};
         x -= button + d(10);
+        l.speed = {x - d(50), cy - d(15), x, cy + d(15)}; // "0.25×" at most.
+        x -= d(50) + d(10);
     } else {
         l.save = {x - d(72), cy - d(17), x, cy + d(17)};
         x -= d(72) + d(8);
@@ -109,6 +119,18 @@ Layout computeLayout(float w, float h, const View& view, const ClipInfo& status)
             l.compress = {x - slot, cy - d(17), x, cy + d(17)};
             x -= slot + d(10);
         }
+        // Volume, hidden (no width, never inverted) when it does not fit: the sources keep their room, the rail goes
+        // first, then the mute button.
+        const float room = x - (l.time.right + d(8)) - sourcesWidth;
+        if (room >= button + d(10)) {
+            if (room >= muteAndRail + d(10)) {
+                l.volume = {x - volumeRail, cy - d(10), x, cy + d(10)};
+                l.mute = {l.volume.left - d(4) - button, cy - button / 2, l.volume.left - d(4), cy + button / 2};
+            } else {
+                l.mute = {x - button, cy - button / 2, x, cy + button / 2};
+            }
+            x = l.mute.left - d(10);
+        }
     }
     // Sources to keep while trimming, to play otherwise: icon switches, or the pill of a plain multi-track file.
     if (sourceCount > 0) {
@@ -122,7 +144,7 @@ Layout computeLayout(float w, float h, const View& view, const ClipInfo& status)
             }
         }
     } else if (pill) {
-        const float left = std::max(l.time.right + d(8), x - d(180));
+        const float left = std::max(l.time.right + d(8), x - (view.editing ? pillWidth : d(180)));
         l.track = {left, cy - d(17), std::max(x, left), cy + d(17)}; // Never inverted; no width means hidden.
     }
     const float scx = (l.stage.left + l.stage.right) / 2, scy = middle(l.stage);
@@ -154,12 +176,12 @@ Part hitTest(const Layout& l, const View& view, const ClipInfo& status, float x,
         return Part::Seek;
     }
     const std::pair<const D2D1_RECT_F*, Part> buttons[] = {
-        {&l.play, Part::Play}, {&l.track, Part::Track}, {&l.mute, Part::Mute}, {&l.trim, Part::Trim},
-        {&l.folder, Part::Folder}, {&l.fullscreen, Part::Fullscreen}, {&l.save, Part::Save}, {&l.replace, Part::Replace}, {&l.cancel, Part::Cancel},
-        {&l.compress, Part::CompressCopy}};
+        {&l.play, Part::Play}, {&l.track, Part::Track}, {&l.mute, Part::Mute}, {&l.speed, Part::Speed}, {&l.trim, Part::Trim},
+        {&l.folder, Part::Folder}, {&l.frame, Part::Frame}, {&l.fullscreen, Part::Fullscreen}, {&l.save, Part::Save}, {&l.replace, Part::Replace},
+        {&l.cancel, Part::Cancel}, {&l.compress, Part::CompressCopy}};
     for (const auto& [rect, part] : buttons) if (inside(*rect, x, y)) return part;
     for (int i = 0; i < l.sourceCount; ++i) if (inside(l.sources[i], x, y)) return static_cast<Part>(static_cast<int>(Part::Source0) + i);
-    if (inside(l.volume, x, y, 6 * s)) return Part::Volume;
+    if (width(l.volume) > 0 && inside(l.volume, x, y, 6 * s)) return Part::Volume;
     if (inside(l.stage, x, y) && !(view.fullscreen && (y >= l.bar.top || y < l.head.bottom))) return Part::Stage;
     return Part::None;
 }
@@ -504,14 +526,26 @@ void Painter::draw(ID2D1DeviceContext* dc, IDWriteFactory* write, ID2D1Factory1*
         const float thickness = using_ ? d(6) : d(4), y = middle(l.seek);
         const float px = static_cast<float>(scale.x(playback.position));
         rounded({l.seek.left, y - thickness / 2, l.seek.right, y + thickness / 2}, thickness / 2, rail);
-        if (px > l.seek.left) rounded({l.seek.left, y - thickness / 2, px, y + thickness / 2}, thickness / 2, accent);
+        // The progress in the clip's game colour when it has one (game colours), otherwise the accent.
+        const auto progress = view.tint ? colour(*view.tint) : accent;
+        if (px > l.seek.left) rounded({l.seek.left, y - thickness / 2, px, y + thickness / 2}, thickness / 2, progress);
+        // The A-B loop, in the progress colour: a soft band over its stretch with a tick at each end; A alone is a single tick.
+        if (view.loop.in >= 0) {
+            const float ax = static_cast<float>(scale.x(view.loop.in));
+            if (view.loop.active()) {
+                const float bx = static_cast<float>(scale.x(view.loop.out));
+                rounded({ax, y - d(5), bx, y + d(5)}, d(3), colour(view.tint.value_or(theme::accent), 0.28f));
+                line(bx, y - d(7), bx, y + d(7), progress, d(2));
+            }
+            line(ax, y - d(7), ax, y + d(7), progress, d(2));
+        }
         if (using_) {
             if (view.hoverTime >= 0 && view.pressed != Part::Seek) {
                 const float hx = static_cast<float>(scale.x(view.hoverTime));
                 line(hx, y - thickness / 2, hx, y + thickness / 2, ink, d(2));
                 bubble(view.hoverTime, hx, y - d(10));
             }
-            dc->FillEllipse({{px, y}, d(7), d(7)}, paint(accent));
+            dc->FillEllipse({{px, y}, d(7), d(7)}, paint(progress));
             dc->DrawEllipse({{px, y}, d(7), d(7)}, paint(colour(stageColour, 0.6f)), d(1.5f));
             if (view.pressed == Part::Seek) bubble(playback.position, px, y - d(12));
         }
@@ -593,6 +627,11 @@ void Painter::draw(ID2D1DeviceContext* dc, IDWriteFactory* write, ID2D1Factory1*
         }
     };
 
+    if (width(l.speed) > 0) {
+        // The speed in the accent while it is not 1× (then also silent).
+        pill(l.speed, Part::Speed, false);
+        runs({{speedLabel(view.speed), view.speed == 1 ? ink : accent}}, body_.get(), l.speed, true);
+    }
     if (width(l.track) > 0) {
         pill(l.track, Part::Track, false);
         const auto& name = status.audioLabel;
@@ -641,21 +680,8 @@ void Painter::draw(ID2D1DeviceContext* dc, IDWriteFactory* write, ID2D1Factory1*
             }
             if (!on) seg(-8, -8, 8, 8); // Off: a diagonal slash through the glyph.
         }
-        // Hint over the hovered switch: "<name> on" / "<name> off".
-        const int hovered_ = sourceIndex(view.hover);
-        if (hovered_ >= 0 && hovered_ < l.sourceCount && view.pressed == Part::None) {
-            const bool on = hovered_ < static_cast<int>(status.checked.size()) && status.checked[hovered_];
-            const bool included = on && hovered_ < static_cast<int>(status.included.size()) && status.included[hovered_];
-            const auto label = included ? status.tracks[hovered_] + L" · part of desktop audio" : status.tracks[hovered_] + (on ? L" on" : L" off");
-            const float w = measure(label, small_.get()) + d(16);
-            const float right = std::min(l.group.right, l.controls.right);
-            const D2D1_RECT_F r{right - w, l.group.top - d(30), right, l.group.top - d(8)};
-            rounded(r, d(6), colour(theme::raised));
-            outline(r, d(6), colour(theme::border));
-            text(label, small_.get(), r, ink, DWRITE_TEXT_ALIGNMENT_CENTER);
-        }
     }
-    if (!view.editing) {
+    if (width(l.mute) > 0) { // Hidden when a narrow trim bar has no room.
         {   // Speaker with waves for the level; a cross when muted.
             const auto c = iconButton(l.mute, Part::Mute);
             const float cx = (l.mute.left + l.mute.right) / 2 - d(3), cy = middle(l.mute);
@@ -677,7 +703,7 @@ void Painter::draw(ID2D1DeviceContext* dc, IDWriteFactory* write, ID2D1Factory1*
                 }
             }
         }
-        {   // Volume rail.
+        if (width(l.volume) > 0) {   // Volume rail; the trim bar may show only the mute button.
             const float y = middle(l.volume), level = view.muted ? 0.f : view.volume / 100.f;
             const float x = l.volume.left + width(l.volume) * level;
             rounded({l.volume.left, y - d(2), l.volume.right, y + d(2)}, d(2), rail);
@@ -685,6 +711,23 @@ void Painter::draw(ID2D1DeviceContext* dc, IDWriteFactory* write, ID2D1Factory1*
             const float knob = active(Part::Volume) || view.pressed == Part::Volume ? d(6.5f) : d(5);
             dc->FillEllipse({{x, y}, knob, knob}, paint(view.muted ? muted : accent));
         }
+    }
+    if (l.sourceCount > 0) { // Drawn after the volume controls, so the hint stays on top.
+        // Hint over the hovered switch: "<name> on" / "<name> off".
+        const int hovered_ = sourceIndex(view.hover);
+        if (hovered_ >= 0 && hovered_ < l.sourceCount && view.pressed == Part::None) {
+            const bool on = hovered_ < static_cast<int>(status.checked.size()) && status.checked[hovered_];
+            const bool included = on && hovered_ < static_cast<int>(status.included.size()) && status.included[hovered_];
+            const auto label = included ? status.tracks[hovered_] + L" · part of desktop audio" : status.tracks[hovered_] + (on ? L" on" : L" off");
+            const float w = measure(label, small_.get()) + d(16);
+            const float right = std::min(l.group.right, l.controls.right);
+            const D2D1_RECT_F r{right - w, l.group.top - d(30), right, l.group.top - d(8)};
+            rounded(r, d(6), colour(theme::raised));
+            outline(r, d(6), colour(theme::border));
+            text(label, small_.get(), r, ink, DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+    }
+    if (!view.editing) {
         {   // Trim: scissors in the accent colour.
             iconButton(l.trim, Part::Trim);
             const float cx = (l.trim.left + l.trim.right) / 2, cy = middle(l.trim) - d(1);
@@ -700,6 +743,15 @@ void Painter::draw(ID2D1DeviceContext* dc, IDWriteFactory* write, ID2D1Factory1*
             stroke(-8, 6, -8, -6); stroke(-8, -6, -2, -6); stroke(-2, -6, 0, -3);
             stroke(0, -3, 8, -3); stroke(8, -3, 8, 6); stroke(8, 6, -8, 6);
             stroke(-8, -1, 8, -1);
+        }
+        {   // Save the frame: a camera, its body, lens and viewfinder bump.
+            const auto c = iconButton(l.frame, Part::Frame);
+            const float cx = (l.frame.left + l.frame.right) / 2, cy = middle(l.frame) + d(1);
+            dc->DrawRoundedRectangle({{cx - d(8), cy - d(5), cx + d(8), cy + d(6)}, d(2), d(2)}, paint(c), d(1.5f));
+            dc->DrawEllipse({{cx, cy + d(0.5f)}, d(3), d(3)}, paint(c), d(1.5f));
+            line(cx - d(3.5f), cy - d(5), cx - d(2), cy - d(7.5f), c, d(1.5f));
+            line(cx - d(2), cy - d(7.5f), cx + d(2), cy - d(7.5f), c, d(1.5f));
+            line(cx + d(2), cy - d(7.5f), cx + d(3.5f), cy - d(5), c, d(1.5f));
         }
         {   // Fullscreen corners (inward while fullscreen).
             const auto c = iconButton(l.fullscreen, Part::Fullscreen);

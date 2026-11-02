@@ -66,6 +66,7 @@ void App::openClip(const std::filesystem::path& path) {
     playerOpen_ = true;
     clipGrid_.setOpenClip(path);
     player_.open(path, playerVolume_, clipGrid_.dateOf(path));
+    player_.setTint(clipGrid_.gameColour(path));
     layout();
     SetFocus(control(Player));
     InvalidateRect(window_, nullptr, FALSE);

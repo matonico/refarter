@@ -4,6 +4,8 @@
 #include "player/clip_trim.h"
 #include "player/media.h"
 #include "recycle_bin.h"
+#include "capture/clip_folder.h"
+#include "capture/screenshot.h"
 #include "clip_list.h"
 #include "trim_follow_up.h"
 #include "player/renderer.h"
@@ -18,6 +20,7 @@ extern "C" {
 #include <windowsx.h>
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 
@@ -28,19 +31,15 @@ constexpr wchar_t className[] = L"RefarterClipPlayer";
 constexpr wchar_t renameClass[] = L"RefarterRenameBox";
 constexpr UINT statusChanged = WM_APP + 20;
 constexpr UINT trimFinished = WM_APP + 21;
+constexpr UINT frameSaved = WM_APP + 22; // The engine wrote (or could not write) the current frame: Engine::frameResult.
 constexpr UINT_PTR hideTimer = 1, toastTimer = 2, progressTimer = 3;
 
-enum Kind { Play, Pause, Toggle, Seek, Scrub, StepForward, StepBack, Track, Thumbnails };
+enum Kind { Play, Pause, Toggle, Seek, Scrub, StepForward, StepBack, Track, Thumbnails, SaveFrame };
 struct Command {
     int kind = Play;
     double value = 0;
     int count = 0, width = 0, height = 0;
 };
-
-bool softwareOnly() {
-    wchar_t value[8]{};
-    return GetEnvironmentVariableW(L"REFARTER_PLAYER_SOFTWARE", value, 8) && value[0] == L'1';
-}
 
 // The seek bar, the trim strip and its handles: pressing there drags the playhead or a handle.
 bool onTimeline(Part part) {
@@ -55,6 +54,72 @@ double now() {
 }
 } // namespace
 
+// Writes saved frames as PNGs on a below-normal thread of its own, made on the first save and kept for the player's
+// lifetime, so neither the engine nor closing a clip waits for an encode, and a save asked for just before closing is
+// still written. Each outcome carries its player session; the window shows only its own clip's.
+struct ClipPlayer::FrameWriter {
+    struct Job { std::uint64_t session = 0; std::filesystem::path file; std::vector<std::uint8_t> pixels; UINT width = 0, height = 0; };
+    struct Result { std::uint64_t session = 0; std::wstring text; bool saved = false; };
+
+    explicit FrameWriter(HWND window) : window(window) {}
+    ~FrameWriter() {
+        { std::lock_guard lock(mutex); stop = true; }
+        work.notify_all();
+        if (thread.joinable()) thread.join(); // Pending frames are still written.
+    }
+    void write(Job job) {
+        std::lock_guard lock(mutex);
+        jobs.push_back(std::move(job));
+        if (!thread.joinable()) thread = std::thread([this] { run(); });
+        work.notify_all();
+    }
+    void report(Result result) { // An outcome known without writing (no picture, no folder).
+        { std::lock_guard lock(mutex); results.push_back(std::move(result)); }
+        PostMessageW(window, frameSaved, 0, 0);
+    }
+    std::vector<Result> take() {
+        std::lock_guard lock(mutex);
+        return std::exchange(results, {});
+    }
+
+private:
+    void run() {
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+        winrt::init_apartment(winrt::apartment_type::multi_threaded); // WIC.
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock lock(mutex);
+                work.wait(lock, [this] { return stop || !jobs.empty(); });
+                if (jobs.empty()) break; // Stopping, with nothing left to write.
+                job = std::move(jobs.front());
+                jobs.pop_front();
+            }
+            std::optional<std::wstring> error;
+            try {
+                // Chosen again here, in order: a second save in the same second must not take the first one's name.
+                job.file = capture::nextFreePath(job.file);
+                if (job.file.empty()) error = L"no free file name in the screenshots folder";
+                else error = capture::writePng(job.file, job.pixels.data(), job.width, job.height, job.width * 4);
+            } catch (const std::exception&) {
+                error = L"frame not saved · not enough memory";
+            }
+            // writePng speaks of screenshots; a frame from the player says so in its own words.
+            report({job.session, error ? L"frame not saved · " + std::wstring(error->substr(error->find(L"·") == std::wstring::npos ? 0 : error->find(L"·") + 2))
+                                       : L"frame saved · " + job.file.filename().wstring(), !error});
+        }
+        winrt::uninit_apartment();
+    }
+
+    HWND window;
+    std::mutex mutex;
+    std::condition_variable work;
+    std::deque<Job> jobs;
+    std::vector<Result> results;
+    bool stop = false;
+    std::thread thread;
+};
+
 // Decoding, timing and drawing for one open clip, on its own thread. The window
 // sends commands and its view; the engine reports a Status and posts
 // statusChanged when something the window reacts to has changed.
@@ -67,6 +132,8 @@ struct ClipPlayer::Engine {
     std::deque<Command> commands;
     std::shared_ptr<const ClipInfo> info = std::make_shared<const ClipInfo>();
     Playback playback;
+    std::shared_ptr<FrameWriter> writer; // Saved frames go there to be written; outlives this clip.
+    std::uint64_t session = 0;           // The player session this engine belongs to, for the writer's outcomes.
     HANDLE wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     std::atomic<bool> stop = false;
     std::thread thread;
@@ -76,7 +143,8 @@ struct ClipPlayer::Engine {
     std::thread thumbnailThread;
     std::atomic<bool> thumbnailStop = false;
 
-    Engine(HWND window, std::filesystem::path path, const View& view) : window(window), path(std::move(path)), view(view) {
+    Engine(HWND window, std::filesystem::path path, const View& view, std::shared_ptr<FrameWriter> writer, std::uint64_t session)
+        : window(window), path(std::move(path)), view(view), writer(std::move(writer)), session(session) {
         thread = std::thread([this] { run(); });
     }
     ~Engine() {
@@ -125,7 +193,7 @@ struct ClipPlayer::Engine {
             {
                 // A second decoder of its own: playback never waits for thumbnails.
                 MediaFile file;
-                if (file.open(clip, {shared.get(), false, softwareOnly()})) {
+                if (file.open(clip, {shared.get(), false, softwareOnly(), 1})) { // Single keyframes gain nothing from more.
                     VideoConverter converter(shared.get());
                     for (int i = 0; i < count && !thumbnailStop && !stop; ++i) {
                         const double time = (i + 0.5) * duration / count;
@@ -200,7 +268,7 @@ void ClipPlayer::Engine::run() {
         };
         if (!renderer.create(window, error)) {
             local.error = error;
-        } else if (!media.open(path, {renderer.device(), true, softwareOnly()})) {
+        } else if (!media.open(path, {renderer.device(), true, softwareOnly(), 4})) { // Four software threads: it plays beside a game.
             local.error = media.error();
         } else {
             local.ready = true;
@@ -221,6 +289,7 @@ void ClipPlayer::Engine::run() {
         const bool hasAudio = local.ready && media.audioTracks() > 0 && audio.open();
         bool audioClock = hasAudio;
         double position = 0, wallBase = 0, wallStart = now();
+        double speed = 1; // Applied from the view; other than 1× the wall clock runs scaled and nothing is heard.
         std::vector<Thumbnail> thumbnails;
         std::vector<float> samples(4096 * 2);
         // What the last drawn pass showed, to tell whether another pass would look different.
@@ -231,7 +300,7 @@ void ClipPlayer::Engine::run() {
 
         const auto clock = [&] {
             if (!playing) return position;
-            return audioClock ? audio.clock() : wallBase + (now() - wallStart);
+            return audioClock ? audio.clock() : wallBase + (now() - wallStart) * speed;
         };
         const auto seekTo = [&](double time, bool onFrame) {
             time = std::clamp(time, 0.0, local.duration);
@@ -239,7 +308,7 @@ void ClipPlayer::Engine::run() {
             next = media.next();
             position = onFrame && current ? current.time : time;
             if (hasAudio) audio.flush(position);
-            audioClock = hasAudio && audio.opened();
+            audioClock = hasAudio && audio.opened() && speed == 1;
             wallBase = position;
             wallStart = now();
             stale = false;
@@ -248,8 +317,11 @@ void ClipPlayer::Engine::run() {
         const auto setPlaying = [&](bool on) {
             if (!local.ready || on == playing) return;
             if (on) {
+                // At a trim's out point, at B (or just past it) or at the end: start again at the range's start.
+                const bool looping = !shown.editing && shown.loop.active();
                 const double end = shown.editing ? shown.out : local.duration;
-                if (position >= end - local.frameDuration / 2) seekTo(shown.editing ? shown.in : 0, false);
+                if (looping && loopRestarts(shown.loop, position, local.frameDuration)) seekTo(shown.loop.in, false);
+                else if (position >= end - local.frameDuration / 2) seekTo(shown.editing ? shown.in : looping ? shown.loop.in : 0, false);
                 else if (stale) seekTo(position, true); // Frame steps moved the picture, not the audio.
                 wallBase = position;
                 wallStart = now();
@@ -258,7 +330,7 @@ void ClipPlayer::Engine::run() {
                 wallBase = position;
             }
             playing = on;
-            if (hasAudio) audio.play(on);
+            if (hasAudio) audio.play(on && speed == 1);
             dirty = true;
         };
         // The graphics device was removed or reset: nothing new can be shown, so say so, pause and stop drawing.
@@ -287,6 +359,16 @@ void ClipPlayer::Engine::run() {
                     viewChanged = false;
                     dirty = true;
                 }
+            }
+            if (local.ready && shown.speed != speed) {
+                // From where the picture is now. Between silent speeds only the clock is rebased; back at 1× a seek to
+                // the current picture realigns the audio decoder, which stood still meanwhile.
+                const bool resume = playing;
+                setPlaying(false);
+                speed = shown.speed;
+                if (speed == 1) seekTo(position, false);
+                else audioClock = false; // The paused audio no longer keeps time: the scaled wall clock does.
+                setPlaying(resume);
             }
             const float level = shown.muted ? 0.f : shown.volume / 100.f;
             audio.setVolume(silent ? 0.f : level * level); // Closer to how loudness is heard.
@@ -357,6 +439,31 @@ void ClipPlayer::Engine::run() {
                     setPlaying(resume);
                     break;
                 }
+                case SaveFrame: {
+                    // Paused first, so the file is the picture on screen; written beside the screenshot shortcut's.
+                    setPlaying(false);
+                    std::filesystem::path clip;
+                    { std::lock_guard lock(mutex); clip = this->path; } // A rename may change it.
+                    const auto folder = clip.parent_path() / L"screenshots";
+                    // Named like a screenshot of the clip's game: "<game> <now>.png" (the clip's name when it has no game).
+                    const auto game = clipSourceFromName(clip);
+                    FrameWriter::Job job{session};
+                    std::wstring problem;
+                    try {
+                        // Only the read-back happens here; the PNG is encoded on the writer's thread.
+                        if (!current) problem = L"no picture to save yet";
+                        else if (const auto unusable = capture::prepareClipFolder(folder, capture::ClipFolderKind::Screenshots)) problem = *unusable;
+                        else if ((job.file = capture::nextClipPath(folder, game.empty() ? clipDisplayName(clip) : game, L".png")).empty())
+                            problem = L"frame not saved · no free file name in the screenshots folder";
+                        else if (const auto failed = renderer.readPicture(current.frame.get(), job.pixels, job.width, job.height)) problem = *failed;
+                    } catch (const std::exception&) {
+                        problem = L"frame not saved · the screenshots folder could not be prepared";
+                    }
+                    if (problem.empty()) writer->write(std::move(job));
+                    else writer->report({session, std::move(problem), false});
+                    dirty = true;
+                    break;
+                }
                 case Thumbnails:
                     thumbnails.clear();
                     startThumbnails(renderer.device(), local.duration, command.count,
@@ -367,7 +474,7 @@ void ClipPlayer::Engine::run() {
             }
 
             if (playing) {
-                if (hasAudio) {
+                if (hasAudio && speed == 1) {
                     while (audio.queued() < 0.25) {
                         const auto frames = media.audio(samples.data(), 4096);
                         if (!frames) break;
@@ -380,8 +487,16 @@ void ClipPlayer::Engine::run() {
                         audioClock = false;
                     }
                 }
-                const double time = clock();
+                double time = clock();
                 bool advanced = false;
+                // The A-B loop: reaching B goes back to A and plays on (not while trimming, which has its own range).
+                // Before the clip's own end check, so a loop ending at the last picture wraps rather than pauses.
+                const double wrapAt = std::min(shown.loop.out + local.frameDuration, local.duration - 0.002);
+                if (!shown.editing && loopWraps(shown.loop, position, time, wrapAt)) {
+                    seekTo(shown.loop.in, false);
+                    time = clock();
+                    advanced = true;
+                }
                 while (next && next.time <= time + 0.002) {
                     current = std::move(next);
                     next = media.next();
@@ -428,7 +543,8 @@ void ClipPlayer::Engine::run() {
                     drawnPixel = static_cast<int>(std::lround((shown.editing ? drawnStrip : drawnSeek).x(position)));
                     drawnKey = timeKey();
                     ID2D1Bitmap1* picture = current ? renderer.picture(current.frame.get(),
-                        static_cast<UINT>(layout.video.right - layout.video.left), static_cast<UINT>(layout.video.bottom - layout.video.top)) : nullptr;
+                        static_cast<UINT>(layout.video.right - layout.video.left), static_cast<UINT>(layout.video.bottom - layout.video.top),
+                        crop(shown.zoom)) : nullptr;
                     painter.draw(renderer.begin(), renderer.text(), renderer.factory(), layout, shown, local, state, picture, thumbnails);
                     renderer.end(); // Waits for the vertical blank: this paces playback drawing.
                 }
@@ -440,7 +556,7 @@ void ClipPlayer::Engine::run() {
                 DWORD wait = 100;
                 if (visible) {
                     wait = 16;
-                    if (next) wait = static_cast<DWORD>(std::clamp((next.time - clock()) * 1000 - 1, 1.0, 16.0));
+                    if (next) wait = static_cast<DWORD>(std::clamp((next.time - clock()) / speed * 1000 - 1, 1.0, 16.0));
                 }
                 WaitForSingleObject(wake, wait);
             } else {
@@ -480,9 +596,11 @@ void ClipPlayer::open(const std::filesystem::path& path, int volume, const std::
     path_ = path;
     const float scale = view_.scale;
     const bool fullscreen = view_.fullscreen;
+    const auto tint = view_.tint; // A trim or rename reopening its clip keeps the game colour; the app sets it for a new one.
     view_ = {};
     view_.scale = scale;
     view_.fullscreen = fullscreen;
+    view_.tint = tint;
     view_.volume = std::clamp(volume, 0, 100);
     view_.muted = muted; // Set before the engine starts, so a muted clip never blips.
     setTitle(path);
@@ -494,7 +612,13 @@ void ClipPlayer::open(const std::filesystem::path& path, int volume, const std::
         if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &info)) view_.date = formatClipDate(info.ftLastWriteTime, now);
     }
     thumbnailsFor_ = 0;
-    engine_ = std::make_unique<Engine>(window_, path, view_);
+    if (!frameWriter_) frameWriter_ = std::make_shared<FrameWriter>(window_);
+    engine_ = std::make_unique<Engine>(window_, path, view_, frameWriter_, session_);
+}
+
+void ClipPlayer::setTint(std::optional<COLORREF> tint) {
+    view_.tint = tint;
+    publish();
 }
 
 void ClipPlayer::setTitle(const std::filesystem::path& path) {
@@ -575,6 +699,32 @@ void ClipPlayer::command(int kind, double value) {
 void ClipPlayer::seek(double time, bool scrub) { command(scrub ? Scrub : Seek, time); }
 
 void ClipPlayer::step(int frames) { command(frames > 0 ? StepForward : StepBack); }
+
+void ClipPlayer::setSpeed(float speed) {
+    if (speed == view_.speed) return;
+    view_.speed = speed;
+    // A save or compression in progress keeps its toast; the bar's speed button still shows the change.
+    if (!view_.toast.empty() && view_.toastKind == ToastKind::Progress) publish();
+    // "sound on" only when there is something to hear: not muted, not at 0 %.
+    else showToast(speed == 1 ? (view_.muted || view_.volume == 0 ? std::wstring(L"1×") : std::wstring(L"1× · sound on")) : speedLabel(speed) + L" · no sound",
+                   ToastKind::Notice, false);
+}
+
+void ClipPlayer::setLoop(Loop loop) {
+    if (loop == view_.loop) return;
+    view_.loop = loop;
+    const auto text = loop.active() ? L"loop " + formatTime(loop.in, true) + L" – " + formatTime(loop.out, true) + L" · backspace clears" :
+        loop.in >= 0 ? L"loop from " + formatTime(loop.in, true) + L" · press B for its end" : std::wstring(L"loop cleared");
+    notice(text); // The seek bar shows the loop even while another toast stays.
+}
+
+void ClipPlayer::notice(const std::wstring& text, ToastKind kind) {
+    // A save in progress, an error or a warning on show keeps its toast: a hint must not hide them.
+    const bool held = !view_.toast.empty() &&
+        (view_.toastKind == ToastKind::Progress || view_.toastKind == ToastKind::Error || view_.toastKind == ToastKind::Partial);
+    if (held) publish();
+    else showToast(text, kind, false);
+}
 
 void ClipPlayer::setVolume(int volume, bool remember) {
     view_.volume = std::clamp(volume, 0, 100);
@@ -882,6 +1032,8 @@ void ClipPlayer::activate(Part part) {
     const auto current = info();
     switch (part) {
     case Part::Play: case Part::Stage: command(Toggle); break;
+    case Part::Speed: setSpeed(stepSpeed(view_.speed, 1, true)); break; // Round: 1×, 1.5×, 2×, 0.25×, 0.5×.
+    case Part::Frame: command(SaveFrame); break;
     case Part::Mute:
         view_.muted = !view_.muted || view_.volume == 0;
         if (!view_.muted && view_.volume == 0) setVolume(50, true);
@@ -933,10 +1085,33 @@ void ClipPlayer::activate(Part part) {
     }
 }
 
-void ClipPlayer::drag(float x, float) {
+void ClipPlayer::zoomBy(int steps, float px, float py) {
+    setZoom(zoomed(view_.zoom, steps, px, py));
+}
+
+void ClipPlayer::setZoom(Zoom zoom) {
+    if (zoom == view_.zoom) return;
+    view_.zoom = zoom;
+    // A save in progress, an error or a warning on show keeps its toast; the zoom then only shows in the picture.
+    const auto kind = view_.toastKind;
+    if (!view_.toast.empty() && (kind == ToastKind::Progress || kind == ToastKind::Error || kind == ToastKind::Partial)) publish();
+    else showToast(zoom.level == 1 ? L"zoom off" : std::to_wstring(zoom.level) + L"× · drag to move · 0 resets", ToastKind::Notice, false);
+}
+
+void ClipPlayer::drag(float x, float y) {
     const auto current = info();
     const auto l = layout(*current);
     switch (view_.pressed) {
+    case Part::Stage: {
+        // A zoomed picture follows the pointer once it has moved further than a click would.
+        if (panStart_.level == 1) break;
+        const float dx = x - panFrom_.x, dy = y - panFrom_.y;
+        if (!panned_ && std::fabs(dx) <= GetSystemMetrics(SM_CXDRAG) && std::fabs(dy) <= GetSystemMetrics(SM_CYDRAG)) break;
+        panned_ = true;
+        view_.zoom = panned(panStart_, dx / std::max(1.f, l.video.right - l.video.left), dy / std::max(1.f, l.video.bottom - l.video.top));
+        publish();
+        break;
+    }
     case Part::Seek: case Part::Timeline: {
         double time = timeAt(l, view_, *current, x);
         if (view_.editing) time = std::clamp(time, view_.in, view_.out);
@@ -1008,6 +1183,17 @@ LRESULT ClipPlayer::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         InvalidateRect(window_, nullptr, FALSE);
         return 0;
     }
+    case frameSaved:
+        // Every outcome is said once, and only for the clip still open (a frame of the clip closed since is still written).
+        if (frameWriter_) {
+            for (const auto& result : frameWriter_->take()) {
+                if (result.session != session_ || result.text.empty()) continue;
+                // A save or compression in progress keeps its toast.
+                if (view_.toast.empty() || view_.toastKind != ToastKind::Progress)
+                    showToast(result.text, result.saved ? ToastKind::Done : ToastKind::Error, false);
+            }
+        }
+        return 0;
     case trimFinished: {
         if (trimThread_.joinable()) trimThread_.join();
         KillTimer(window_, progressTimer);
@@ -1120,7 +1306,9 @@ LRESULT ClipPlayer::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             const auto part = view_.pressed != Part::None ? view_.pressed : view_.hover;
             const bool handle = part == Part::InHandle || part == Part::OutHandle;
             const bool clickable = part != Part::None && part != Part::Stage;
-            SetCursor(LoadCursorW(nullptr, handle ? IDC_SIZEWE : part == Part::Title ? IDC_IBEAM : clickable ? IDC_HAND : IDC_ARROW));
+            const bool movable = part == Part::Stage && view_.zoom.level > 1; // The zoomed picture can be dragged.
+            SetCursor(LoadCursorW(nullptr, handle ? IDC_SIZEWE : part == Part::Title ? IDC_IBEAM : movable ? IDC_SIZEALL :
+                clickable ? IDC_HAND : IDC_ARROW));
             return TRUE;
         }
         break;
@@ -1133,6 +1321,9 @@ LRESULT ClipPlayer::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         view_.pressed = part;
         view_.hover = part;
         SetCapture(window_);
+        panFrom_ = {static_cast<LONG>(x), static_cast<LONG>(y)};
+        panStart_ = view_.zoom;
+        panned_ = false;
         const bool timeline = onTimeline(part);
         if (timeline) {
             wasPlaying_ = playback().playing;
@@ -1153,9 +1344,10 @@ LRESULT ClipPlayer::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             wasPlaying_ = false;
         } else if (pressed == Part::Volume) {
             setVolume(view_.volume, true);
-        } else if (pressed == part && part != Part::None) {
-            activate(part);
+        } else if (pressed == part && part != Part::None && !(part == Part::Stage && panned_)) {
+            activate(part); // A drag that moved the zoomed picture is not a click on it.
         }
+        panned_ = false;
         view_.hover = part;
         publish();
         return 0;
@@ -1180,8 +1372,21 @@ LRESULT ClipPlayer::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         ScreenToClient(window_, &point);
         const int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
-        const auto part = hitTest(layout(), view_, *info(), static_cast<float>(point.x), static_cast<float>(point.y));
+        const auto l = layout();
+        const auto part = hitTest(l, view_, *info(), static_cast<float>(point.x), static_cast<float>(point.y));
         if (part == Part::Volume || part == Part::Mute) setVolume(view_.volume + notches * 5, true);
+        else if (part == Part::Stage && view_.pressed == Part::None) {
+            // Over the picture: zoom around the pointer, one step per notch. A touchpad pinch (Ctrl+wheel) and fine
+            // wheels send less than a notch at a time: those parts add up until they make one.
+            zoomWheel_ += GET_WHEEL_DELTA_WPARAM(wParam);
+            const int steps = zoomWheel_ / WHEEL_DELTA;
+            zoomWheel_ %= WHEEL_DELTA;
+            const float px = (point.x - l.video.left) / std::max(1.f, l.video.right - l.video.left);
+            const float py = (point.y - l.video.top) / std::max(1.f, l.video.bottom - l.video.top);
+            auto zoom = view_.zoom;
+            for (int i = 0; i < std::abs(steps); ++i) zoom = zoomed(zoom, steps > 0 ? 1 : -1, px, py);
+            setZoom(zoom); // One toast and one redraw for all the notches.
+        }
         else if (onTimeline(part)) {
             // Wheel over the timeline: frame by frame, or seconds with shift.
             if (GET_KEYSTATE_WPARAM(wParam) & MK_SHIFT) seek(playback().position - notches, false);
@@ -1197,19 +1402,40 @@ LRESULT ClipPlayer::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         const bool repeat = (lParam & (1 << 30)) != 0;
         if (view_.fullscreen) showControls();
         // Ctrl+C, Ctrl+F and the like belong to the system, not to the single-letter shortcuts.
-        const bool modified = (GetKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_MENU) & 0x8000);
+        const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool modified = control || (GetKeyState(VK_MENU) & 0x8000);
         if (modified && wParam >= 'A' && wParam <= 'Z') return DefWindowProcW(window_, message, wParam, lParam);
+        // Ctrl+arrows move a zoomed picture by a tenth of the view, as dragging it would.
+        if (control && view_.zoom.level > 1 && wParam >= VK_LEFT && wParam <= VK_DOWN) {
+            const float step = 0.1f;
+            view_.zoom = panned(view_.zoom, wParam == VK_LEFT ? step : wParam == VK_RIGHT ? -step : 0.f,
+                                wParam == VK_UP ? step : wParam == VK_DOWN ? -step : 0.f);
+            publish();
+            return 0;
+        }
         switch (wParam) {
+        case VK_OEM_PLUS: case VK_ADD: zoomBy(1); break;
+        case VK_OEM_MINUS: case VK_SUBTRACT: zoomBy(-1); break;
+        case '0': case VK_NUMPAD0: setZoom({}); break;
         case VK_SPACE: case 'K': if (!repeat) command(Toggle); break;
         case VK_LEFT: if (view_.editing) step(-1); else seek(current.position - 5, false); break;
         case VK_RIGHT: if (view_.editing) step(1); else seek(current.position + 5, false); break;
         case 'J': seek(current.position - 10, false); break;
         case 'L': seek(current.position + 10, false); break;
-        case VK_OEM_COMMA: step(-1); break;
-        case VK_OEM_PERIOD: step(1); break;
         case VK_UP: setVolume(view_.volume + 5, true); break;
         case VK_DOWN: setVolume(view_.volume - 5, true); break;
         case 'M': if (!repeat) activate(Part::Mute); break;
+        // The A-B loop: A and B at the current picture, Backspace clears it. Trimming has its own range.
+        // Only on a clip that is open and playable, and not while trimming, which has its own range.
+        case 'A': if (!repeat && !view_.editing && info()->ready) setLoop(loopFrom(view_.loop, current.position)); break;
+        case 'B':
+            if (repeat || view_.editing || !info()->ready) break;
+            // loopTo refuses an end at or before the start by leaving the loop as it was.
+            if (const auto loop = loopTo(view_.loop, current.position); loop.out != current.position) notice(L"the loop's end must come after its start", ToastKind::Partial);
+            else setLoop(loop);
+            break;
+        case VK_BACK: if (!repeat && !view_.editing && view_.loop.in >= 0) setLoop({}); break;
+        case 'P': if (!repeat) command(SaveFrame); break; // The picture on screen as a PNG, beside the screenshots.
         case 'F': if (!repeat) toggleFullscreen(); break;
         case 'T': if (!repeat) { if (view_.editing) endTrim(); else startTrim(); } break;
         case VK_F2: if (!repeat) beginRename(); break;
@@ -1222,6 +1448,20 @@ LRESULT ClipPlayer::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     }
+    case WM_CHAR:
+        // By the character typed, not the key, so every layout works: , and . step a frame, < and > change the speed
+        // (Shift+, and Shift+. on a US keyboard, as on video sites). On AZERTY "." needs Shift and still steps.
+        if (wParam == L',' || wParam == L'.') {
+            if (view_.fullscreen) showControls();
+            step(wParam == L',' ? -1 : 1);
+            return 0;
+        }
+        if (wParam == L'<' || wParam == L'>') {
+            if (view_.fullscreen) showControls();
+            setSpeed(stepSpeed(view_.speed, wParam == L'<' ? -1 : 1));
+            return 0;
+        }
+        break;
     case WM_SYSKEYDOWN: // Alt+← steps back, as in a browser.
         if (wParam == VK_LEFT && !(lParam & (1 << 30))) { back(); return 0; }
         break;

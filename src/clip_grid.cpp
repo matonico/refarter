@@ -1,4 +1,5 @@
 #include "clip_grid.h"
+#include "capture/clip_folder.h"
 #include "message_box.h"
 #include "theme.h"
 
@@ -18,8 +19,13 @@ namespace refarter {
 namespace {
 using namespace theme;
 constexpr UINT libraryReady = WM_APP + 3;
+constexpr UINT previewReady = WM_APP + 4;
 constexpr wchar_t className[] = L"RefarterClipGrid";
-constexpr UINT_PTR noteTimer = 1, bandTimer = 2;
+constexpr UINT_PTR noteTimer = 1, bandTimer = 2, previewTimer = 3;
+// Hover preview: how many keyframes, and how long the pointer must rest on a tile first, so sweeping across the
+// library opens no files.
+constexpr int previewPictures = 12;
+constexpr UINT previewDelayMs = 200;
 bool keyDown(int key) { return (GetKeyState(key) & 0x8000) != 0; }
 
 // A copy of a thumbnail `width` pixels wide as an opaque 32-bit bitmap, the form the shell's drag image takes
@@ -50,7 +56,10 @@ HBITMAP dragBitmap(HBITMAP thumbnail, SIZE source, int width, SIZE& size) {
 
 ClipGrid::~ClipGrid() {
     library_.reset(); // Joins the worker before the bitmaps it hands over are freed.
+    preview_.reset(); // The same for the preview thread.
     clearThumbnails();
+    clearIcons();
+    for (const HBITMAP picture : previewPictures_) if (picture) DeleteObject(picture);
     if (editBrush_) DeleteObject(editBrush_);
     if (ole_) OleUninitialize();
 }
@@ -75,6 +84,7 @@ void ClipGrid::setStyle(UINT dpi, HFONT name, HFONT date, bool smallTiles) {
     smallTiles_ = smallTiles;
     updateLabels();
     measure();
+    askIcons(); // At the new scale.
 }
 
 // Texts and their widths for every listed clip; the fonts or the list changed.
@@ -174,6 +184,24 @@ void ClipGrid::setSearch(const std::wstring& text) {
         scroll_ = 0;
         focus_ = 0; // The first match takes the keyboard place.
     } // Cleared: the focused clip keeps its place (updateList finds it again by path).
+    if (scanned_) updateList();
+}
+
+void ClipGrid::setOrder(ClipOrder order) {
+    if (order_ == order) return;
+    order_ = order;
+    scroll_ = 0;
+    if (order_.by != ClipSort::Length && !lengthsAsked_.empty()) {
+        library_->cancelLengths(); // Answers already on their way are still kept.
+        lengthsAsked_.clear();
+    }
+    if (scanned_) updateList();
+}
+
+void ClipGrid::setPeriod(ClipPeriod period) {
+    if (period_ == period) return;
+    period_ = period;
+    scroll_ = 0;
     if (scanned_) updateList();
 }
 
@@ -436,6 +464,152 @@ void ClipGrid::clearThumbnails() {
     thumbnails_.clear();
 }
 
+void ClipGrid::clearIcons() {
+    for (auto& [game, bitmap] : icons_) DeleteObject(bitmap);
+    icons_.clear();
+    iconsAsked_.clear();
+    accents_.clear();
+}
+
+void ClipGrid::askIcons() {
+    if (!library_ || (!overview() && !gameColours_)) return;
+    if (const int size = px(22); size != iconSize_) {
+        clearIcons(); // A new scale: every icon at the new size.
+        iconSize_ = size;
+    }
+    std::vector<std::wstring> games;
+    for (const auto& folder : folders_)
+        if (folder.key != L"*" && iconsAsked_.insert(folder.key).second) games.push_back(folder.key);
+    // Clip tiles' games too, for their colour.
+    for (const auto& clip : clips_)
+        if (auto key = lower(sourceOf(clip)); !key.empty() && iconsAsked_.insert(key).second) games.push_back(std::move(key));
+    if (!games.empty()) library_->icons(std::move(games), iconSize_);
+}
+
+void ClipGrid::setGameColours(bool on) {
+    if (gameColours_ == on) return;
+    gameColours_ = on;
+    askIcons();
+    if (!window_) return;
+    InvalidateRect(window_, nullptr, FALSE);
+    SendMessageW(parent_, WM_COMMAND, MAKEWPARAM(id_, coloursChanged), reinterpret_cast<LPARAM>(window_)); // The open player too.
+}
+
+std::optional<COLORREF> ClipGrid::gameColour(const std::filesystem::path& clip) const {
+    if (!gameColours_) return std::nullopt;
+    const auto listed = std::find_if(allClips_.begin(), allClips_.end(), [&](const ClipFile& c) { return c.path == clip; });
+    const auto game = lower(listed != allClips_.end() ? sourceOf(*listed) : clipSourceFromName(clip));
+    const auto found = accents_.find(game);
+    return found != accents_.end() ? std::optional(found->second) : std::nullopt;
+}
+
+std::optional<COLORREF> ClipGrid::tileColour(int index) const {
+    if (!gameColours_ || index < 0 || index >= items()) return std::nullopt;
+    const auto found = accents_.find(overview() ? folders_[index].key : lower(sourceOf(clips_[index])));
+    return found != accents_.end() ? std::optional(found->second) : std::nullopt;
+}
+
+void ClipGrid::setListedGames(const std::vector<std::pair<std::wstring, std::wstring>>& games) {
+    if (!library_) return;
+    // Keyed as a folder reads its game back from a clip's name, characters Windows rejects in file names included
+    // ("jedi: survivor" is the folder "jedi_ survivor").
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    std::map<std::wstring, std::wstring> listed;
+    for (const auto& [label, executable] : games)
+        if (!label.empty() && !executable.empty()) listed[lower(clipSourceFromName(capture::clipFileName(label, now)))] = executable;
+    library_->listedGames(std::move(listed));
+    for (auto it = iconsAsked_.begin(); it != iconsAsked_.end();) it = icons_.contains(*it) ? std::next(it) : iconsAsked_.erase(it);
+    askIcons();
+}
+
+void ClipGrid::rememberGame(const std::wstring& game, const std::filesystem::path& executable) {
+    if (!library_ || game.empty() || executable.empty()) return;
+    // Every save of a game reports it; only a new game or another executable changes anything.
+    const auto key = lower(game);
+    if (const auto known = rememberedGames_.find(key); known != rememberedGames_.end() && known->second == executable) return;
+    rememberedGames_[key] = executable;
+    library_->rememberGame(game, executable);
+    // Asked again once a scan lists its folder; the icon shown meanwhile stays until its replacement arrives.
+    iconsAsked_.erase(key);
+}
+
+void ClipGrid::hoverPreview(int index, POINT point) {
+    const bool clip = index >= 0 && !overview() && index < static_cast<int>(clips_.size()) && !band_ && pressed_ < 0;
+    if (!clip || clips_[index].path != previewClip_) {
+        clearPreview();
+        if (!clip) return;
+        previewClip_ = clips_[index].path;
+    }
+    const RECT tile = tileRect(index);
+    const RECT picture{tile.left, tile.top, tile.right, tile.top + thumbHeight_};
+    const int slice = PtInRect(&picture, point) ?
+        std::clamp(static_cast<int>((point.x - picture.left) * previewPictures / std::max(1L, picture.right - picture.left)), 0, previewPictures - 1) : -1;
+    // Asked only once the pointer has rested on the picture itself: every move restarts the wait, so sweeping across
+    // the library (or along a caption or a tile's buttons) opens no files.
+    if (!previewRequest_) {
+        if (slice >= 0) SetTimer(window_, previewTimer, previewDelayMs, nullptr);
+        else KillTimer(window_, previewTimer);
+    }
+    if (slice != previewSlice_) {
+        previewSlice_ = slice;
+        invalidateTile(index);
+    }
+}
+
+void ClipGrid::startPreview() {
+    KillTimer(window_, previewTimer);
+    // Still resting on that clip's picture: nothing for a pointer that left, a press or a drag rectangle.
+    if (previewClip_.empty() || previewRequest_ || previewSlice_ < 0 || band_ || pressed_ >= 0) return;
+    if (hover_ < 0 || hover_ >= static_cast<int>(clips_.size()) || clips_[hover_].path != previewClip_) return;
+    // At the size the thumbnail is shown, in the clip's own shape when Windows already said it.
+    const SIZE frame = thumbnailFrame();
+    SIZE size = frame;
+    if (const auto cached = thumbnails_.find(previewClip_.wstring()); cached != thumbnails_.end() && cached->second.size.cx > 0 && cached->second.size.cy > 0) {
+        const double fit = std::min(static_cast<double>(frame.cx) / cached->second.size.cx, static_cast<double>(frame.cy) / cached->second.size.cy);
+        size = {std::max(1L, static_cast<LONG>(cached->second.size.cx * fit)), std::max(1L, static_cast<LONG>(cached->second.size.cy * fit))};
+    }
+    if (size.cx <= 0 || size.cy <= 0) return;
+    if (!preview_) preview_ = std::make_unique<player::ClipPreview>([window = window_] { PostMessageW(window, previewReady, 0, 0); });
+    previewPictures_.assign(previewPictures, nullptr);
+    previewSize_ = size;
+    previewRequest_ = preview_->request(previewClip_, previewPictures, static_cast<UINT>(size.cx), static_cast<UINT>(size.cy),
+                                        MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST));
+}
+
+void ClipGrid::clearPreview() {
+    KillTimer(window_, previewTimer);
+    if (previewRequest_ && preview_) preview_->cancel();
+    for (const HBITMAP picture : previewPictures_) if (picture) DeleteObject(picture);
+    previewPictures_.clear();
+    previewClip_.clear();
+    previewRequest_ = 0;
+    previewSlice_ = -1;
+}
+
+void ClipGrid::receivePreview() {
+    if (!preview_) return;
+    bool arrived = false;
+    for (const auto& picture : preview_->take()) {
+        if (picture.request != previewRequest_ || picture.index < 0 || picture.index >= static_cast<int>(previewPictures_.size())) {
+            DeleteObject(picture.bitmap); // For a tile no longer hovered.
+            continue;
+        }
+        if (previewPictures_[picture.index]) DeleteObject(previewPictures_[picture.index]);
+        previewPictures_[picture.index] = picture.bitmap;
+        arrived = true;
+    }
+    if (arrived && hover_ >= 0) invalidateTile(hover_);
+}
+
+HBITMAP ClipGrid::previewPicture(int index) const {
+    if (index != hover_ || previewSlice_ < 0 || overview() || index >= static_cast<int>(clips_.size()) || clips_[index].path != previewClip_) return nullptr;
+    std::vector<bool> decoded(previewPictures_.size());
+    for (std::size_t i = 0; i < decoded.size(); ++i) decoded[i] = previewPictures_[i] != nullptr;
+    const int shown = player::ClipPreview::nearest(decoded, previewSlice_);
+    return shown >= 0 ? previewPictures_[shown] : nullptr;
+}
+
 void ClipGrid::receive() {
     auto results = library_->take();
     // Anything but thumbnails can change every tile; thumbnails repaint only their own.
@@ -484,6 +658,35 @@ void ClipGrid::receive() {
         }
         if (!remember.empty()) library_->remember(std::move(remember));
     }
+    bool coloured = false;
+    for (const auto& icon : results.icons) {
+        if (!icon.bitmap) continue; // No known executable, or it has no icon: the plain folder mark stays.
+        if (icon.size != iconSize_ || !iconsAsked_.contains(icon.game)) { DeleteObject(icon.bitmap); continue; } // Asked before a change.
+        if (const auto old = icons_.find(icon.game); old != icons_.end()) DeleteObject(old->second);
+        icons_[icon.game] = icon.bitmap;
+        if (icon.accent) accents_[icon.game] = *icon.accent;
+        else accents_.erase(icon.game);
+        everything = coloured = true;
+    }
+    // A clip already open in the player before its colour arrived takes it now.
+    if (coloured) SendMessageW(parent_, WM_COMMAND, MAKEWPARAM(id_, coloursChanged), reinterpret_cast<LPARAM>(window_));
+    // Lengths asked for the order: kept like a thumbnail's, then sorted in once the last has arrived.
+    const bool measuring = !lengthsAsked_.empty();
+    std::unordered_map<std::wstring, const ClipFile*> listed; // By path: one look-up per answer, not a scan of the folder.
+    if (!results.lengths.empty()) for (const auto& clip : allClips_) listed.emplace(clip.path.wstring(), &clip);
+    for (auto& length : results.lengths) {
+        const auto key = length.clip.path.wstring();
+        lengthsAsked_.erase(key);
+        const auto found = listed.find(key);
+        if (found == listed.end() || !sameClip(*found->second, length.clip)) continue; // Changed or gone.
+        if (const auto known = details_.find(key); known != details_.end() && sameClip(known->second.clip, length.clip)) continue; // A thumbnail brought it first.
+        details_[key] = {length.clip, length.duration};
+    }
+    // Sorted in once the last asked length has come back, whether or not that last batch brought anything new.
+    if (measuring && lengthsAsked_.empty() && order_.by == ClipSort::Length) {
+        updateList();
+        everything = true;
+    }
     std::vector<std::size_t> changed;
     for (auto& thumbnail : results.thumbnails) {
         const auto key = thumbnail.clip.path.wstring();
@@ -515,34 +718,54 @@ void ClipGrid::receive() {
 }
 
 void ClipGrid::updateList() {
+    clearPreview(); // The tiles move: the next pointer move asks again.
     const int oldFocus = focus_;
     const bool wasOverview = overview();
     const auto focused = focus_ < items() ? tileClip(focus_).path : std::filesystem::path{};
     const auto focusedFolder = wasOverview && focus_ < items() ? folders_[focus_].key : std::wstring{};
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
     std::vector<ClipFile> shown;
     for (const auto& clip : allClips_) {
         if (!search_.empty() && !matchesSearch(clipDisplayName(clip.path), sourceOf(clip), search_)) continue;
+        if (!inPeriod(clip.written, period_, now)) continue;
         const bool compressed = isCompressedCopy(clip.path);
         if (view_ == ClipView::Compressed ? compressed : view_ == ClipView::All || (!compressed && clip.favourite)) shown.push_back(clip);
     }
+    if (order_.by == ClipSort::Length) {
+        // Lengths come with thumbnails; the rest are read once, without thumbnails, and sorted in when all have arrived.
+        std::vector<ClipFile> unknown;
+        for (const auto& clip : shown) {
+            // A length of an older file at this path (replaced by a trim) does not count.
+            const auto key = clip.path.wstring();
+            const auto known = details_.find(key);
+            if ((known == details_.end() || !sameClip(known->second.clip, clip)) && lengthsAsked_.insert(key).second) unknown.push_back(clip);
+        }
+        if (!unknown.empty()) library_->lengths(std::move(unknown));
+    }
+    sortClips(shown, order_, [this](const ClipFile& clip) -> std::optional<std::uint64_t> {
+        const auto found = details_.find(clip.path.wstring());
+        return found != details_.end() && sameClip(found->second.clip, clip) ? found->second.duration : std::nullopt;
+    });
     viewCount_ = shown.size();
     folders_.clear();
     clips_.clear();
     if (grouped_) {
-        // Folders in the order of their newest clip; the open one lists its clips.
+        // Folders in the order of their first clip; the open one lists its clips.
         std::unordered_map<std::wstring, std::size_t> at;
         for (const auto& clip : shown) {
             const auto game = sourceOf(clip);
             auto key = game.empty() ? std::wstring(L"*") : lower(game);
             const auto [place, added] = at.emplace(key, folders_.size());
-            if (added) folders_.push_back({key, game.empty() ? L"other" : game, {clip}});
-            else if (folders_[place->second].covers.size() < 4) folders_[place->second].covers.push_back(clip);
-            ++folders_[place->second].count;
+            auto& folder = added ? folders_.emplace_back(Folder{key, game.empty() ? L"other" : game, {}}) : folders_[place->second];
+            if (folder.covers.size() < 4) folder.covers.push_back(clip);
+            if (CompareFileTime(&clip.written, &folder.newest) > 0) folder.newest = clip.written;
+            ++folder.count;
             if (key == openFolder_) clips_.push_back(clip);
         }
         // Not in this tab, or emptied: back to the overview. A search that matches nothing here keeps the folder open,
         // so correcting or clearing it returns to the same place.
-        if (clips_.empty() && search_.empty()) openFolder_.clear();
+        if (clips_.empty() && search_.empty() && !filtering()) openFolder_.clear();
     } else clips_ = std::move(shown);
     backLabel_.clear();
     backCount_.clear();
@@ -559,15 +782,13 @@ void ClipGrid::updateList() {
     library_->want({}, {}); // Cancel obsolete thumbnail requests after filtering.
     index_.clear();
     dates_.clear();
-    SYSTEMTIME now{};
-    GetLocalTime(&now);
     focus_ = items() == 0 ? 0 : std::clamp(oldFocus, 0, items() - 1);
     if (overview()) {
         // Folder tiles: the newest clip's date. Thumbnails are found by their covers' paths.
         for (std::size_t i = 0; i < folders_.size(); ++i) {
             for (const auto& cover : folders_[i].covers) index_[cover.path.wstring()] = i;
             if (folders_[i].key == focusedFolder) focus_ = static_cast<int>(i);
-            dates_.push_back(formatClipDate(folders_[i].covers.front().written, now));
+            dates_.push_back(formatClipDate(folders_[i].newest, now));
         }
     }
     for (std::size_t i = 0; i < clips_.size(); ++i) {
@@ -615,6 +836,7 @@ void ClipGrid::updateList() {
     requestedFirst_ = requestedLast_ = -1;
     updateLabels();
     measure();
+    askIcons();
     if (GetFocus() == window_ && items() > 0) focusTile(focus_);
     SendMessageW(parent_, WM_COMMAND, MAKEWPARAM(id_, clipsChanged), reinterpret_cast<LPARAM>(window_));
 }
@@ -629,7 +851,9 @@ void ClipGrid::measure() {
     const int target = px(smallTiles_ ? 176 : 232);
     const int width = std::max(1, static_cast<int>(client.right) - pad_ * 2);
     columns_ = std::max(1, (width + gap_) / (target + gap_));
+    const int oldTileWidth = tileWidth_;
     tileWidth_ = (width - gap_ * (columns_ - 1)) / columns_;
+    if (tileWidth_ != oldTileWidth) clearPreview(); // Its pictures were made for the old size; the next rest asks again.
     thumbHeight_ = tileWidth_ * 9 / 16;
     tileHeight_ = thumbHeight_ + px(50);
     const int rows = (items() + columns_ - 1) / columns_;
@@ -641,7 +865,9 @@ void ClipGrid::measure() {
 void ClipGrid::scrollTo(int y) {
     RECT client{};
     GetClientRect(window_, &client);
-    scroll_ = std::clamp(y, 0, std::max(0, content_ - static_cast<int>(client.bottom)));
+    const int scrolled = std::clamp(y, 0, std::max(0, content_ - static_cast<int>(client.bottom)));
+    if (scrolled != scroll_) clearPreview(); // Another tile may be under the pointer now.
+    scroll_ = scrolled;
     SCROLLINFO info{sizeof(info), SIF_ALL | SIF_DISABLENOSCROLL, 0, std::max(0, content_ - 1),
                     static_cast<UINT>(client.bottom), scroll_};
     SetScrollInfo(window_, SB_VERT, &info, TRUE);
@@ -946,8 +1172,10 @@ void ClipGrid::paint(HDC dc) {
         // never spills out). Keyboard focus alone adds a border of the same shape; hover stays grey.
         const bool selected = !overview() && selection_.contains(clips_[i].path);
         const bool keyFocus = focused && keyboardNav_ && i == focus_;
+        // A game colour, kept subtle: the hover outline and a folder's edge, never a fill.
+        const auto gameTint = tileColour(i);
         if (selected) roundRect(g, halo, px(10), accentSurface, accentSurface);
-        else if (i == hover_ || i == pressed_) roundRect(g, halo, px(10), raised, raised);
+        else if (i == hover_ || i == pressed_) roundRect(g, halo, px(10), raised, gameTint ? *gameTint : raised);
         if (selected || keyFocus) {
             const float width = (selected ? (keyFocus ? 2.f : 1.5f) : 1.f) * scale, half = width / 2.f;
             Gdiplus::GraphicsPath path;
@@ -957,7 +1185,7 @@ void ClipGrid::paint(HDC dc) {
             g.DrawPath(&pen, &path);
         }
         const RECT thumb{tile.left, tile.top, tile.right, tile.top + thumbHeight_};
-        roundRect(g, thumb, px(8), background, border);
+        roundRect(g, thumb, px(8), background, overview() && gameTint ? *gameTint : border);
         // A clip fills the frame; a folder shows its four newest clips 2 × 2 (cells without a clip stay empty).
         const SIZE cell = thumbnailFrame();
         const auto shown = tileClips(i);
@@ -967,7 +1195,16 @@ void ClipGrid::paint(HDC dc) {
             const int left = thumb.left + 1 + static_cast<int>(k % 2) * (cell.cx + px(2));
             const int top = thumb.top + 1 + static_cast<int>(k / 2) * (cell.cy + px(2));
             const auto key = shown[k].path.wstring();
-            if (auto cached = thumbnails_.find(key); cached != thumbnails_.end()) {
+            if (const HBITMAP picture = previewPicture(i)) {
+                // The hover preview's picture for the place under the pointer, made at the shown size.
+                const int x = left + (cell.cx - previewSize_.cx) / 2, y = top + (cell.cy - previewSize_.cy) / 2;
+                const auto previous = SelectObject(source, picture);
+                BitBlt(dc, x, y, previewSize_.cx, previewSize_.cy, source, 0, 0, SRCCOPY);
+                SelectObject(source, previous);
+                // Where in the clip it is: a thin line along the bottom, as far as the pointer.
+                const int along = thumb.left + 1 + (thumb.right - thumb.left - 2) * (previewSlice_ + 1) / previewPictures;
+                fill(dc, {thumb.left + 1, thumb.bottom - px(3), along, thumb.bottom - 1}, accent);
+            } else if (auto cached = thumbnails_.find(key); cached != thumbnails_.end()) {
                 // Fit inside the 16:9 cell, keeping the clip's own aspect ratio.
                 const auto [bw, bh] = cached->second.size;
                 const double fit = std::min(static_cast<double>(cell.cx) / bw, static_cast<double>(cell.cy) / bh);
@@ -995,12 +1232,24 @@ void ClipGrid::paint(HDC dc) {
             pill(count, px(5), background, label.size.c_str(), ink);
             const auto mark = favouriteRect(i);
             roundRect(g, mark, px(7), background, border);
-            Gdiplus::Pen pen(color(i == hover_ || (focused && i == focus_) ? accent : muted), 1.4f * scale);
-            pen.SetLineJoin(Gdiplus::LineJoinRound);
-            const float cx = (mark.left + mark.right) / 2.f, cy = (mark.top + mark.bottom) / 2.f;
-            const auto at = [&](float x, float y) { return Gdiplus::PointF{cx + x * scale, cy + y * scale}; };
-            const Gdiplus::PointF shape[] = {at(-7.5f, -5.5f), at(-2.5f, -5.5f), at(-0.5f, -3.5f), at(7.5f, -3.5f), at(7.5f, 5.5f), at(-7.5f, 5.5f)};
-            g.DrawPolygon(&pen, shape, 6);
+            // The game's own icon when its executable is known (game_icons.h), else the plain folder mark.
+            const auto icon = icons_.find(folders_[i].key);
+            const HDC iconDc = icon != icons_.end() ? CreateCompatibleDC(dc) : nullptr;
+            if (iconDc) {
+                const auto old = SelectObject(iconDc, icon->second);
+                const int x = (mark.left + mark.right - iconSize_) / 2, y = (mark.top + mark.bottom - iconSize_) / 2;
+                const BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+                AlphaBlend(dc, x, y, iconSize_, iconSize_, iconDc, 0, 0, iconSize_, iconSize_, blend);
+                SelectObject(iconDc, old);
+                DeleteDC(iconDc);
+            } else {
+                Gdiplus::Pen pen(color(i == hover_ || (focused && i == focus_) ? accent : muted), 1.4f * scale);
+                pen.SetLineJoin(Gdiplus::LineJoinRound);
+                const float cx = (mark.left + mark.right) / 2.f, cy = (mark.top + mark.bottom) / 2.f;
+                const auto at = [&](float x, float y) { return Gdiplus::PointF{cx + x * scale, cy + y * scale}; };
+                const Gdiplus::PointF shape[] = {at(-7.5f, -5.5f), at(-2.5f, -5.5f), at(-0.5f, -3.5f), at(7.5f, -3.5f), at(7.5f, 5.5f), at(-7.5f, 5.5f)};
+                g.DrawPolygon(&pen, shape, 6);
+            }
             const int captionTop = thumb.bottom + px(8);
             drawText(dc, nameFont_, label.name, {tile.left + px(2), captionTop, tile.right - px(4), captionTop + px(20)}, ink);
             drawText(dc, dateFont_, dates_[i], {tile.left + px(2), captionTop + px(21), tile.right - px(4), captionTop + px(39)}, muted);
@@ -1140,6 +1389,7 @@ LRESULT CALLBACK ClipGrid::proc(HWND window, UINT message, WPARAM wParam, LPARAM
 LRESULT ClipGrid::handle(UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case libraryReady: receive(); return 0;
+    case previewReady: receivePreview(); return 0;
     case WM_SIZE: measure(); return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
@@ -1213,10 +1463,12 @@ LRESULT ClipGrid::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             invalidateTile(previous);
             invalidateTile(hit);
         }
+        hoverPreview(hit, point);
         return 0;
     }
     case WM_MOUSELEAVE: {
         tracking_ = false;
+        clearPreview();
         const int previous = hover_, held = pressed_;
         hover_ = pressed_ = -1;
         moreHover_ = starHover_ = binHover_ = nameHover_ = pencilHover_ = false;
@@ -1431,7 +1683,9 @@ LRESULT ClipGrid::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         InvalidateRect(window_, nullptr, FALSE);
         return 0;
     case WM_TIMER:
-        if (wParam == noteTimer) {
+        if (wParam == previewTimer) {
+            startPreview(); // The pointer rested on the tile.
+        } else if (wParam == noteTimer) {
             KillTimer(window_, noteTimer);
             note_.clear();
             SendMessageW(parent_, WM_COMMAND, MAKEWPARAM(id_, noteChanged), reinterpret_cast<LPARAM>(window_));

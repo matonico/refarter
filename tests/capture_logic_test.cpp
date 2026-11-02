@@ -3,6 +3,7 @@
 #include "capture/audio_levels.h"
 #include "capture/clip_folder.h"
 #include "capture/discord_audio.h"
+#include "capture/encoder_times.h"
 #include "capture/game_process.h"
 #include "capture/frame_pacer.h"
 #include "capture/frame_rate_budget.h"
@@ -11,19 +12,25 @@
 #include "capture/mic_filters.h"
 #include "capture/annexb.h"
 #include "capture/replay_buffer.h"
+#include "capture/save_audio.h"
+#include "capture/track_workers.h"
 #include "capture/video_settings.h"
 #include "capture/startup_frame.h"
 #include "capture/screenshot.h"
 #include <wincodec.h>
 #include <winrt/base.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <optional>
+#include <stdexcept>
 #include <thread>
 
 using namespace refarter::capture;
@@ -117,23 +124,28 @@ int main() {
     check(bar.clipping(), "-3 dBFS warns");
     check(meterLength(0.5f, 101) == 51 && meterLength(0.f, 80) == 0 && meterLength(1.f, 80) == 80 && meterLength(1.5f, 80) == 80,
           "meter pixels round and clamp");
-    const auto adjusted = prepareAudioTracks({2000, -2000}, {3000, -3000}, {50, 200});
-    check(adjusted.tracks == std::vector<std::vector<std::int16_t>>{{7000, -7000}, {1000, -1000}, {6000, -6000}},
+    // The microphone's track is mono (one sample a frame); the mix stays stereo.
+    const auto adjusted = prepareAudioTracks({2000, -2000}, {3000, 3000}, {50, 200});
+    check(adjusted.tracks == std::vector<std::vector<std::int16_t>>{{7000, 5000}, {1000, -1000}, {6000}},
           "mix and separate tracks share adjusted levels");
-    const auto muted = prepareAudioTracks({2000, -2000}, {3000, -3000}, {0, 100});
-    check(muted.tracks == std::vector<std::vector<std::int16_t>>{{3000, -3000}, {0, 0}, {3000, -3000}},
+    const auto muted = prepareAudioTracks({2000, -2000}, {3000, 3000}, {0, 100});
+    check(muted.tracks == std::vector<std::vector<std::int16_t>>{{3000, 3000}, {0, 0}, {3000}},
           "muted source remains silent alternate, mix keeps other source");
     check(prepareAudioTracks({25000, -25000}, {25000, -25000}, {}).tracks.front() ==
           std::vector<std::int16_t>{32767, -32768}, "combined mix saturates");
-    check(prepareAudioTracks({}, {2000, -2000}, {100, 50}).tracks ==
-          std::vector<std::vector<std::int16_t>>{{1000, -1000}}, "single mic track gain");
+    check(prepareAudioTracks({}, {2000, 2000}, {100, 50}).tracks ==
+          std::vector<std::vector<std::int16_t>>{{1000}}, "single mic track gain");
+    check(prepareAudioTracks({}, {3000, 1000, -2000, -4001}, {}).tracks == std::vector<std::vector<std::int16_t>>{{2000, -3000}},
+          "the microphone is saved mono, its two channels averaged");
+    check(audioLayout({true, true, true, true}, true).channels == std::vector<int>{2, 2, 1, 2, 2} &&
+          audioLayout({false, true, false, false}, true).channels == std::vector<int>{1}, "only the microphone's track is mono");
     check(prepareAudioTracks({2000, -2000}, {}, {50, 100}).tracks ==
           std::vector<std::vector<std::int16_t>>{{1000, -1000}}, "single desktop track gain");
     check(prepareAudioTracks({}, {}, {}).tracks.empty(), "disabled audio adds no tracks");
     check(adjusted.names == std::vector<std::string>{"mix", "desktop", "microphone"}, "tracks are named in order");
     check(prepareAudioTracks({}, {2000, -2000}, {}).names == std::vector<std::string>{"microphone"}, "single track is named");
-    const auto discord = prepareAudioTracks({2000, -2000}, {3000, -3000}, {50, 100}, {4000, -4000});
-    check(discord.tracks == std::vector<std::vector<std::int16_t>>{{6000, -6000}, {1000, -1000}, {3000, -3000}, {2000, -2000}},
+    const auto discord = prepareAudioTracks({2000, -2000}, {3000, 3000}, {50, 100}, {4000, -4000});
+    check(discord.tracks == std::vector<std::vector<std::int16_t>>{{6000, 0}, {1000, -1000}, {3000}, {2000, -2000}},
           "discord joins the mix and keeps the desktop volume");
     check(discord.names == std::vector<std::string>{"mix", "desktop", "microphone", "discord"}, "discord track comes last");
     const auto withDiscord = prepareAudioTracks({2000, -2000}, {}, {}, {1000, 3000});
@@ -142,8 +154,8 @@ int main() {
     check(prepareAudioTracks({1, 2, 3, 4}, {}, {}, {5, 6}).tracks.front() == std::vector<std::int16_t>{6, 8, 3, 4},
           "mix spans the longest source");
     // A game window's own sound is a last track of its own: the mix does not change and never sums it.
-    const auto game = prepareAudioTracks({2000, -2000}, {3000, -3000}, {50, 100}, {}, {1000, -1000});
-    check(game.tracks == std::vector<std::vector<std::int16_t>>{{4000, -4000}, {1000, -1000}, {3000, -3000}, {500, -500}} &&
+    const auto game = prepareAudioTracks({2000, -2000}, {3000, 3000}, {50, 100}, {}, {1000, -1000});
+    check(game.tracks == std::vector<std::vector<std::int16_t>>{{4000, 2000}, {1000, -1000}, {3000}, {500, -500}} &&
           game.names == std::vector<std::string>{"mix", "desktop", "microphone", "game"}, "game track follows the sources, outside the mix");
     const auto gameAlone = prepareAudioTracks({2000, -2000}, {}, {}, {}, {1000, -1000});
     check(gameAlone.names == std::vector<std::string>{"desktop", "game"} && gameAlone.tracks.size() == 2,
@@ -288,6 +300,76 @@ int main() {
     ReplayBuffer capped(1'000'000, 100);
     for (int i = 0; i < 20; ++i) capped.push(packet(i * 10, i % 5 == 0, 10));
     check(capped.bytes() <= 100, "byte cap evicts GOPs");
+    ReplayBuffer frozen(1'000'000, 100);
+    for (int i = 0; i < 40; ++i) frozen.push(packet(0, i % 5 == 0, 10));
+    check(frozen.bytes() <= 100, "pictures that share one time still leave the buffer");
+    {
+        // A screen that stood still: one GOP of nine pictures in its first second, then nothing for five hours.
+        // A five-minute replay saved then starts with that GOP just before the replay, not five hours earlier.
+        constexpr std::int64_t sec = 10'000'000;
+        ReplayBuffer still(300 * sec, 1'000'000);
+        for (int i = 0; i < 9; ++i) still.push(packet(i * sec / 10, i == 0));
+        const std::int64_t saved = 5 * 3600 * sec, from = saved - 300 * sec;
+        const auto clip = still.snapshot(300 * sec, saved);
+        check(clip.size() == 9 && clip.front()->keyframe && clip.back()->time == from && clip.front()->time == from - 8 * sec / 10,
+              "a stale lead-in moves up to the replay's start");
+        check(clip[1]->time - clip[0]->time == sec / 10, "a moved lead-in keeps its spacing");
+        still.push(packet(saved - 60 * sec, false));
+        const auto changed = still.snapshot(300 * sec, saved);
+        check(changed.size() == 10 && changed[8]->time == from && changed.back()->time == saved - 60 * sec,
+              "a picture after the replay's start keeps its time");
+    }
+    {
+        // An encoder that ignored the forced keyframe: one GOP holds a picture at the start, three hours of a still
+        // screen, then a picture half a second before the replay's start (too short a hold to move it). The clip
+        // still starts only a moment before that picture, not three hours earlier.
+        constexpr std::int64_t sec = 10'000'000;
+        ReplayBuffer gop(300 * sec, 1'000'000);
+        const std::int64_t saved = 3 * 3600 * sec + 400 * sec, from = saved - 300 * sec;
+        gop.push(packet(0, true));
+        gop.push(packet(sec / 10, false));
+        gop.push(packet(from - sec / 2, false));
+        gop.push(packet(from + sec, false));
+        const auto clip = gop.snapshot(300 * sec, saved);
+        check(clip.size() == 4 && clip.front()->keyframe && clip[2]->time == from - sec / 2 &&
+              clip.front()->time == from - sec / 2 - 2 * ReplayBuffer::packedTick && clip[1]->time == from - sec / 2 - ReplayBuffer::packedTick,
+              "a still stretch inside the lead-in is packed before the first shown picture");
+        check(clip.back()->time == from + sec, "pictures from the replay's start keep their times");
+    }
+    {
+        EncoderTimes times;
+        for (const std::int64_t time : {100, 200, 300}) times.submitted(time);
+        check(times.output(100) == 100 && times.output(200) == 200 && times.repaired() == 0, "stamped encoder times are kept");
+        check(times.output(std::nullopt) == 300 && times.repaired() == 1, "an unstamped output takes its input's time");
+        times.submitted(400);
+        times.submitted(500);
+        check(times.output(0) == 400 && times.output(7) == 500 && times.repaired() == 3,
+              "an output stamped with an unknown time takes the oldest waiting");
+        times.submitted(600);
+        times.submitted(700);
+        check(times.output(700) == 700 && times.repaired() == 3, "a stamped output passes a dropped picture");
+        for (int i = 0; i < 100; ++i) times.submitted(1'000 + i);
+        check(times.output(std::nullopt) == 1'000 + 100 - static_cast<std::int64_t>(EncoderTimes::limit),
+              "dropped pictures are forgotten");
+    }
+    {
+        // The picture between two stamped outputs was dropped: an unstamped output next must not take its time.
+        EncoderTimes times;
+        for (const std::int64_t time : {100, 200, 300}) times.submitted(time);
+        check(times.output(100) == 100 && times.output(300) == 300, "stamped outputs pass a dropped picture");
+        times.submitted(400);
+        check(times.output(std::nullopt) == 400, "an unstamped output after a dropped picture takes its own time, never the dropped one");
+        times.submitted(500);
+        check(times.output(0) == 500, "an unknown stamp after a dropped picture takes its own time too");
+    }
+    {
+        // One stray output (a header-only sample stamped 0) takes the next time; the real picture with that stamp
+        // keeps it, and the pictures after it stay in step.
+        EncoderTimes times;
+        for (const std::int64_t time : {100, 200, 300}) times.submitted(time);
+        check(times.output(0) == 100, "a stray output takes the oldest waiting time");
+        check(times.output(100) == 100 && times.output(200) == 200 && times.output(300) == 300, "the real pictures keep their own times");
+    }
 
     // Actual irregular near-60 Hz delivery: legacy slots reject candidates
     // despite the source fitting the sustained rate. Budget must retain all.
@@ -562,6 +644,36 @@ int main() {
         check(consistent, "a read racing the writer never returns sound from another time");
     }
     check(AudioTrack::ringBytes(60) == 65ull * 48'000 * 4, "a ring holds replay plus five seconds of 16-bit stereo");
+    check(AudioTrack::ringBytes(60, 1) == 65ull * 48'000 * 2, "a mono ring holds half as much");
+    {
+        // A mono ring (the microphone) keeps one channel: stereo in, the two averaged, the same on both channels out.
+        const auto unit = [](std::int64_t frames) { return frames * 10'000'000 / AudioTrack::rate; }; // Exact for these counts.
+        AudioTrack mono(2, 1); // Two one-second chunks.
+        std::vector<std::int16_t> pcm(72'000 * 2);
+        for (std::size_t f = 0; f < 72'000; ++f) {
+            pcm[2 * f] = static_cast<std::int16_t>(f % 1000);
+            pcm[2 * f + 1] = static_cast<std::int16_t>(-static_cast<int>(f % 7) * 3);
+        }
+        const auto expected = [&](std::size_t f) { return static_cast<std::int16_t>((pcm[2 * f] + pcm[2 * f + 1]) / 2); };
+        mono.write(0, pcm.data(), 28'800);
+        mono.write(unit(28'800), pcm.data() + 28'800 * 2, 43'200); // Crosses a chunk edge.
+        const auto out = mono.read(0, unit(72'000));
+        bool same = out.size() == 72'000u * 2;
+        for (std::size_t f = 0; same && f < 72'000; ++f) same = out[2 * f] == expected(f) && out[2 * f + 1] == expected(f);
+        check(same, "a mono ring reads the channels averaged on both, across a chunk edge");
+        mono.write(unit(72'000), pcm.data(), 48'000); // Wraps: frames before 24'000 are gone.
+        const auto wrapped = mono.read(0, unit(120'000));
+        same = wrapped.size() == 120'000u * 2;
+        for (std::size_t f = 0; same && f < 120'000; ++f) {
+            const auto want = f < 24'000 ? std::int16_t{0} : f < 72'000 ? expected(f) : expected(f - 72'000);
+            same = wrapped[2 * f] == want && wrapped[2 * f + 1] == want;
+        }
+        check(same, "a mono ring wraps like a stereo one");
+        mono.write(unit(120'000), nullptr, 96'000); // Two seconds of silence: the whole ring.
+        const auto silent = mono.read(unit(120'000), unit(216'000));
+        check(silent.size() == 96'000u * 2 && std::all_of(silent.begin(), silent.end(), [](std::int16_t v) { return v == 0; }),
+              "silence written over a mono ring reads silent");
+    }
     // Microphone filters.
     {
         MicFilters bad;
@@ -826,6 +938,127 @@ int main() {
         check(BoundProcess::ofProcess(nullptr).running() == 0 &&
             BoundProcess::ofProcess(event).running() == 0, "missing or non-process recorder handle binds nothing");
         if (event) CloseHandle(event);
+    }
+
+    // A save prepares its tracks a piece at a time: the same samples as reading every ring whole, filtering the
+    // microphone and calling prepareAudioTracks, whatever the piece sizes.
+    {
+        AudioTrack desktopRing(10), micRing(10, sourceChannels(MicrophoneSource)), discordRing(10), gameRing(10);
+        std::uint32_t seed = 7;
+        const auto random = [&] { seed = seed * 1664525u + 1013904223u; return static_cast<std::int16_t>((seed >> 16) % 20'000 - 10'000); };
+        std::vector<std::int16_t> piece(480 * 2);
+        for (int p = 0; p < 600; ++p) { // Six seconds in 10 ms packets; Discord speaks in the middle only.
+            const std::int64_t time = 1'000'000 + p * 100'000;
+            for (auto* ring : {&desktopRing, &micRing, &gameRing}) {
+                for (auto& s : piece) s = random();
+                ring->write(time, piece.data(), 480);
+            }
+            for (auto& s : piece) s = p >= 200 && p < 300 ? random() : 0;
+            discordRing.write(time, piece.data(), 480);
+        }
+        const std::int64_t from = 5'000'000, to = 55'000'000; // 0.4 s to 5.4 s after the first packet.
+        MicFilters filters;
+        filters.noiseSuppression = filters.noiseGate = true;
+        filters.gateOpenDb = -40.f;
+        filters.gateCloseDb = -45.f;
+        const AudioLevels levels{80, 150};
+        auto micWhole = micRing.read(from, to);
+        applyMicFilters(micWhole, filters);
+        const auto whole = prepareAudioTracks(desktopRing.read(from, to), std::move(micWhole), levels,
+                                              discordRing.read(from, to), gameRing.read(from, to), true);
+        for (const std::size_t size : {std::size_t{4'800}, std::size_t{1'001}, std::size_t{77}}) {
+            SaveAudio save({&desktopRing, &micRing, &discordRing, &gameRing}, from, to, filters, levels);
+            check(save.sounds(DiscordSource) && save.sounds(GameSource), "sources with sound are found without copying them whole");
+            const auto layout = save.layout(true);
+            check(layout.names == whole.names && layout.channels == std::vector<int>{2, 2, 1, 2, 2},
+                  "streamed save lays out the same tracks, the microphone's mono");
+            std::vector<std::vector<std::int16_t>> streamed(layout.names.size()), pieces;
+            for (std::size_t done = 0; done < save.frames(); done += size) {
+                save.next(layout, size, pieces);
+                for (std::size_t k = 0; k < pieces.size(); ++k) streamed[k].insert(streamed[k].end(), pieces[k].begin(), pieces[k].end());
+            }
+            check(streamed == whole.tracks, "streamed save gives the same samples as the whole tracks");
+        }
+        { // A save slower than real time, and a second one pressed during it (each copies its span at its press): the
+          // capture thread wraps the rings past both spans before either is read.
+            const std::int64_t from2 = 3'000'000, to2 = 40'000'000; // Overlaps the first span.
+            SaveAudio slow({&desktopRing, &micRing, &discordRing, &gameRing}, from, to, filters, levels);
+            SaveAudio second({&desktopRing, &micRing, &discordRing, &gameRing}, from2, to2, filters, levels);
+            auto micWhole2 = micRing.read(from2, to2);
+            applyMicFilters(micWhole2, filters);
+            const auto whole2 = prepareAudioTracks(desktopRing.read(from2, to2), std::move(micWhole2), levels,
+                                                   discordRing.read(from2, to2), gameRing.read(from2, to2), true);
+            const auto desktopBefore = desktopRing.read(from, to);
+            for (int p = 600; p < 1'800; ++p) { // Twelve more seconds into rings of ten.
+                const std::int64_t time = 1'000'000 + p * 100'000;
+                for (auto* ring : {&desktopRing, &micRing, &discordRing, &gameRing}) {
+                    for (auto& s : piece) s = random();
+                    ring->write(time, piece.data(), 480);
+                }
+            }
+            check(desktopRing.read(from, to) != desktopBefore, "the rings no longer hold the clip's sound");
+            const auto layout = slow.layout(true);
+            std::vector<std::vector<std::int16_t>> streamed(layout.names.size()), pieces;
+            for (std::size_t done = 0; done < slow.frames(); done += 4'800) {
+                slow.next(layout, 4'800, pieces);
+                for (std::size_t k = 0; k < pieces.size(); ++k) streamed[k].insert(streamed[k].end(), pieces[k].begin(), pieces[k].end());
+            }
+            check(streamed == whole.tracks, "a save keeps its sound when the rings are overwritten while it is written");
+            const auto layout2 = second.layout(true);
+            std::vector<std::vector<std::int16_t>> streamed2(layout2.names.size());
+            for (std::size_t done = 0; done < second.frames(); done += 4'800) {
+                second.next(layout2, 4'800, pieces);
+                for (std::size_t k = 0; k < pieces.size(); ++k) streamed2[k].insert(streamed2[k].end(), pieces[k].begin(), pieces[k].end());
+            }
+            check(streamed2 == whole2.tracks, "a save pressed during another one also keeps the sound it had at its press");
+        }
+        { // Sources that were silent through the span: Discord and the game are not copied; the desktop is kept.
+            AudioTrack hushDesktop(10), hushDiscord(10), hushGame(10);
+            for (auto* ring : {&hushDesktop, &hushDiscord, &hushGame}) ring->write(1'000'000, nullptr, 480'000);
+            SaveAudio hushed({&hushDesktop, nullptr, &hushDiscord, &hushGame}, from, to, {}, {});
+            check(hushed.recorded(DiscordSource) && hushed.recorded(GameSource) && !hushed.sounds(DiscordSource) && !hushed.sounds(GameSource),
+                  "a silent Discord or game span is recorded but has no sound and no copy");
+            hushed.drop(DiscordSource);
+            hushed.drop(GameSource);
+            const auto layout = hushed.layout(true);
+            std::vector<std::vector<std::int16_t>> silence;
+            hushed.next(layout, hushed.frames(), silence);
+            check(layout.names == std::vector<std::string>{"desktop"} && silence.size() == 1 && silence[0].size() == hushed.frames() * 2 &&
+                      std::all_of(silence[0].begin(), silence[0].end(), [](std::int16_t s) { return s == 0; }),
+                  "a silent desktop is kept as zeros of the clip's length");
+        }
+        AudioTrack quiet(10);
+        quiet.write(1'000'000, nullptr, 48'000);
+        SaveAudio silent({&desktopRing, nullptr, &quiet, nullptr}, from, to, {}, {});
+        check(!silent.sounds(DiscordSource) && !silent.recorded(GameSource), "a silent or missing source is told apart");
+        silent.drop(DiscordSource);
+        check(silent.layout(true).names == std::vector<std::string>{"desktop"}, "a dropped source leaves no track");
+    }
+    // A save's encoders: every worker runs each round once with its own index; an error reaches wait(), and the
+    // workers go on to the next round.
+    {
+        std::array<int, 4> runs{};
+        std::atomic<int> entered = 0, left = 0, late = 0;
+        std::optional<TrackWorkers> workers;
+        workers.emplace(runs.size(), [&] { ++entered; }, [&] { ++left; });
+        bool rounds = true;
+        for (int round = 0; round < 500; ++round) {
+            workers->start([&](std::size_t worker) { ++runs[worker]; });
+            workers->wait();
+            rounds = rounds && std::all_of(runs.begin(), runs.end(), [&](int n) { return n == round + 1; });
+        }
+        check(rounds, "every worker runs every round once");
+        workers->start([](std::size_t worker) { if (worker == 2) throw std::runtime_error("encoder failed"); });
+        bool thrown = false;
+        try { workers->wait(); } catch (const std::runtime_error&) { thrown = true; }
+        check(thrown, "a worker's error reaches wait()");
+        workers->start([&](std::size_t worker) { ++runs[worker]; });
+        workers->wait();
+        check(runs[2] == 501, "the workers go on after an error");
+        workers->start([&](std::size_t) { std::this_thread::sleep_for(std::chrono::milliseconds(20)); ++late; });
+        workers.reset(); // Without wait(), as when a save fails while encoding.
+        check(late == 4, "a round in progress finishes before the workers end");
+        check(entered == 4 && left == 4, "each worker enters and leaves its thread once");
     }
     return failures ? 1 : 0;
 }

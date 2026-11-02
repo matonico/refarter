@@ -9,6 +9,15 @@
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     const bool startup = refarter::startupLaunch(GetCommandLineW());
     const bool quit = refarter::quitLaunch(GetCommandLineW());
+    const auto command = refarter::launchCommand(GetCommandLineW());
+    // Save and screenshot act on the running Refarter only and never bring its window to the front. They never take
+    // the instance lock either: held for a moment, it would make a Refarter starting then (at sign-in) see a running
+    // copy, find no window yet and exit.
+    if (command == refarter::LaunchCommand::SaveReplay || command == refarter::LaunchCommand::Screenshot) {
+        if (const HWND existing = FindWindowW(L"RefarterDesktopShell", nullptr))
+            PostMessageW(existing, RegisterWindowMessageW(refarter::commandMessageName), static_cast<WPARAM>(command), 0);
+        return 0; // Nothing runs to save from.
+    }
     const HANDLE instanceLock = CreateMutexW(nullptr, FALSE, L"Local\\RefarterDesktopShell");
     if (!instanceLock) return 1;
     const auto closeLock = [](void* handle) { CloseHandle(handle); };
@@ -20,12 +29,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
                 DWORD pid = 0;
                 GetWindowThreadProcessId(existing, &pid);
                 if (!quit) AllowSetForegroundWindow(pid);
-                PostMessageW(existing, RegisterWindowMessageW(quit ? refarter::quitMessageName : refarter::restoreMessageName), 0, 0);
+                if (command != refarter::LaunchCommand::None)
+                    PostMessageW(existing, RegisterWindowMessageW(refarter::commandMessageName), static_cast<WPARAM>(command), 0);
+                else PostMessageW(existing, RegisterWindowMessageW(quit ? refarter::quitMessageName : refarter::restoreMessageName), 0, 0);
             }
         }
         return 0;
     }
-    if (quit) return 0;
+    if (quit) return 0; // --library, with nothing running, starts Refarter on its library.
     // Before anything that could crash; the name carries the version whose symbols read the dump.
     refarter::installCrashDumps(refarter::localAppDataFile(L"crashes"), L"refarter " REFARTER_VERSION_FULL_STRING);
     const auto com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);

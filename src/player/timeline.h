@@ -103,4 +103,63 @@ struct TimelineScale {
     }
 };
 
+// Playback speeds, slowest first. Audio plays at 1× only (decided in #108): the other speeds are silent.
+inline constexpr float playbackSpeeds[] = {0.25f, 0.5f, 1.f, 1.5f, 2.f};
+
+// One step slower (-1) or faster (+1), stopping at the ends; `wrap` goes round instead (the speed button's click).
+inline float stepSpeed(float speed, int step, bool wrap = false) {
+    constexpr int count = static_cast<int>(std::size(playbackSpeeds));
+    int at = 2;
+    for (int i = 0; i < count; ++i) if (playbackSpeeds[i] == speed) at = i;
+    const int next = at + (step > 0 ? 1 : step < 0 ? -1 : 0);
+    return playbackSpeeds[wrap ? (next + count) % count : std::clamp(next, 0, count - 1)];
+}
+
+// "0.25×", "0.5×", "1×", "1.5×", "2×".
+inline std::wstring speedLabel(float speed) {
+    wchar_t text[16];
+    swprintf(text, std::size(text), L"%g×", speed);
+    return text;
+}
+
+// The player's A-B loop: playback repeats from `in` once it reaches `out`. Only the view, for the open clip; never
+// saved. `in` alone (no `out` yet) is a start waiting for its end.
+struct Loop {
+    double in = -1, out = -1;
+    bool active() const { return in >= 0 && out > in; }
+    bool operator==(const Loop&) const = default;
+};
+
+// The shortest loop: about three frames at 60 fps, so B pressed right after A is not a stutter.
+inline constexpr double minimumLoop = 0.05;
+
+// A at `time`: a new start; an end that would come before it is dropped.
+inline Loop loopFrom(Loop loop, double time) {
+    loop.in = std::max(0.0, time);
+    if (loop.out <= loop.in + minimumLoop) loop.out = -1;
+    return loop;
+}
+
+// B at `time`: the end, from A or (without one) from the start of the clip. Too close to A, or before it, nothing changes.
+inline Loop loopTo(Loop loop, double time) {
+    const double in = loop.in >= 0 ? loop.in : 0;
+    if (time <= in + minimumLoop) return loop;
+    return {in, time};
+}
+
+// How far past B playback may already be and still loop: B is set from the picture the window shows, which trails
+// the engine by a moment while playing. A seek further past B plays on.
+inline constexpr double loopReach = 0.25;
+
+// Playback moved from `before` to `now`: back to A once it reaches `wrapAt` (the end of B's picture, so that picture
+// is shown; no later than the clip's last moment). Starting well after B plays on.
+inline bool loopWraps(const Loop& loop, double before, double now, double wrapAt) {
+    return loop.active() && before < loop.out + loopReach && now >= wrapAt;
+}
+
+// Play pressed at `position`: start again at A when the picture is at or just past B (as at a trim's out point).
+inline bool loopRestarts(const Loop& loop, double position, double frameDuration) {
+    return loop.active() && position >= loop.out - frameDuration / 2 && position < loop.out + loopReach;
+}
+
 } // namespace refarter::player

@@ -69,6 +69,7 @@ public:
     HWND create(HWND parent, int id, Callbacks callbacks);
     // `date` is the line the library shows under the clip; empty: from the file's time.
     void open(const std::filesystem::path& path, int volume, const std::wstring& date = {}, bool muted = false);
+    void setTint(std::optional<COLORREF> tint); // The open clip's game colour for the seek bar, or none (after open()).
     // Stops playback and releases the decoder, GPU surfaces and audio device.
     void close();
     void setDpi(UINT dpi);
@@ -98,6 +99,8 @@ public:
 
 private:
     struct Engine;
+    struct FrameWriter;
+    std::shared_ptr<FrameWriter> frameWriter_; // Writes saved frames; made on the first clip, kept for the player's lifetime.
     void setTitle(const std::filesystem::path& path); // The name over the picture, and its width for clicks.
     static LRESULT CALLBACK proc(HWND, UINT, WPARAM, LPARAM);
     LRESULT handle(UINT message, WPARAM wParam, LPARAM lParam);
@@ -111,12 +114,19 @@ private:
     void seek(double time, bool scrub);
     void activate(Part part);
     void drag(float x, float y);
+    // The magnifier: a step in or out around a point of the video rectangle (fractions of it), or back to 1×.
+    void zoomBy(int steps, float px = 0.5f, float py = 0.5f);
+    void setZoom(Zoom zoom);
     void startTrim();
     void endTrim();
     void leaveTrim(); // endTrim, also cancelling a copy that is still being written.
     void save(bool replace);
     std::filesystem::path replaceOriginal(bool keepCopyName = false); // The clip that now holds the trimmed copy.
     void setVolume(int volume, bool remember);
+    void setSpeed(float speed); // A toast says the speed, and that it is silent other than at 1×.
+    void setLoop(Loop loop); // A toast says what the loop now is.
+    // A passing hint as a toast, unless a save's progress, an error or a warning is on show.
+    void notice(const std::wstring& text, ToastKind kind = ToastKind::Notice);
     void step(int frames);
     void toggleFullscreen();
     void showControls();
@@ -137,6 +147,11 @@ private:
     View view_;
     std::unique_ptr<Engine> engine_;
     bool wasPlaying_ = false;   // Playback resumes after a drag on the timeline.
+    // Dragging the zoomed picture: where it started, and whether it moved far enough not to be a click (play/pause).
+    int zoomWheel_ = 0; // Wheel movement over the picture not yet a whole notch (touchpad pinch, fine wheels).
+    POINT panFrom_{};
+    Zoom panStart_;
+    bool panned_ = false;
     bool tracking_ = false;
     LPARAM lastMove_ = -1;      // Mouse moves that did not move do not reveal the controls.
     int thumbnailsFor_ = 0;      // Strip width the thumbnails were made for.

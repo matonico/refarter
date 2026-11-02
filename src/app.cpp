@@ -12,6 +12,7 @@
 #include "source_names.h"
 #include "text.h"
 #include "startup.h"
+#include "jump_list.h"
 #include "window_target.h"
 #include "diagnostic_log.h"
 
@@ -33,6 +34,17 @@ constexpr UINT meterSync = WM_APP + 6;   // Rechecks the meters once a show or h
 constexpr UINT storageQuestion = WM_APP + 8; // Asks the storage question that a save over a game had to leave for later.
 constexpr int initialClientWidth = 1120, initialClientHeight = 760;
 
+// Whether this process runs elevated (as administrator); false when the token cannot be read.
+bool runsElevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION elevation{};
+    DWORD size = 0;
+    const bool read = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) != FALSE;
+    CloseHandle(token);
+    return read && elevation.TokenIsElevated != 0;
+}
+
 } // namespace
 
 bool App::addTrayIcon() { return tray_.present() || tray_.add(smallIcon_, trayTip()); }
@@ -43,6 +55,7 @@ void App::restoreWindow() {
     const bool firstStartupOpen = startupTray_;
     startupTray_ = false;
     if (!state_.closeToTray) removeTrayIcon();
+    if (firstStartupOpen) registerJumpList(executablePath()); // Left out of the hidden sign-in start.
     if (firstStartupOpen) {
         // Sign-in may change the hidden window's bounds while displays settle.
         // Apply the ordinary size once; later tray restores keep the user's size.
@@ -99,6 +112,7 @@ bool App::toggled(int id) const {
     case StartMinimised: return state_.startMinimised;
     case DiagnosticLogging: return state_.diagnosticLogging;
     case CompressCopyAfterTrim: return state_.compressCopyAfterTrim;
+    case GameColours: return state_.gameColours;
     case AskBeforeBinning: return state_.askBeforeBinning;
     case UpdateCheckSwitch: return state_.updateCheck == UpdateChoice::On; // "ask" counts as off until answered.
     default: return false;
@@ -174,6 +188,7 @@ void App::command(int id) {
         break;
     case SelectProcess: chooseSource(); break;
     case AutoCaptureSource: chooseAutoCapture(); break;
+    case SortClips: chooseClipOrder(); break;
     case StartReplay:
         if (busy_ || closing_) return;
         if (recording_ == capture::RecorderState::Off) startReplay();
@@ -187,6 +202,10 @@ void App::command(int id) {
     case CompressCopyAfterTrim:
         state_.compressCopyAfterTrim = !state_.compressCopyAfterTrim;
         player_.setCompressCopyDefault(state_.compressCopyAfterTrim);
+        break;
+    case GameColours:
+        state_.gameColours = !state_.gameColours;
+        clipGrid_.setGameColours(state_.gameColours);
         break;
     case AskBeforeBinning:
         state_.askBeforeBinning = !state_.askBeforeBinning;
@@ -354,10 +373,18 @@ void App::setAutoCaptured(const std::wstring& path, const std::wstring& label, b
     if (on) list.add(path, label);
     else list.remove(path);
     // The list changes only once it is safely on disk.
-    if (writeAutoCapture(autoCapturePath(), list)) autoCapture_ = std::move(list);
-    else setStatus(L"the auto-capture list could not be saved");
+    if (writeAutoCapture(autoCapturePath(), list)) {
+        autoCapture_ = std::move(list);
+        shareListedGames();
+    } else setStatus(L"the auto-capture list could not be saved");
     refreshControls();
     InvalidateRect(window_, nullptr, FALSE);
+}
+
+void App::shareListedGames() {
+    std::vector<std::pair<std::wstring, std::wstring>> games;
+    for (const auto& game : autoCapture_.games) games.emplace_back(game.label, game.path);
+    clipGrid_.setListedGames(games);
 }
 
 bool App::canUseAutoCapture() const {
@@ -451,8 +478,29 @@ void App::updateTrayTip() {
     if (tray_.present()) tray_.setTip(trayTip());
 }
 
-std::wstring App::saveName() const {
-    return target_.source.window ? friendlySourceName(target_.title, target_.name) : lower(target_.name);
+std::wstring App::saveName(std::wstring* executable) const {
+    if (target_.source.window) {
+        if (executable) *executable = target_.path;
+        return friendlySourceName(target_.title, target_.name);
+    }
+    // A whole monitor: a listed game in front on it at the press names the save. Read once here; no hook or polling.
+    // Only while replay runs: a retained replay was recorded before, perhaps of another game now in front.
+    std::optional<ForegroundApp> front;
+    if (executable) executable->clear(); // The monitor's own name has no game behind it.
+    if (recording_ != capture::RecorderState::Buffering) return monitorSaveName(target_.name, front);
+    // The root owner, so a dialog of the game in front still counts as the game.
+    std::wstring frontPath;
+    if (const auto app = windowTarget(GetAncestor(GetForegroundWindow(), GA_ROOTOWNER))) {
+        const auto* listed = autoCapture_.find(app->path);
+        // The list's label, not the live window title, which some games change (server, account): one folder per game.
+        front = ForegroundApp{listed != nullptr,
+                              target_.source.monitor && MonitorFromWindow(app->source.window, MONITOR_DEFAULTTONULL) == target_.source.monitor,
+                              listed ? listed->label : app->title, app->name};
+        frontPath = app->path;
+    }
+    // The game that named it, so its folder shows that game's icon; none when the monitor's name stays.
+    if (executable && front && front->listed && front->onMonitor) *executable = frontPath;
+    return monitorSaveName(target_.name, front);
 }
 
 void App::saveReplay() {
@@ -466,7 +514,10 @@ void App::saveReplay() {
     }
     saving_ = true;
     setStatus(note.empty() ? L"saving replay…" : note);
-    recorder_->save(clipFolder_, saveName(), requestedAt);
+    std::wstring executable;
+    const auto name = saveName(&executable); // Read once: a monitor's name follows the app in front at the press.
+    recorder_->save(clipFolder_, name, requestedAt);
+    savingExecutable_ = std::move(executable); // Remembered once the clip is written.
     // Acknowledge the accepted request, not completion; a failed write plays its own sound later.
     chimes_.play(Chimes::Kind::Saved, false);
     refreshControls();
@@ -534,14 +585,18 @@ void App::receiveEvents() {
             continue; // Shown on the recording page; the status line keeps its message.
         case RecordingEvent::Kind::Saved:
             saving_ = false;
-            if (event.success) clipGrid_.scan(clipFolder_); // The new clip goes to the front.
-            else {
+            if (event.success) {
+                // The game's folder shows its icon: keyed by the game as the library reads it back from the clip's name.
+                if (!savingExecutable_.empty()) clipGrid_.rememberGame(clipSourceFromName(event.path), savingExecutable_);
+                clipGrid_.scan(clipFolder_); // The new clip goes to the front.
+            } else {
                 // The replay survives a failed save only if nothing is stopping, quitting or clearing it meanwhile.
                 event.message = failedSaveText(event.message, replayKeptNow());
                 // Heard over the game; silent while sleep, sign-out or quitting waits for the save.
                 sounded = !quietDialogs();
                 if (sounded) chimes_.play(Chimes::Kind::Failed, false);
             }
+            savingExecutable_.clear();
             break;
         case RecordingEvent::Kind::Folder:
             busy_ = false;
@@ -649,6 +704,19 @@ LRESULT CALLBACK App::windowProc(HWND window, UINT message, WPARAM wParam, LPARA
 LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
     if (restoreMessage_ && message == restoreMessage_) { if (!closing_) restoreWindow(); return 0; }
     if (quitMessage_ && message == quitMessage_) { quit(); return 0; }
+    if (commandMessage_ && message == commandMessage_) {
+        // As the shortcuts do: save and screenshot only while replay runs, with their chime, and the window stays where it is.
+        if (closing_) return 0;
+        // While a shortcut is being assigned no press saves (see WM_HOTKEY), so neither does the jump list's.
+        if (assigning_ && static_cast<LaunchCommand>(wParam) != LaunchCommand::Library) return 0;
+        switch (static_cast<LaunchCommand>(wParam)) {
+        case LaunchCommand::SaveReplay: shortcutPressed(saveShortcut); break;
+        case LaunchCommand::Screenshot: shortcutPressed(screenshotShortcut); break;
+        case LaunchCommand::Library: restoreWindow(); command(Library); break;
+        default: break;
+        }
+        return 0;
+    }
     if (tray_.taskbarCreated(message)) {
         // Explorer discarded the icon; recreate it without polling. Never
         // leave the app inaccessible if the shell cannot accept a new icon.
@@ -796,6 +864,7 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (wParam && storageQuestionQueued_) PostMessageW(window_, storageQuestion, 0, 0); // Not inside the activation itself.
         if (wParam && state_.updateCheck == UpdateChoice::Ask) PostMessageW(window_, updateQuestion, 0, 0); // The opt-in question, if Refarter is in front.
         if (wParam && !queuedErrors_.empty()) PostMessageW(window_, errorDialogs, 0, 0); // Errors that arrived while a game was in front.
+        if (wParam) PostMessageW(window_, meterForeground, 0, 0); // Meters stopped under a game run again; foreground settles first (the hook skips our own process).
         break;
     case WM_CREATE: {
         dpi_ = GetDpiForWindow(window_);
@@ -810,6 +879,14 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         tray_.create(window_, trayEvent);
         restoreMessage_ = RegisterWindowMessageW(restoreMessageName);
         quitMessage_ = RegisterWindowMessageW(quitMessageName);
+        commandMessage_ = RegisterWindowMessageW(commandMessageName);
+        // Only a Refarter run as administrator (for shortcuts over an elevated game) opens the filter, so it still takes
+        // these from the jump list, Explorer or a tool at the user's usual level, and Explorer's TaskbarCreated, which
+        // Windows would otherwise drop without a word (UIPI). A normal Refarter keeps the filter: opening it would let
+        // lower-integrity processes, such as browser sandboxes, post these messages too.
+        if (runsElevated())
+            for (const UINT handOver : {restoreMessage_, quitMessage_, commandMessage_, tray_.taskbarCreatedMessage()})
+                if (handOver) ChangeWindowMessageFilterEx(window_, handOver, MSGFLT_ALLOW, nullptr);
         refreshStartup();
         if (state_.closeToTray) addTrayIcon();
         createControls();
@@ -861,8 +938,9 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_GETMINMAXINFO: {
         auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
         // The Recording and Settings pages scroll, so this is no longer their height; it keeps the sidebar and the
-        // library laid out above the footer.
-        RECT minimum{0, 0, px(960), px(740)};
+        // library laid out above the footer. The width keeps the trim bar on one row for a clip with four audio sources,
+        // beside the expanded sidebar (see computeLayout): 836 px of player + 196 sidebar + 2 x 24 gaps.
+        RECT minimum{0, 0, px(1080), px(680)};
         AdjustWindowRectExForDpi(&minimum, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi_);
         limits->ptMinTrackSize = {minimum.right - minimum.left, minimum.bottom - minimum.top};
         return 0;
@@ -896,6 +974,9 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             saveSettings();
             refreshControls();
             InvalidateRect(control(AskBeforeBinning), nullptr, FALSE);
+        }
+        else if (LOWORD(wParam) == Clips && HIWORD(wParam) == ClipGrid::coloursChanged) {
+            if (playerOpen_) player_.setTint(clipGrid_.gameColour(clipGrid_.openClip())); // Its colour arrived after it opened.
         }
         else if (LOWORD(wParam) == Clips && HIWORD(wParam) == ClipGrid::noteChanged) {
             invalidateStrip(); // The strip under the card shows the note.
@@ -967,6 +1048,7 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         PostMessageW(window_, meterSync, 0, 0);
         return 0;
     case meterSync: syncMeters(); return 0;
+    case meterForeground: meterForegroundChanged(); return 0;
     case leftoversDone: leftoversHandled(static_cast<int>(wParam), static_cast<int>(lParam)); return 0;
     case WM_POWERBROADCAST: powerBroadcast(wParam); return TRUE;
     case WM_QUERYENDSESSION: return queryEndSession(lParam) ? TRUE : FALSE;
@@ -1067,6 +1149,7 @@ App::~App() {
     finishLeftoverCleanup();
     compression_.stop();
     auto_.unwatchGameExit(); recorder_.reset(); // Join callbacks before the mailbox is destroyed.
+    watchMeterForeground(false); // Normally gone already (quit() syncs the meters); never leave a hook behind.
     closeMeterCaptures();
     joinMeterClosers(); // Every meter capture thread has ended before the meters, COM and the process go.
     diagnosticLog().write(DiagnosticEvent::SessionEnded);
@@ -1100,6 +1183,9 @@ int App::run(HINSTANCE instance, int showCommand, bool startup) {
         // Failed tray creation must never leave an inaccessible hidden process.
         ShowWindow(window_, startup ? SW_SHOW : showCommand);
         UpdateWindow(window_);
+        // The taskbar's save replay, screenshot and open library, once per start, after the window is up; a hidden
+        // sign-in start leaves this shell work for the first time its window opens (restoreWindow).
+        registerJumpList(executablePath());
         SetFocus(control(Library));
         PostMessageW(window_, updateQuestion, 0, 0);
         if (!clipGrid_.scanned()) clipGrid_.scan(clipFolder_);

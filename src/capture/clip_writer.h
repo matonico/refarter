@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -18,11 +19,15 @@ struct ClipFormat {
     Codec codec = Codec::H264;
     std::vector<std::uint8_t> sequenceHeader; // Annex B parameter sets, or the encoder's AV1 codec data.
     std::int64_t end = 0; // Packet-clock time the clip ends; the last frame is held until then.
-    // Audio tracks, each 48 kHz stereo 16-bit PCM starting at the first packet.
-    // Encoded to AAC while saving, so nothing encodes audio during gameplay.
-    std::vector<std::vector<std::int16_t>> audio;
-    // Per audio track, written as its handler name (at most 12 characters); may be empty.
+    // Audio tracks, one per name (written as its handler name, at most 12 characters; may be empty), each
+    // `audioFrames` of 48 kHz 16-bit PCM starting at the first packet, interleaved with the track's `audioChannels`
+    // (2 when missing; 1 for the microphone). `audio` gives the next frames of every track, in order, while the clip
+    // is written, so a save never holds whole tracks. Encoded to AAC while saving, so nothing encodes audio during
+    // gameplay.
     std::vector<std::string> audioNames;
+    std::vector<int> audioChannels;
+    std::size_t audioFrames = 0;
+    std::function<void(std::size_t frames, std::vector<std::vector<std::int16_t>>& tracks)> audio;
     bool preserveCaptureTime = false; // Recorder enables this; direct probe callers retain their supplied durations.
 };
 

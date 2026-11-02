@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -95,12 +96,78 @@ inline int meterLength(float fraction, int length) {
     return std::clamp(static_cast<int>(std::lround(fraction * static_cast<float>(std::max(length, 0)))), 0, std::max(length, 0));
 }
 
-// Saved tracks and the names written into the file for them (MP4 handler names,
-// read by the built-in player to offer each source on its own).
+// Saved tracks (interleaved, stereo except the microphone's: see sourceChannels) and the names written into the
+// file for them (MP4 handler names, read by the built-in player to offer each source on its own).
 struct PreparedAudio {
     std::vector<std::vector<std::int16_t>> tracks;
     std::vector<std::string> names;
 };
+
+// The sources, in this order, as prepareAudioTracks and SaveAudio take them.
+enum AudioSource : int { DesktopSource, MicrophoneSource, DiscordSource, GameSource, audioSourceCount };
+
+// Channels a source is buffered and saved with: the microphone is mono (its two channels averaged), the others and
+// the mix stereo. Everything in between (ring reads, filters, volume, the mix) stays stereo.
+inline constexpr int sourceChannels(int source) { return source == MicrophoneSource ? 1 : 2; }
+
+// Stereo frames to mono, the two channels averaged (the same as a mono ring stores them).
+inline void downmix(const std::int16_t* stereo, std::size_t frames, std::int16_t* mono) {
+    for (std::size_t f = 0; f < frames; ++f) mono[f] = static_cast<std::int16_t>((stereo[2 * f] + stereo[2 * f + 1]) / 2);
+}
+
+// The volume setting a source takes: Discord and the game are part of desktop audio.
+inline int sourcePercent(int source, const AudioLevels& levels) {
+    return source == MicrophoneSource ? levels.microphonePercent : levels.desktopPercent;
+}
+
+// Which tracks a clip saves (see prepareAudioTracks): their names and, per track, the sources summed into it and
+// its channels (a track of one source has that source's, the mix is stereo).
+struct AudioLayout {
+    std::vector<std::string> names;
+    std::vector<std::vector<int>> sources;
+    std::vector<int> channels;
+};
+
+inline AudioLayout audioLayout(const std::array<bool, audioSourceCount>& recorded, bool gameInDesktop) {
+    static constexpr const char* names[] = {"desktop", "microphone", "discord", "game output"};
+    std::vector<int> summed; // The game stands out of the mix while desktop audio already holds it.
+    for (int source = 0; source < audioSourceCount; ++source)
+        if (recorded[source] && (source != GameSource || !gameInDesktop)) summed.push_back(source);
+    AudioLayout layout;
+    const auto add = [&](const char* name, std::vector<int> sources) {
+        layout.names.push_back(name);
+        layout.channels.push_back(sources.size() == 1 ? sourceChannels(sources.front()) : 2);
+        layout.sources.push_back(std::move(sources));
+    };
+    if (summed.size() > 1) add("mix", summed);
+    for (const int source : summed) add(names[source], {source});
+    // The game's own sound is already in desktop audio (and so in the mix): it is a track of its own, never summed.
+    if (gameInDesktop && recorded[GameSource]) add("game", {GameSource});
+    return layout;
+}
+
+// One piece of every track of `layout` from one stereo piece of each source (volume applied), `samples` long each;
+// a mono track comes out half as long.
+inline void mixPieces(const AudioLayout& layout, const std::array<const std::int16_t*, audioSourceCount>& pieces,
+                      std::size_t samples, std::vector<std::vector<std::int16_t>>& tracks) {
+    tracks.resize(layout.sources.size());
+    for (std::size_t t = 0; t < tracks.size(); ++t) {
+        auto& track = tracks[t];
+        const auto& sources = layout.sources[t];
+        if (layout.channels[t] == 1) {
+            track.resize(samples / 2);
+            downmix(pieces[sources.front()], samples / 2, track.data());
+            continue;
+        }
+        track.resize(samples);
+        if (sources.size() == 1) { std::copy_n(pieces[sources.front()], samples, track.begin()); continue; }
+        for (std::size_t i = 0; i < samples; ++i) {
+            int sum = 0;
+            for (const int source : sources) sum += pieces[source][i];
+            track[i] = static_cast<std::int16_t>(std::clamp(sum, -32768, 32767));
+        }
+    }
+}
 
 // Inputs already have any microphone filters applied; an empty input was not
 // recorded. Discord, split out of desktop audio, keeps the desktop volume. Keep
@@ -114,39 +181,34 @@ inline PreparedAudio prepareAudioTracks(
         std::vector<std::int16_t> desktop, std::vector<std::int16_t> microphone,
         const AudioLevels& levels, std::vector<std::int16_t> discord = {}, std::vector<std::int16_t> game = {},
         bool gameInDesktop = true) {
-    applyAudioLevel(desktop, levels.desktopPercent);
-    applyAudioLevel(microphone, levels.microphonePercent);
-    applyAudioLevel(discord, levels.desktopPercent);
-    applyAudioLevel(game, levels.desktopPercent); // The game is part of desktop audio.
-    std::vector<std::int16_t> none; // Stands in for the game when it is already inside desktop audio.
-    const std::pair<const char*, std::vector<std::int16_t>*> sources[] = {
-        {"desktop", &desktop}, {"microphone", &microphone}, {"discord", &discord}, {"game output", gameInDesktop ? &none : &game}};
-    std::size_t recorded = 0, longest = 0;
-    for (const auto& [name, samples] : sources) {
-        if (samples->empty()) continue;
-        ++recorded;
-        longest = std::max(longest, samples->size());
+    std::vector<std::int16_t>* sources[] = {&desktop, &microphone, &discord, &game};
+    std::array<bool, audioSourceCount> recorded{};
+    for (int source = 0; source < audioSourceCount; ++source) {
+        applyAudioLevel(*sources[source], sourcePercent(source, levels));
+        recorded[source] = !sources[source]->empty();
     }
+    const auto layout = audioLayout(recorded, gameInDesktop);
     PreparedAudio prepared;
-    if (recorded > 1) {
+    prepared.names = layout.names;
+    for (std::size_t t = 0; t < layout.sources.size(); ++t) {
+        const auto& summed = layout.sources[t];
+        if (layout.channels[t] == 1) { // The microphone, saved mono.
+            const auto& stereo = *sources[summed.front()];
+            std::vector<std::int16_t> mono(stereo.size() / 2);
+            downmix(stereo.data(), mono.size(), mono.data());
+            prepared.tracks.push_back(std::move(mono));
+            continue;
+        }
+        if (summed.size() == 1) { prepared.tracks.push_back(std::move(*sources[summed.front()])); continue; }
+        std::size_t longest = 0; // Whole tracks may differ in length; a missing sample is silence.
+        for (const int source : summed) longest = std::max(longest, sources[source]->size());
         std::vector<std::int16_t> mixed(longest);
         for (std::size_t i = 0; i < mixed.size(); ++i) {
             int sum = 0;
-            for (const auto& [name, samples] : sources) if (i < samples->size()) sum += (*samples)[i];
+            for (const int source : summed) if (i < sources[source]->size()) sum += (*sources[source])[i];
             mixed[i] = static_cast<std::int16_t>(std::clamp(sum, -32768, 32767));
         }
-        prepared.tracks.push_back(std::move(mixed));
-        prepared.names.push_back("mix");
-    }
-    for (const auto& [name, samples] : sources) {
-        if (samples->empty()) continue;
-        prepared.tracks.push_back(std::move(*samples));
-        prepared.names.push_back(name);
-    }
-    // The game's own sound is already in desktop audio (and so in the mix): it is a track of its own, never summed.
-    if (gameInDesktop && !game.empty()) {
-        prepared.tracks.push_back(std::move(game));
-        prepared.names.push_back("game");
+        prepared.tracks.push_back(std::move(mixed)); // The mix comes first, before its sources move.
     }
     return prepared;
 }

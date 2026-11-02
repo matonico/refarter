@@ -12,7 +12,7 @@ using namespace theme;
 using namespace ui;
 
 // Sidebar widths and the gap before page content, in logical pixels.
-constexpr int expandedSidebar = 214, collapsedSidebar = 64, contentGap = 36;
+constexpr int expandedSidebar = 196, collapsedSidebar = 64, contentGap = 24;
 // A full-width footer under the sidebar and pages: status and source on the left, the version on the right.
 constexpr int footerHeight = 26;
 // Window messages shared by several app*.cpp files. WM_APP + 1 to + 6 and + 8 are private to app.cpp, + 3 and + 4 also in auto_session.h.
@@ -20,6 +20,7 @@ constexpr UINT leftoversDone = WM_APP + 7;   // The startup scan for unfinished 
 constexpr UINT updateChecked = WM_APP + 9;   // The release check's worker has an answer (UpdateClient::take; see app_updates.cpp).
 constexpr UINT updateQuestion = WM_APP + 10; // Ask the opt-in question now if Refarter is in front.
 constexpr UINT errorDialogs = WM_APP + 11;   // Show the error messages that waited for Refarter's own window to be in front.
+constexpr UINT meterForeground = WM_APP + 12; // The window in front may have changed: look at what covers the meters (see app_meters.cpp).
 // The right end of the footer reserves this much (logical px) for the version text; an "update available" text adds its own width.
 constexpr int footerVersionReserve = 220;
 constexpr std::chrono::seconds startupUpdateDelay{30}; // The automatic check waits this long after start-up (a worker asleep on an event, not a timer).
@@ -30,8 +31,10 @@ constexpr int libraryRowTop = 80, libraryRowHeight = 38, libraryCardTop = 118, l
 constexpr int tileButton = 32, tileButtonTop = libraryCardTop - 6 - tileButton;
 // The pair of tile-size buttons ends at the content edge; the clip count ends before them.
 constexpr int tileGap = 4, countGap = 16, countWidth = 90;
-// The folders toggle stands a little apart, left of the tile-size pair; the clip count then ends before it.
-constexpr int folderGap = 10, libraryButtonsWidth = 3 * tileButton + tileGap + folderGap;
+// The folders toggle stands a little apart, left of the tile-size pair, with the sort menu just before it; the clip
+// count then ends before them.
+constexpr int folderGap = 10, folderButtonOffset = 3 * tileButton + tileGap + folderGap;
+constexpr int libraryButtonsWidth = folderButtonOffset + tileGap + tileButton;
 constexpr int footerButton = 30; // The strip's folder button.
 // The library's search field, on the line of the page title: the edit, its frame's padding and the magnifier before it.
 constexpr int searchWidth = 200, searchHeight = 23, searchTop = 29, searchFramePad = 8, searchIconRoom = 22;
@@ -46,7 +49,7 @@ inline bool tabDivider(ClipView view, int left) { return left != static_cast<int
 constexpr int meterSpeakerIcon = -1, meterMicIcon = -2;
 void icon(HDC dc, int kind, int x, int y, int size, COLORREF value);
 // Library buttons drawn as icons; their text is the tooltip and the screen reader name.
-constexpr int libraryIconIds[] = {GroupFolders, LargeTiles, SmallTiles, OpenFolder};
+constexpr int libraryIconIds[] = {SortClips, GroupFolders, LargeTiles, SmallTiles, OpenFolder};
 constexpr int numberIds[] = {CustomSeconds, Bitrate, StorageLimitField, GateOpen, GateClose, GateAttack, GateHold, GateRelease};
 constexpr int sliderIds[] = {DesktopVolume, MicrophoneVolume, ChimeVolume};
 // The percentages beside the source sliders can be typed in; the chime's stays a plain label.
@@ -86,7 +89,7 @@ inline Slot rowSlot(int id) {
     case StorageBehaviour: return {200, 34, 0, 0};
     case GateOpen: case GateClose: return {40, 23, 60, 28};
     case GateAttack: case GateHold: case GateRelease: return {40, 23, 60, 30};
-    case Suppression: case Gate: case RecordDiscord: case CloseToTray: case StartWithWindows: case StartMinimised: case DiagnosticLogging: case CompressCopyAfterTrim: case AskBeforeBinning: case UpdateCheckSwitch: return {40, 22, 0, 0};
+    case Suppression: case Gate: case RecordDiscord: case CloseToTray: case StartWithWindows: case StartMinimised: case DiagnosticLogging: case CompressCopyAfterTrim: case AskBeforeBinning: case UpdateCheckSwitch: case GameColours: return {40, 22, 0, 0};
     case UpdateCheckNow: return {160, 34, 0, 16}; // Left of the switch, 16 px away.
     case ThirtySeconds: case OneMinute: case ThreeMinutes: case FiveMinutes: return {54, 34, 4, 0};
     case SelectProcess: return {130, 34, 0, 0};

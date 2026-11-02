@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(Refarter VERSION 1.0.0 LANGUAGES CXX)
+project(Refarter VERSION 1.1.0 LANGUAGES CXX)
 
 if(NOT WIN32)
   message(FATAL_ERROR "Refarter currently targets Windows only.")
@@ -74,7 +74,7 @@ add_library(refarter_capture STATIC
   src/capture/video_encoder.cpp)
 refarter_defaults(refarter_capture)
 target_include_directories(refarter_capture PUBLIC src)
-target_link_libraries(refarter_capture PUBLIC refarter_diagnostics d3d11 dxgi dwmapi mfplat mfuuid mfreadwrite windowsapp shell32 ole32 avrt mmdevapi windowscodecs PRIVATE rnnoise)
+target_link_libraries(refarter_capture PUBLIC refarter_diagnostics d3d11 dxgi dwmapi mfplat mfuuid mfreadwrite wmcodecdspuuid windowsapp shell32 ole32 avrt mmdevapi windowscodecs PRIVATE rnnoise)
 
 # In-app player and trimming: a minimal static FFmpeg (MP4, H.264/HEVC/AV1/AAC,
 # D3D11VA) and dav1d, built once by scripts/build-ffmpeg.ps1 into .deps/ffmpeg.
@@ -92,6 +92,7 @@ target_link_libraries(ffmpeg INTERFACE bcrypt ole32 user32 mfplat mfuuid mfreadw
 add_library(refarter_player STATIC
   src/player/audio_output.cpp
   src/player/clip_player.cpp
+  src/player/clip_preview.cpp
   src/player/clip_trim.cpp
   src/player/clip_export.cpp
   src/player/media.cpp
@@ -103,24 +104,24 @@ target_link_libraries(refarter_player PUBLIC refarter_capture ffmpeg d2d1 dwrite
 
 enable_language(RC)
 add_executable(Refarter WIN32 src/main.cpp src/app.cpp src/app_layout.cpp src/app_paint.cpp src/app_controls.cpp src/app_menus.cpp src/app_settings.cpp src/app_storage.cpp src/app_library.cpp src/app_meters.cpp src/app_updates.cpp src/update_client.cpp src/auto_session.cpp src/chime.cpp src/tray_icon.cpp src/compression_job.cpp src/recording_controller.cpp
-  src/clip_grid.cpp src/clip_library.cpp src/clip_sources.cpp src/favourites.cpp src/config.cpp src/startup.cpp src/auto_capture.cpp src/auto_capture_card.cpp src/tray_flyout.cpp src/value_bubble.cpp
+  src/clip_grid.cpp src/clip_library.cpp src/clip_sources.cpp src/game_icons.cpp src/favourites.cpp src/config.cpp src/startup.cpp src/jump_list.cpp src/auto_capture.cpp src/auto_capture_card.cpp src/tray_flyout.cpp src/value_bubble.cpp
   src/popup_menu.cpp src/message_box.cpp src/window_target.cpp src/app_lifecycle.cpp src/leftover_files.cpp src/crash_dumps.cpp src/resources.rc)
 refarter_defaults(Refarter)
 # assets: icon, save chime and failed-save sound; config: the refarter.ini template embedded for first launch.
 target_include_directories(Refarter PRIVATE assets config ${CMAKE_CURRENT_BINARY_DIR}/generated)
-target_link_libraries(Refarter PRIVATE gdiplus dwmapi comctl32 ole32 winmm uxtheme windowscodecs advapi32 winhttp refarter_capture refarter_player)
+target_link_libraries(Refarter PRIVATE gdiplus dwmapi comctl32 ole32 msimg32 propsys winmm uxtheme windowscodecs advapi32 winhttp refarter_capture refarter_player)
 # The shipped exe names its PDB without the build machine's path.
 if(MSVC)
   target_link_options(Refarter PRIVATE $<$<CONFIG:Release>:/PDBALTPATH:$<TARGET_PDB_FILE_NAME:Refarter>>)
 endif()
 
-add_executable(refarter-record tools/refarter_record.cpp src/clip_library.cpp src/recycle_bin.cpp src/clip_sources.cpp src/favourites.cpp)
+add_executable(refarter-record tools/refarter_record.cpp src/clip_library.cpp src/recycle_bin.cpp src/clip_sources.cpp src/game_icons.cpp src/favourites.cpp)
 refarter_defaults(refarter-record)
 target_link_libraries(refarter-record PRIVATE refarter_capture pdh psapi windowscodecs winmm)
 
 include(CTest)
 if(BUILD_TESTING)
-  foreach(test replay_duration capture_logic clip_list clip_selection hotkey config settings chime timing_trace source_names startup favourites auto_capture auto_session player_timeline export_plan power_resume leftover_files save_errors startup_retry diagnostic_log compression_diagnostics trim_follow_up storage_limit audio_device_state player_view value_bubble volume_input temporary_clip trim_cancel long_path update_check)
+  foreach(test replay_duration capture_logic clip_list clip_selection hotkey config settings chime timing_trace source_names startup favourites auto_capture auto_session auto_session_wiring accent_colour clip_preview player_timeline player_zoom export_plan power_resume leftover_files save_errors startup_retry diagnostic_log compression_diagnostics trim_follow_up storage_limit audio_device_state player_view value_bubble volume_input temporary_clip trim_cancel long_path update_check mp4_tracks track_workers meter_rules clip_writer)
     add_executable(${test}_test tests/${test}_test.cpp)
     refarter_defaults(${test}_test)
     target_include_directories(${test}_test PRIVATE src)
@@ -149,15 +150,21 @@ if(BUILD_TESTING)
   target_sources(save_errors_test PRIVATE tests/clip_folder_preflight_cases.cpp)
   target_link_libraries(save_errors_test PRIVATE shell32 ole32)
   target_link_libraries(capture_logic_test PRIVATE refarter_capture)
+  # Media Foundation's software H.264 encoder and MP4 sink; fails rather than hangs when a save stalls.
+  target_link_libraries(clip_writer_test PRIVATE refarter_capture)
+  set_tests_properties(clip_writer PROPERTIES TIMEOUT 120)
   target_link_libraries(clip_selection_test PRIVATE user32 shell32 ole32)
   target_sources(startup_test PRIVATE src/startup.cpp)
   target_link_libraries(startup_test PRIVATE advapi32 shell32)
-  target_sources(favourites_test PRIVATE src/favourites.cpp src/clip_sources.cpp)
-  target_link_libraries(favourites_test PRIVATE shell32 ole32)
+  target_sources(favourites_test PRIVATE src/favourites.cpp src/clip_sources.cpp src/game_icons.cpp)
+  target_link_libraries(favourites_test PRIVATE shell32 ole32 windowscodecs windowsapp)
   target_sources(auto_capture_test PRIVATE src/auto_capture.cpp)
   target_link_libraries(auto_capture_test PRIVATE shell32 ole32)
   target_sources(auto_session_test PRIVATE src/auto_capture.cpp)
   target_link_libraries(auto_session_test PRIVATE shell32 ole32)
+  # The real AutoSession against a stand-in App: starts, stops, sleep and process exit.
+  target_sources(auto_session_wiring_test PRIVATE src/auto_session.cpp src/auto_capture.cpp src/auto_capture_card.cpp src/window_target.cpp)
+  target_link_libraries(auto_session_wiring_test PRIVATE refarter_diagnostics shell32 ole32 dwmapi gdiplus)
   # Manual opt-in: requires a desktop and hardware encoder, unlike CTest units.
   add_executable(recorder_lifecycle_check tests/recorder_lifecycle_check.cpp)
   refarter_defaults(recorder_lifecycle_check)
@@ -166,12 +173,19 @@ if(BUILD_TESTING)
   add_executable(player_media_check tests/player_media_check.cpp)
   refarter_defaults(player_media_check)
   target_link_libraries(player_media_check PRIVATE refarter_player)
+  # Manual opt-in: times one hover preview (12 keyframes at tile size) on a real clip.
+  add_executable(clip_preview_check tests/clip_preview_check.cpp)
+  refarter_defaults(clip_preview_check)
+  target_link_libraries(clip_preview_check PRIVATE refarter_player psapi)
   # Manual opt-in: creates disposable copies; needs a hardware H.264 encoder.
   add_executable(clip_export_check tests/clip_export_check.cpp)
   refarter_defaults(clip_export_check)
   target_link_libraries(clip_export_check PRIVATE refarter_player psapi)
   # Manual opt-in: Shell metadata and Recycle Bin, using disposable scratch copies only.
-  add_executable(clip_library_check tests/clip_library_check.cpp src/clip_library.cpp src/recycle_bin.cpp src/clip_sources.cpp src/favourites.cpp)
+  add_executable(clip_library_check tests/clip_library_check.cpp src/clip_library.cpp src/recycle_bin.cpp src/clip_sources.cpp src/game_icons.cpp src/favourites.cpp)
   refarter_defaults(clip_library_check)
   target_link_libraries(clip_library_check PRIVATE refarter_capture windowscodecs)
+  # Manual opt-in: starts a built Refarter.exe, waits for its window, quits it and looks for crash dumps.
+  add_executable(launch_check tests/launch_check.cpp)
+  refarter_defaults(launch_check)
 endif()

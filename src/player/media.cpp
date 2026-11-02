@@ -1,4 +1,5 @@
 #include "player/media.h"
+#include "player/stereo_resampler.h"
 #include "long_path.h"
 #include "text.h"
 
@@ -217,7 +218,7 @@ bool MediaFile::openVideo(bool hardware) {
         video_->extra_hw_frames = 6; // Pictures held for display while the decoder runs ahead.
         video_->thread_count = 1;
     } else {
-        video_->thread_count = 0; // One per core.
+        video_->thread_count = std::max(0, options_.softwareThreads); // 0 is one per core.
     }
     if (avcodec_open2(video_, codec, nullptr) < 0) {
         avcodec_free_context(&video_);
@@ -245,12 +246,7 @@ bool MediaFile::selectAudio(const std::vector<int>& tracks) {
             return false;
         }
         decoder->codec->pkt_timebase = stream->time_base;
-        AVChannelLayout stereo{};
-        av_channel_layout_default(&stereo, 2);
-        const int made = swr_alloc_set_opts2(&decoder->resampler, &stereo, AV_SAMPLE_FMT_FLT, 48000,
-            &decoder->codec->ch_layout, decoder->codec->sample_fmt, decoder->codec->sample_rate, 0, nullptr);
-        av_channel_layout_uninit(&stereo);
-        if (made < 0 || swr_init(decoder->resampler) < 0) { closeAudio(); return false; }
+        if (!detail::openStereoResampler(&decoder->resampler, decoder->codec, stream, 48000)) { closeAudio(); return false; }
         stream->discard = AVDISCARD_DEFAULT;
         decoders_.push_back(std::move(decoder));
         selection_.push_back(track);

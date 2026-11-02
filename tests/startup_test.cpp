@@ -14,6 +14,12 @@ int main() {
     check(!startupLaunch(L"Refarter.exe") && !startupLaunch(L"Refarter.exe --startup extra") &&
           !startupLaunch(L"Refarter.exe --startup-other"), "ordinary and unknown launches stay visible");
     check(quitLaunch(L"Refarter.exe --quit") && !quitLaunch(L"Refarter.exe --startup"), "quit distinct from startup");
+    check(launchCommand(L"Refarter.exe --save-replay") == LaunchCommand::SaveReplay &&
+          launchCommand(L"\"C:\\Program Files\\Refarter\\Refarter.exe\" --screenshot") == LaunchCommand::Screenshot &&
+          launchCommand(L"Refarter.exe --library") == LaunchCommand::Library, "jump list flags parsed");
+    check(launchCommand(L"Refarter.exe") == LaunchCommand::None && launchCommand(L"Refarter.exe --quit") == LaunchCommand::None &&
+          launchCommand(L"Refarter.exe --save-replay --library") == LaunchCommand::None &&
+          launchCommand(L"Refarter.exe --SAVE-REPLAY") == LaunchCommand::None, "other launches carry no command");
 
     // Exercise real registry operations in an isolated key, never the live Run key.
     const auto key = L"Software\\RefarterTests\\startup-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());

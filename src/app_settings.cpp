@@ -21,6 +21,7 @@ void App::loadSettings() {
     state_.replaySeconds = saved.replaySeconds;
     state_.smallTiles = saved.smallTiles;
     state_.groupFolders = saved.groupFolders;
+    state_.clipOrder = saved.clipOrder;
     state_.askBeforeBinning = saved.askBeforeBinning;
     video_ = saved.video;
     audio_.desktop = saved.desktopAudio;
@@ -42,6 +43,7 @@ void App::loadSettings() {
         updateNote_ = L"version " + update::displayVersion(updateTag_) + L" is available";
     }
     state_.compressCopyAfterTrim = saved.compressCopyAfterTrim;
+    state_.gameColours = saved.gameColours;
     player_.setCompressCopyDefault(saved.compressCopyAfterTrim);
     configureDiagnostics(saved.diagnosticLogging);
     playerVolume_ = saved.playerVolume;
@@ -131,6 +133,7 @@ UserSettings App::settings() const {
     if (clipFolder_ != capture::defaultClipFolder()) s.clipFolder = clipFolder_;
     s.smallTiles = state_.smallTiles;
     s.groupFolders = state_.groupFolders;
+    s.clipOrder = state_.clipOrder;
     s.askBeforeBinning = state_.askBeforeBinning;
     s.sourceMonitor = sourceMonitor_;
     s.levels = audio_.levels;
@@ -144,6 +147,7 @@ UserSettings App::settings() const {
     s.availableUpdateTag = updateTag_;
     s.availableUpdateUrl = updateUrl_;
     s.compressCopyAfterTrim = state_.compressCopyAfterTrim;
+    s.gameColours = state_.gameColours;
     s.chimePercent = chimes_.percent();
     s.playerVolume = playerVolume_;
     s.autoCapture = autoCaptureOn_;

@@ -1,5 +1,6 @@
 #include "player/audio_sources.h"
 #include "player/clip_trim.h"
+#include "player/mono_matrix.h"
 #include "player/timeline.h"
 #include <iostream>
 
@@ -119,7 +120,40 @@ int main() {
           "the game is included only while desktop is on (not game output)");
     check(!TrimAudio{}.changesAudio() && TrimAudio{{1}}.changesAudio() && TrimAudio{{}, false, {}, {}, true}.changesAudio(),
           "an empty keep list is every track; none is explicit");
+    check(unityMonoMatrix("microphone", 1), "Refarter's mono microphone plays at its own level on both sides");
+    check(!unityMonoMatrix("microphone", 2) && !unityMonoMatrix("desktop", 1) && !unityMonoMatrix("SoundHandler", 1) && !unityMonoMatrix("", 1),
+          "stereo tracks and other mono tracks keep the default mapping");
     check(!audioSources({L"audio"}).switchable(), "single track is not switchable");
     check(!audioSources({L"track 1", L"track 2"}).switchable(), "other files pick one track");
+
+    // Playback speed: keys stop at the ends, the button goes round.
+    check(stepSpeed(1, 1) == 1.5f && stepSpeed(1, -1) == 0.5f, "one step either way from 1×");
+    check(stepSpeed(2, 1) == 2 && stepSpeed(0.25f, -1) == 0.25f, "keys stop at 2× and 0.25×");
+    check(stepSpeed(2, 1, true) == 0.25f && stepSpeed(0.25f, -1, true) == 2, "the button goes round");
+    check(stepSpeed(3, 1) == 1.5f, "an unknown speed counts as 1×");
+    check(speedLabel(0.25f) == L"0.25×" && speedLabel(0.5f) == L"0.5×" && speedLabel(1) == L"1×" && speedLabel(1.5f) == L"1.5×" &&
+          speedLabel(2) == L"2×", "speed labels");
+    // A-B loop.
+    {
+        const Loop none;
+        check(!none.active() && !loopFrom(none, 3).active(), "a start alone is not a loop yet");
+        const auto loop = loopTo(loopFrom(none, 3), 7);
+        check(loop.active() && loop.in == 3 && loop.out == 7, "A then B loops between them");
+        check(loopTo(none, 4) == Loop{0, 4}, "B without A loops from the start");
+        check(loopTo(loopFrom(none, 3), 3.01) == loopFrom(none, 3) && loopTo(loopFrom(none, 3), 2) == loopFrom(none, 3),
+              "B at or before A changes nothing");
+        check(loopFrom(loop, 5) == Loop{5, 7}, "a later A keeps the end after it");
+        check(loopFrom(loop, 8) == Loop{8, -1}, "an A after the end drops the end");
+        check(loopFrom(none, -2).in == 0, "A before the start is the start");
+        const double frame = 1.0 / 60, wrapAt = 7 + frame;
+        check(loopWraps(loop, 6.98, 7.02, wrapAt) && !loopWraps(loop, 6.5, 6.9, wrapAt), "back to A when playback reaches B");
+        check(!loopWraps(loop, 6.99, 7.01, wrapAt), "B's own picture is shown before the wrap");
+        check(loopWraps(loop, 7.08, 7.1, wrapAt), "B pressed while playing loops, although playback is already past it");
+        check(!loopWraps(loop, 7.5, 7.6, wrapAt), "playing on after B, once sought past it");
+        check(!loopWraps(loopFrom(none, 3), 6.9, 7.1, wrapAt), "no wrap without an end");
+        check(loopRestarts(loop, 7, frame) && loopRestarts(loop, 7.1, frame) && !loopRestarts(loop, 5, frame) && !loopRestarts(loop, 8, frame),
+              "play at or just past B starts again at A");
+        check(!loopRestarts(loopFrom(none, 3), 7, frame), "no restart without a loop");
+    }
     return failures ? 1 : 0;
 }

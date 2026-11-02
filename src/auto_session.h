@@ -12,13 +12,13 @@
 namespace refarter {
 
 // Auto-capture for listed games on the UI thread: the foreground and size WinEvent hooks, the card, the
-// suppressed instances, the detected game, rearming and the exit wait for the game it started. The decisions are in
+// suppressed instances, the detected game, rearming and the exit wait for any captured game. The decisions are in
 // auto_session_rules.h. The App keeps the window, tray and recorder, and answers through Host; the list
 // and the two switches stay with the App's settings and are read through Context.
 class AutoSession {
 public:
     static constexpr UINT foregroundCheck = WM_APP + 3; // Check the app in front now (hook installed, game added).
-    static constexpr UINT gameExited = WM_APP + 4;      // The automatically started game process exited.
+    static constexpr UINT gameExited = WM_APP + 4;      // A captured game process exited (automatic or manual replay).
     static constexpr UINT_PTR sizeWatchTimer = 1;       // Ends watching a windowed app for a switch to fullscreen.
 
     // What the App currently knows; read on every call, never stored.
@@ -66,7 +66,7 @@ public:
     EventResult onRecorderEvent(bool started, capture::RecorderState state, bool success, std::wstring status, bool retryableStart = false);
     void onManualStop(const RecordingTarget& target, bool buffering); // A user stop; a clear of a retained replay is not one.
     bool clearExitedGameReplay();
-    void releaseForSleep(); // A kept replay is no longer an auto session; a game exit never clears it.
+    void releaseForSleep(); // Detaches both automatic start and exit cleanup; a game exit cannot clear a sleep-kept replay.
     void recheckWhenIdle(); // Deferred rearm waits through sleep and checks the foreground once awake.
     void unwatchGameExit();
 
@@ -93,6 +93,7 @@ private:
     SuppressedInstances suppressed_;    // Game instances stopped manually or failed; held until they exit.
     bool rearm_ = false;                // Recheck the foreground after an automatic session is cleared.
     ULONGLONG autoStartedAt_ = 0;
+    bool exitWatch_ = false;            // This window session, manual or automatic, clears on its process exit.
     HANDLE gameExitWait_ = nullptr;
     std::shared_ptr<void> gameExitProcess_; // Keeps the waited handle alive, even if selection changes.
 };

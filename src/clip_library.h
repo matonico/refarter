@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <map>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -37,6 +38,11 @@ public:
         std::uint64_t driveFree = unknownBytes; // With `clips`: free bytes on the clip drive (unknown for a network drive).
         bool binAllowed = false;                // With `clips`: "bin oldest" may run on its own here (canBinAutomatically).
         std::vector<Thumbnail> thumbnails;
+        // Bitmap owned by the receiver; null: none. `accent`: the colour it gives its game (gameIconAccent), if any.
+        struct Icon { std::wstring game; int size = 0; HBITMAP bitmap = nullptr; std::optional<COLORREF> accent; };
+        std::vector<Icon> icons;
+        struct Length { ClipFile clip; std::optional<std::uint64_t> duration; };
+        std::vector<Length> lengths; // Answers to lengths(), in batches.
     };
 
     // `ready` runs on the worker when results arrive while none are waiting (once per batch): post to the UI, then return.
@@ -68,6 +74,18 @@ public:
     void binOldest(BinRequest request, HWND owner);
     // Replaces queued thumbnail work: only what is on screen now is worth making.
     void want(std::vector<ClipFile> clips, SIZE size);
+    // The executable a game's clip was just saved from, for its folder's icon (game_icons.h); written to games.dat.
+    void rememberGame(std::wstring game, std::filesystem::path executable);
+    // Folder icons for these games (lower case) at `size` pixels, a few at a time before thumbnails; each is answered,
+    // with no bitmap when the game has no known executable or it has no icon.
+    void icons(std::vector<std::wstring> games, int size);
+    // The auto-capture list's games (lower-case label → executable): the icon of a game games.dat does not know yet,
+    // so older clips and monitor captures named after a listed game show it too. Labels are made as clip names are.
+    void listedGames(std::map<std::wstring, std::wstring> games);
+    // Sorting by length: the length of each clip, read as a Shell property (no thumbnail, no decoding) and kept like
+    // a thumbnail's, so a clip is read once. Queued after earlier requests; answered in small batches before thumbnails.
+    void lengths(std::vector<ClipFile> clips);
+    void cancelLengths(); // Another order was chosen: the lengths not read yet are no longer needed.
     Results take();
 
     // Lists clip files directly in `folder` (not subfolders), newest first.
@@ -92,6 +110,11 @@ private:
     std::optional<BinRequest> bin_;
     HWND recycleOwner_ = nullptr;
     std::vector<ClipFile> wanted_;
+    std::vector<std::pair<std::wstring, std::filesystem::path>> games_; // Executables to remember, in the order saved.
+    std::vector<std::wstring> iconsWanted_;
+    int iconSize_ = 0;
+    std::map<std::wstring, std::wstring> listedGames_;
+    std::vector<ClipFile> lengths_;
     SIZE size_{};
     Results results_;
     bool exit_ = false;

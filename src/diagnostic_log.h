@@ -26,7 +26,8 @@ enum class DiagnosticEvent {
     CompressionPackets, CompressionOutputBytes, CompressionFinished, CompressionSkipped,
     CompressionCancelled, CompressionError, CompressionStage, CompressionLibraries,
     CompressionTimeBase, CompressionFrameRate, CompressionSystemError,
-    CompressionLumaSample, CompressionDecodedLuma, CompressionScaledLuma, Count
+    CompressionLumaSample, CompressionDecodedLuma, CompressionScaledLuma, EncoderTimeRepaired,
+    MeterHookFailed, Count
 };
 
 class DiagnosticLog {

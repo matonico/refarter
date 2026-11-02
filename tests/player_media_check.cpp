@@ -226,8 +226,9 @@ void decode(const std::filesystem::path& clip, ID3D11Device* device, bool softwa
             difference += (mix[i] - sum[i]) * (mix[i] - sum[i]);
             level += mix[i] * mix[i];
         }
-        std::printf("     %.1f s of audio: stored mix %.1f ms, %zu sources summed %.1f ms\n",
-                    static_cast<double>(span) / 48000, mixMs, sources.size(), sumMs);
+        std::printf("     %.1f s of audio: stored mix %.1f ms, %zu sources summed %.1f ms, %.1f dB difference\n",
+                    static_cast<double>(span) / 48000, mixMs, sources.size(), sumMs,
+                    10 * std::log10((difference + 1e-12) / (level + 1e-12)));
         check(mix.size() == span * 2 && sum.size() == span * 2, "summed sources decode as far as the mix");
         // AAC codes each track separately, so the sum matches the mix closely, not bit for bit.
         check(difference <= 0.01 * level + 1e-9 * static_cast<double>(mix.size()), "summed sources match the stored mix");
@@ -336,8 +337,9 @@ void trim(const std::filesystem::path& clip) {
     player::MediaFile mixed;
     check(remixed.ok && mixed.open(remixed.path, {nullptr, true, true}), "trim with a new mix opens");
     if (remixed.ok) {
-        bool named = mixed.audioTracks() == sound.audioTracks() && mixed.audioTrackName(0) == L"mix";
-        for (int t = 1; named && t < mixed.audioTracks(); ++t) named = mixed.audioTrackName(t) == sound.audioTrackName(t);
+        // The kept sources only: a game track is left out above.
+        bool named = mixed.audioTracks() == static_cast<int>(sources.size()) + 1 && mixed.audioTrackName(0) == L"mix";
+        for (int t = 1; named && t < mixed.audioTracks(); ++t) named = mixed.audioTrackName(t) == sound.audioTrackName(sources[t - 1]);
         check(named, "new mix first, then the kept sources by name");
         check(std::abs(mixed.duration() - range.length()) < 0.1, "new-mix trim duration matches the range");
         const std::size_t frames = static_cast<std::size_t>(std::min(5.0, range.length() - 0.2) * 48000);

@@ -49,14 +49,14 @@ enum Id {
     ChimeVolumeLabel, ChimeVolume, StartWithWindows, AutoCaptureSource, Player, RecordDiscord,
     SidebarToggle, Compressed, DesktopReset, MicrophoneReset,
     DiagnosticLogging, CompressCopyAfterTrim, StorageLimitField, StorageBehaviour, GroupFolders, AskBeforeBinning, ClipSearch,
-    AssignScreenshot, UpdateCheckSwitch, UpdateCheckNow, StartMinimised, LastId = StartMinimised
+    AssignScreenshot, UpdateCheckSwitch, UpdateCheckNow, StartMinimised, GameColours, SortClips, LastId = SortClips
 };
 // The global shortcuts, as indexes into App's shortcut arrays.
 inline constexpr int saveShortcut = 0, screenshotShortcut = 1, shortcutCount = 2;
 // Ids are contiguous, so a control is found by `id - firstId`.
 inline constexpr int firstId = Library, idCount = LastId - firstId + 1;
 // Row buttons drawn as on/off switches (their text names the state for screen readers).
-inline constexpr int toggleIds[] = {Suppression, Gate, RecordDiscord, CloseToTray, StartWithWindows, StartMinimised, DiagnosticLogging, CompressCopyAfterTrim, AskBeforeBinning, UpdateCheckSwitch};
+inline constexpr int toggleIds[] = {Suppression, Gate, RecordDiscord, CloseToTray, StartWithWindows, StartMinimised, DiagnosticLogging, CompressCopyAfterTrim, AskBeforeBinning, UpdateCheckSwitch, GameColours};
 // Number fields of the noise gate and the caption painted before each.
 struct GateField { int id; const wchar_t* name; };
 inline constexpr GateField gateFields[] = {
@@ -76,6 +76,7 @@ struct ShellState {
     bool replayInputValid = true;
     bool smallTiles = false;
     bool groupFolders = false; // Library: a folder per game in every tab.
+    ClipOrder clipOrder;       // Library: the sort menu's order; its date filter lives in the grid, for the session.
     bool askBeforeBinning = true; // Library: the recycle-bin question is asked.
     bool closeToTray = false;
     bool startWithWindows = false;
@@ -83,6 +84,7 @@ struct ShellState {
     bool sidebarCollapsed = false; // Icons only, for more page width.
     bool diagnosticLogging = false;
     bool compressCopyAfterTrim = false; // The trim bar's "compress & copy" box starts ticked.
+    bool gameColours = true;            // Folders, tiles and the player take a colour from the game's icon.
     unsigned maxStorageGb = 0;          // Clip folder limit; 0 is none.
     StorageFull storageFull = StorageFull::Warn;
     bool storageFullChosen = false;     // The user picked a behaviour (saved), so the first-time question is over.
@@ -130,6 +132,7 @@ private:
     TrayIcon tray_;
     UINT restoreMessage_ = 0;
     UINT quitMessage_ = 0;
+    UINT commandMessage_ = 0; // A jump list task or a tool started Refarter.exe with a flag (LaunchCommand in WPARAM).
     bool startupLaunch_ = false, startupTray_ = false, startupOtherCopy_ = false;
     bool startupReadFailed_ = false;
     std::unique_ptr<RecordingController> recorder_;
@@ -197,7 +200,12 @@ private:
     std::array<theme::BackBuffer, 4> meterBuffers_; // One kept compose bitmap per display.
     ULONGLONG meterTick_ = 0;
     bool meterTimer_ = false, meterToolAdded_ = false;
+    bool metersCovered_ = false; // Another app's window covers ours (decided when the foreground changes, not per tick).
+    HWINEVENTHOOK meterForegroundHook_ = nullptr; // Installed only while meters are wanted.
+    bool meterHookLogged_ = false; // The hook's failure is written to the diagnostic log once.
     void syncMeters(bool reopen = false);
+    void watchMeterForeground(bool on);
+    void meterForegroundChanged();
     void stepMeters();
     void closeMeterCapture(int source);
     void closeMeterCaptures();
@@ -240,6 +248,7 @@ private:
     bool recorderClosed_ = false;
     void setFullscreen(bool on);
     bool busy_ = false, saving_ = false, closing_ = false;
+    std::wstring savingExecutable_; // The game behind the save in progress, remembered for its folder icon once the clip is written.
     bool shooting_ = false; // A screenshot was asked for and has not answered yet.
     Config config_;
     std::vector<SettingEntry> stored_; // What refarter.ini says now, to write only changes.
@@ -272,7 +281,9 @@ private:
     bool startAutoReplay(RecordingTarget target); // Selects `target` and starts; the previous source returns on failure.
     void declineGame(const std::wstring& path);
     void setAutoCaptured(const std::wstring& path, const std::wstring& label, bool on);
+    void shareListedGames(); // The list's games to the library, for their folders' icons.
     void chooseAutoCapture();
+    void chooseClipOrder(); // The library's sort menu: order, direction and date filter.
     bool canUseAutoCapture() const;
     void useAutoCapture();
     bool startReplay();
@@ -393,7 +404,9 @@ private:
     capture::Size sourceSize() const;
     void saveReplay();
     void takeScreenshot();
-    std::wstring saveName() const; // What clips and screenshots of the current source are named after.
+    // What clips and screenshots of the current source are named after; `executable` gets the game behind that name
+    // (the window's, or the listed game in front of a monitor), or empty for a monitor's own name.
+    std::wstring saveName(std::wstring* executable = nullptr) const;
     void shortcutPressed(int shortcut); // A global shortcut fired (saveShortcut or screenshotShortcut).
     // The storage limit and low-disk rules (app_storage.cpp). Nothing here reads a disk on the window thread: the
     // folder size and free space come from the library worker's last scan.
@@ -450,6 +463,7 @@ private:
     int typingVolume_ = 0; // The percentage field being typed in (its label id), or 0.
     int hoverVolume_ = 0;  // The percentage field under the pointer, or 0.
     void beginVolumeTyping(int label);
+    bool searchEmpty_ = true; // The library search has no text: its field shows the placeholder (see editProc).
     HWND focusedTextField() const;                // The focused volume percentage, number field or library search, or null.
     RECT fieldFrame(int id) const; // The frame painted around a text field (see app_controls.cpp).
     void invalidateFieldFrame(HWND edit);         // Repaints all painted around an edit: frame, unit, gate caption and focus outline.

@@ -164,14 +164,17 @@ int main() {
         check(!rearmShortSession(ReplayState::Buffering, true, false, false, true, 1'000, 2'000), "only a stopped session");
     }
 
-    // Any automatically started game clears its replay once its own process has exited.
+    // Any captured game clears its replay once its own process has exited. How AutoSession wires
+    // starts, stops, sleep and exits into this rule is checked in auto_session_wiring_test.
     {
         check(gameExitClears(false, false, ReplayState::Stopped, true), "an exited game clears its retained replay");
         check(gameExitClears(false, false, ReplayState::Buffering, true), "an exited game clears its running replay");
         check(!gameExitClears(false, false, ReplayState::Off, true), "nothing to clear without a replay");
-        check(!gameExitClears(false, false, ReplayState::Stopped, false), "a running game, a manual session or no process keeps the replay");
+        check(!gameExitClears(false, false, ReplayState::Stopped, false), "a running game or no owned process keeps the replay");
         check(!gameExitClears(true, false, ReplayState::Stopped, true), "not while closing");
         check(!gameExitClears(false, true, ReplayState::Stopped, true), "not while the recorder is busy");
+        check(gameClosedStatus(true) == L"auto-capture · game closed · clearing replay", "an automatic clear keeps the auto-capture prefix");
+        check(gameClosedStatus(false) == L"game closed · clearing replay", "a manual clear has no auto-capture prefix");
     }
 
     // A replay kept by sleep leaves the auto session: a later game exit cannot clear it.
@@ -179,8 +182,6 @@ int main() {
         check(sleepKeepReleasesAutoSession(true, true), "a sleep-kept replay is released from auto-capture");
         check(!sleepKeepReleasesAutoSession(true, false), "a sleep pause that kept nothing is an ordinary stop");
         check(!sleepKeepReleasesAutoSession(false, true), "a game closing is not a sleep keep");
-        const bool autoSessionAfterRelease = false; // AutoSession::releaseForSleep clears autoSession_.
-        check(!gameExitClears(false, false, ReplayState::Stopped, autoSessionAfterRelease), "the exited game finds no auto session to clear");
     }
 
     // The tray's detected game: a listed game, or a fullscreen app that may be offered, but not overlays or declined apps.

@@ -18,6 +18,7 @@ public:
     void setTip(const std::wstring& tip); // Only when it changed.
     void setIcon(HICON icon);              // A new icon for a present one (DPI change).
     bool taskbarCreated(UINT message) const { return taskbarCreated_ && message == taskbarCreated_; }
+    UINT taskbarCreatedMessage() const { return taskbarCreated_; } // 0 until create(); an elevated app lets it through UIPI.
     void forget() { present_ = false; }    // Explorer discarded the icon; add() may run again.
 
 private:

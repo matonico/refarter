@@ -97,6 +97,9 @@ TrimResult trimClip(const std::filesystem::path& source, TrimRange range, std::a
         out->time_base = in->time_base;
         out->disposition = in->disposition;
         av_dict_copy(&out->metadata, in->metadata, 0);
+        // FFmpeg reads a track's udta/name as "name" but writes only "title" there (Media Foundation's track name).
+        if (const auto* name = av_dict_get(in->metadata, "name", nullptr, 0); name && !av_dict_get(out->metadata, "title", nullptr, 0))
+            av_dict_set(&out->metadata, "title", name->value, 0);
         map[i] = out->index;
         return true;
     };
@@ -110,6 +113,7 @@ TrimResult trimClip(const std::filesystem::path& source, TrimRange range, std::a
             return fail(L"the new audio mix could not be prepared.");
         out->disposition = AV_DISPOSITION_DEFAULT;
         av_dict_set(&out->metadata, "handler_name", "mix", 0);
+        av_dict_set(&out->metadata, "title", "mix", 0);
     }
     for (std::size_t k = 0; k < kept.size(); ++k) {
         const int i = kept[k];
@@ -118,7 +122,10 @@ TrimResult trimClip(const std::filesystem::path& source, TrimRange range, std::a
         // The default track is the new mix, or the first kept track on its own.
         if (chosen) out->disposition = (out->disposition & ~AV_DISPOSITION_DEFAULT) |
             (!mixing && i == kept.front() ? AV_DISPOSITION_DEFAULT : 0);
-        if (!keptNames[k].empty()) av_dict_set(&out->metadata, "handler_name", keptNames[k].c_str(), 0);
+        if (!keptNames[k].empty()) {
+            av_dict_set(&out->metadata, "handler_name", keptNames[k].c_str(), 0);
+            av_dict_set(&out->metadata, "title", keptNames[k].c_str(), 0);
+        }
     }
     if (avio_open(&output->pb, utf8(partial.wstring()).c_str(), AVIO_FLAG_WRITE) < 0)
         return fail(L"the clip folder cannot be written to.");

@@ -92,14 +92,19 @@ inline bool rearmShortSession(ReplayState state, bool autoSession, bool closing,
     return state == ReplayState::Stopped && autoSession && !closing && !busy && processRunning && now - startedAt < shortSessionMs;
 }
 
-// The process of an automatically started game exited (exitedAutoCapture) while its replay runs or is
-// retained and nothing else is in the way. Pending saves finish; only the unsaved buffer is cleared.
-inline bool gameExitClears(bool closing, bool busy, ReplayState state, bool automaticGameExited) {
-    return !closing && !busy && state != ReplayState::Off && automaticGameExited;
+// The captured process of a window session, automatic or manual, exited while replay runs or is retained and
+// nothing else is in the way. Pending saves finish; only the unsaved buffer is cleared.
+inline bool gameExitClears(bool closing, bool busy, ReplayState state, bool capturedGameExited) {
+    return !closing && !busy && state != ReplayState::Off && capturedGameExited;
+}
+
+// An automatic session keeps the "auto-capture · " prefix its other statuses carry.
+inline std::wstring gameClosedStatus(bool automatic) {
+    return automatic ? L"auto-capture · game closed · clearing replay" : L"game closed · clearing replay";
 }
 
 // A replay that sleep keeps (the sleep pause ended in the retained state) is the user's to clear, never auto-capture's:
-// it is let go from the auto session, so neither a game exit nor the short-session rule can clear it afterwards.
+// both automatic-start ownership and exit cleanup are released, so no later process exit or short-session rule clears it.
 inline bool sleepKeepReleasesAutoSession(bool fromSleepPause, bool retained) { return fromSleepPause && retained; }
 
 // ---- Game instances stopped by hand or that failed to start --------------------------------------

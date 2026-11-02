@@ -1,11 +1,14 @@
 #pragma once
 
+#include "player/timeline.h"
 #include "player/toast_kind.h"
+#include "player/zoom.h"
 
 #include <d2d1_1.h>
 #include <dwrite.h>
 #include <winrt/base.h>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -14,7 +17,7 @@ namespace refarter::player {
 // Interactive parts of the player surface.
 enum class Part {
     None, Stage, Back, Play, Seek, Track, Mute, Volume, Trim, Folder, Fullscreen,
-    Timeline, InHandle, OutHandle, Save, Replace, Cancel, CompressCopy, ErrorOpen, Rename, Title,
+    Timeline, InHandle, OutHandle, Save, Replace, Cancel, CompressCopy, ErrorOpen, Rename, Title, Speed, Frame,
     Source0, Source1, Source2, Source3, Source4, Source5 // One icon switch per audio source.
 };
 
@@ -42,6 +45,10 @@ struct View {
     bool saving = false;
     bool compressing = false; // The saved trim is being compressed; keep its original trim view until completion.
     float progress = 0;
+    std::optional<COLORREF> tint; // The clip's game colour for the seek bar's progress (game colours on), else the accent.
+    Zoom zoom;                // The magnifier (wheel over the picture, + - 0); a new clip starts at 1×.
+    float speed = 1;          // Playback speed (playbackSpeeds); silent other than at 1×. A new clip starts at 1×.
+    Loop loop;                // A-B loop (keys A, B, Backspace); a new clip starts without one. Not while trimming.
 };
 
 // What the engine learns about the open clip when it opens or its audio changes. Immutable once
@@ -82,7 +89,7 @@ struct Layout {
     D2D1_RECT_F card{}, head{}, back{}, rename{}, title{}, stage{}, video{}, bar{}, seek{}, strip{}, controls{};
     D2D1_RECT_F group{}, sources[maxSources]{}; // The source switches and the bordered box around them.
     int sourceCount = 0;
-    D2D1_RECT_F play{}, time{}, track{}, mute{}, volume{}, trim{}, folder{}, fullscreen{};
+    D2D1_RECT_F play{}, time{}, track{}, mute{}, volume{}, trim{}, folder{}, fullscreen{}, speed{}, frame{};
     D2D1_RECT_F save{}, replace{}, cancel{}, compress{}, errorOpen{};
     bool compressShort = false; // Too narrow for the full "compress & copy" label.
     float scale = 1;

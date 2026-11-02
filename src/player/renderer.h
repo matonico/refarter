@@ -8,7 +8,12 @@
 #include <dxgi1_2.h>
 #include <winrt/base.h>
 #include <cstdint>
+#include <filesystem>
+#include <optional>
+#include <vector>
 #include <string>
+
+#include "player/zoom.h"
 
 struct AVFrame;
 
@@ -23,8 +28,8 @@ winrt::com_ptr<ID3D11Texture2D> createPictureTexture(ID3D11Device* device, UINT 
 class VideoConverter {
 public:
     explicit VideoConverter(ID3D11Device* device);
-    // Draws `frame` scaled into all of `target` (BGRA, render-target bindable).
-    bool convert(const AVFrame* frame, ID3D11Texture2D* target);
+    // Draws `part` of `frame` (fractions of it; all of it by default) scaled into all of `target` (BGRA, render-target bindable).
+    bool convert(const AVFrame* frame, ID3D11Texture2D* target, const Crop& part = {});
 
 private:
     bool prepare(UINT inWidth, UINT inHeight, UINT outWidth, UINT outHeight);
@@ -56,8 +61,11 @@ public:
     IDWriteFactory* text() const { return write_.get(); }
     ID2D1Factory1* factory() const { return factory_.get(); }
 
-    // The current picture as a bitmap of exactly width × height pixels.
-    ID2D1Bitmap1* picture(const AVFrame* frame, UINT width, UINT height);
+    // The current picture, or the part of it the zoom shows, as a bitmap of exactly width × height pixels.
+    ID2D1Bitmap1* picture(const AVFrame* frame, UINT width, UINT height, const Crop& part = {});
+    // `frame` at its full resolution as packed BGRA rows (width × 4 bytes each), copied off the GPU for a PNG written
+    // elsewhere (the engine must not stall on the encode); what went wrong, or nothing.
+    std::optional<std::wstring> readPicture(const AVFrame* frame, std::vector<std::uint8_t>& pixels, UINT& width, UINT& height);
     // Wraps a BGRA texture (a thumbnail) as a bitmap for drawing.
     winrt::com_ptr<ID2D1Bitmap1> wrap(ID3D11Texture2D* texture);
 
@@ -89,6 +97,7 @@ private:
     winrt::com_ptr<ID2D1Bitmap1> pictureBitmap_;
     const AVFrame* pictureFrame_ = nullptr;
     std::int64_t pictureStamp_ = 0;
+    Crop picturePart_;
 };
 
 } // namespace refarter::player

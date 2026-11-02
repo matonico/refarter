@@ -40,9 +40,8 @@ bool writeAutoCapture(const std::filesystem::path& file, const AutoCaptureList& 
 bool offerable(const std::filesystem::path& executable);
 // Overlays and capture tools are tool or non-activating windows; games are ordinary app windows.
 bool appWindowStyle(LONG_PTR extendedStyle);
-// Only confirmed process exit clears automatic replay; Alt-Tab/window closure and
-// manual sessions retain it. A held process handle keeps instance identity stable.
-bool exitedAutoCapture(bool automatic, HANDLE process);
+// Only confirmed exit of the held process counts; Alt-Tab and window closure do not.
+bool capturedProcessExited(HANDLE process);
 // The window covers its whole monitor: borderless or exclusive fullscreen,
 // not merely maximised above a visible taskbar.
 bool coversMonitor(const RECT& window, const RECT& monitor);

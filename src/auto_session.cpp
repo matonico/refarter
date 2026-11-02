@@ -202,7 +202,7 @@ void AutoSession::onManualStop(const RecordingTarget& target, bool buffering) {
     // A manual stop wins: a listed game is not auto-captured again until that instance exits.
     // Clearing a retained replay is not a stop: the game's next window may still be captured.
     if (suppressOnManualStop(buffering, autoSession_, host_.context().list->find(target.path) != nullptr)) suppress(target);
-    autoSession_ = false;
+    autoSession_ = exitWatch_ = false;
     rearm_ = !buffering; // Clearing a retained replay lets the listed foreground game start without another Alt-Tab.
 }
 
@@ -213,9 +213,12 @@ AutoSession::EventResult AutoSession::onRecorderEvent(bool started, capture::Rec
     const auto state = replayState(recording);
     const auto& target = *ctx.source;
     bool rearming = false, clearingGame = false;
-    if (started && success && autoSession_) autoStartedAt_ = GetTickCount64();
+    if (started && success && state == ReplayState::Buffering) {
+        exitWatch_ = target.source.window != nullptr; // A whole monitor has no game process to exit.
+        if (autoSession_) autoStartedAt_ = GetTickCount64();
+    }
     if (state == ReplayState::Off) {
-        autoSession_ = false;
+        autoSession_ = exitWatch_ = false;
         unwatchGameExit();
         recheckWhenIdle();
     } else if (state != ReplayState::Off && (clearingGame = watchGameExit())) {
@@ -228,7 +231,7 @@ AutoSession::EventResult AutoSession::onRecorderEvent(bool started, capture::Rec
         host_.stop();
     }
     if (result.quiet) result.status = L"auto-capture · " + result.status;
-    if (clearingGame) result.status = L"auto-capture · game closed · clearing replay";
+    if (clearingGame) result.status = gameClosedStatus(autoSession_);
     if (rearming) result.status = L"auto-capture · the game opened a new window · following it";
     // A game auto-capture cannot record (elevated, protected) is not retried on every Alt-Tab.
     // A start that timed out because the game was minimised meanwhile is retried next time it is in front.
@@ -246,7 +249,7 @@ void AutoSession::unwatchGameExit() {
 }
 
 void AutoSession::releaseForSleep() {
-    autoSession_ = rearm_ = false;
+    autoSession_ = rearm_ = exitWatch_ = false;
     unwatchGameExit();
 }
 
@@ -260,11 +263,11 @@ void AutoSession::recheckWhenIdle() {
 bool AutoSession::clearExitedGameReplay() {
     const auto ctx = host_.context();
     const auto& target = *ctx.source;
-    if (!gameExitClears(ctx.closing, ctx.busy, replayState(ctx.recording), exitedAutoCapture(autoSession_, target.process.get())))
+    if (!gameExitClears(ctx.closing, ctx.busy, replayState(ctx.recording), exitWatch_ && capturedProcessExited(target.process.get())))
         return false;
     unwatchGameExit();
     rearm_ = true;
-    host_.status(L"auto-capture · game closed · clearing replay");
+    host_.status(gameClosedStatus(autoSession_));
     diagnosticLog().write(DiagnosticEvent::GameExited);
     host_.stop(); // Finishes pending saves; only the unsaved buffer is discarded.
     return true;
@@ -273,9 +276,9 @@ bool AutoSession::clearExitedGameReplay() {
 bool AutoSession::watchGameExit() {
     const auto ctx = host_.context();
     const auto& target = *ctx.source;
-    if (!autoSession_ || !target.process || ctx.closing) return false;
+    if (!exitWatch_ || !target.process || ctx.closing) return false;
     if (clearExitedGameReplay()) return true;
-    // Observe process exit even if WGC never reports window closure. Wait once,
+    // Observe manual and automatic game exit even if WGC never reports window closure. Wait once,
     // without polling, then verify the current session again on the UI thread.
     if (!gameExitWait_) {
         gameExitProcess_ = target.process;

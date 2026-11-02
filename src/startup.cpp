@@ -52,4 +52,11 @@ static bool launchFlag(std::wstring_view commandLine, std::wstring_view flag) {
 }
 bool startupLaunch(std::wstring_view commandLine) { return launchFlag(commandLine, L"--startup"); }
 bool quitLaunch(std::wstring_view commandLine) { return launchFlag(commandLine, L"--quit"); }
+
+LaunchCommand launchCommand(std::wstring_view commandLine) {
+    for (const auto& entry : launchCommands)
+        if (launchFlag(commandLine, entry.flag)) return entry.command;
+    return LaunchCommand::None;
+}
+
 } // namespace refarter

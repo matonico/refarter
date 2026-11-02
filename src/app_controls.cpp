@@ -106,7 +106,8 @@ void App::createControls() {
     addButton(AllClips, L"all clips", Page::Library);
     addButton(Favourites, L"favourites", Page::Library);
     addButton(Compressed, L"compressed", Page::Library);
-    // Left to right as placed: the folders toggle, then the two tile sizes. The grid and the folder button under it follow below.
+    // Left to right as placed: the sort menu, the folders toggle, then the two tile sizes. The grid and the folder button under it follow below.
+    addButton(SortClips, L"sort", Page::Library);
     addButton(GroupFolders, L"folders by game", Page::Library);
     addButton(LargeTiles, L"large tiles", Page::Library);
     addButton(SmallTiles, L"small tiles", Page::Library);
@@ -152,6 +153,7 @@ void App::createControls() {
     if (!state_.maxStorageGb) SetWindowTextW(control(StorageLimitField), L""); // Empty: no limit.
     addButton(StorageBehaviour, L"when full · warn and save", Page::Settings, ButtonBackdrop::Card);
     addButton(CompressCopyAfterTrim, L"compress & copy after trim · off", Page::Settings, ButtonBackdrop::Card);
+    addButton(GameColours, L"game colours · on", Page::Settings, ButtonBackdrop::Card);
     volume(ChimeVolume, ChimeVolumeLabel, L"save chime volume", chimes_.percent(), 100, Page::Settings);
     addButton(CloseToTray, L"close to tray · off", Page::Settings, ButtonBackdrop::Card);
     addButton(StartWithWindows, L"start with windows · off", Page::Settings, ButtonBackdrop::Card);
@@ -178,7 +180,10 @@ void App::createControls() {
     if (auto grid = clipGrid_.create(window_, Clips)) controls_[Clips - firstId] = {grid, Page::Library};
     addButton(OpenFolder, L"open clip folder", Page::Library); // Under the grid: Tab reaches it after the clips.
     clipGrid_.setGrouped(state_.groupFolders);
+    clipGrid_.setOrder(state_.clipOrder);
     clipGrid_.setAskBeforeBinning(state_.askBeforeBinning);
+    clipGrid_.setGameColours(state_.gameColours);
+    shareListedGames(); // Loaded with the settings, before the grid existed.
     if (auto view = player_.create(window_, Player, playerCallbacks())) controls_[Player - firstId] = {view, Page::Library};
     for (const int slider : sliderIds) updateVolumeLabel(slider);
     // Fields show only their value ("180", "100%"); the row's name is what a screen reader should say.
@@ -191,7 +196,7 @@ void App::createControls() {
     // Collapsed sidebar buttons show icons only; a tooltip gives each its name.
     tooltips_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
         CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, window_, nullptr, GetModuleHandleW(nullptr), nullptr);
-    for (const int id : {SidebarToggle, Library, Recording, Settings, SaveReplay, StartReplay, GroupFolders, LargeTiles, SmallTiles, OpenFolder, DesktopReset, MicrophoneReset}) {
+    for (const int id : {SidebarToggle, Library, Recording, Settings, SaveReplay, StartReplay, SortClips, GroupFolders, LargeTiles, SmallTiles, OpenFolder, DesktopReset, MicrophoneReset}) {
         TOOLINFOW tool{sizeof(tool)};
         tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
         tool.hwnd = window_;
@@ -347,6 +352,8 @@ void App::refreshControls() {
     EnableWindow(control(StartMinimised), !closing_ && state_.startWithWindows && !startupReadFailed_);
     EnableWindow(control(DiagnosticLogging), !closing_);
     EnableWindow(control(CompressCopyAfterTrim), !closing_);
+    EnableWindow(control(GameColours), !closing_);
+    setTextIfChanged(control(GameColours), state_.gameColours ? L"game colours · on" : L"game colours · off");
     EnableWindow(control(AskBeforeBinning), !closing_);
     EnableWindow(control(UpdateCheckSwitch), !closing_);
     EnableWindow(control(UpdateCheckNow), !closing_ && !(updates_.running() && updateManual_));
@@ -361,6 +368,9 @@ void App::refreshControls() {
     // With a newer version known the button opens its page (the footer's text does too, but only for the mouse).
     setTextIfChanged(control(UpdateCheckNow), updates_.running() && updateManual_ ? L"checking…" :
         updateTag_.empty() ? L"check for updates" : L"open release page");
+    // The sort icon's text is its tooltip and what a screen reader says: the order, and the date filter when one is set.
+    setTextIfChanged(control(SortClips), std::wstring(L"sort · ") + clipOrderLabel(clipGrid_.order()) +
+        (clipGrid_.filtering() ? std::wstring(L" · ") + clipPeriodNames[static_cast<int>(clipGrid_.period())] : std::wstring{}));
     // The list can change while recording; it only affects the next time a game comes to the front.
     EnableWindow(control(AutoCaptureSource), !closing_);
     const auto games = autoCapture_.games.size();
@@ -497,7 +507,12 @@ void App::updateSearch() {
     std::wstring text(static_cast<size_t>(GetWindowTextLengthW(search)) + 1, L'\0');
     text.resize(static_cast<size_t>(GetWindowTextW(search, text.data(), static_cast<int>(text.size()))));
     clipGrid_.setSearch(text);
-    InvalidateRect(search, nullptr, TRUE); // The placeholder comes and goes with the text.
+    const bool empty = text.empty();
+    if (empty != searchEmpty_) {
+        searchEmpty_ = empty;
+        // The edit redraws its line itself when the text changes, so the placeholder is repainted by a WM_PAINT.
+        InvalidateRect(search, nullptr, TRUE);
+    }
 }
 
 // Keys in the search field: Esc clears it, then leaves it; Enter or Down goes to the matching clips.
@@ -582,18 +597,30 @@ LRESULT CALLBACK App::editProc(HWND edit, UINT message, WPARAM wParam, LPARAM lP
         if (GetFocus() != edit) app->syncGateBubble(); // The focused field's bubble, if any; otherwise none.
     }
     const LRESULT result = DefSubclassProc(edit, message, wParam, lParam);
-    if (message == WM_PAINT && id == ClipSearch && GetWindowTextLengthW(edit) == 0) {
-        // The empty search names itself, in the muted colour, where the text would start.
-        if (const HDC dc = GetDC(edit)) {
-            RECT text{};
-            GetClientRect(edit, &text);
-            text.left += LOWORD(SendMessageW(edit, EM_GETMARGINS, 0, 0)) + 1;
-            const auto old = SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(edit, WM_GETFONT, 0, 0)));
-            SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, muted);
-            DrawTextW(dc, L"search clips", -1, &text, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
-            SelectObject(dc, old);
-            ReleaseDC(edit, dc);
+    // What makes the edit redraw its line outside WM_PAINT: focus, selection, a left click, and the end of a drag.
+    const bool repaints = message == WM_SETFOCUS || message == WM_KILLFOCUS || message == EM_SETSEL ||
+                          message == WM_LBUTTONDOWN || message == WM_LBUTTONUP || message == WM_LBUTTONDBLCLK ||
+                          message == WM_CAPTURECHANGED;
+    // searchEmpty_ is tracked by updateSearch: asking the field here would send WM_GETTEXTLENGTH back through this procedure.
+    if (id == ClipSearch && (message == WM_PAINT || repaints) && app->searchEmpty_) {
+        if (message == WM_PAINT) {
+            // The empty search names itself, in the muted colour, on the line where the text would be: the edit
+            // clears that line when it redraws, so nothing of the name is left outside it.
+            if (const HDC dc = GetDC(edit)) {
+                RECT text{};
+                SendMessageW(edit, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&text));
+                text.left += 1;
+                const auto old = SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(edit, WM_GETFONT, 0, 0)));
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, muted);
+                DrawTextW(dc, L"search clips", -1, &text, DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                SelectObject(dc, old);
+                ReleaseDC(edit, dc);
+            }
+        } else {
+            // The edit redraws its line for a click, a selection or the focus outside WM_PAINT, which wipes the name;
+            // paint it again.
+            InvalidateRect(edit, nullptr, TRUE);
         }
     }
     if (message == WM_SETFOCUS) {

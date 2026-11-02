@@ -92,5 +92,51 @@ int main() {
     check(!matchesSearch(L"best", L"apex", L"best apex zz"), "a missing word fails");
     check(!matchesSearch(L"abc", L"def", L"cd"), "no match across the name and the game");
     check(matchesSearch(L"cafÉ \U0001F430", L"", L"café \U0001F430"), "unicode names");
+
+    // Library order: every key both ways; equal keys keep the scan's newest-first order.
+    {
+        auto a = clip(L"Clip 10.mp4", 300), b = clip(L"clip 9.mp4", 200), c = clip(L"20mb_alpha.mp4", 100);
+        a.bytes = 5; b.bytes = 7; c.bytes = 5;
+        const std::vector<ClipFile> scanned{a, b, c};
+        const auto names = [](const std::vector<ClipFile>& clips) {
+            std::wstring text;
+            for (const auto& clip : clips) text += clip.path.wstring() + L"|";
+            return text;
+        };
+        const auto lengths = [](const ClipFile& clip) -> std::optional<std::uint64_t> {
+            if (clip.path == L"Clip 10.mp4") return 30;
+            if (clip.path == L"clip 9.mp4") return 90;
+            return std::nullopt; // Not read yet.
+        };
+        const auto sorted = [&](ClipSort by, bool descending) {
+            auto clips = scanned;
+            sortClips(clips, {by, descending}, lengths);
+            return names(clips);
+        };
+        check(sorted(ClipSort::Date, true) == L"Clip 10.mp4|clip 9.mp4|20mb_alpha.mp4|", "newest first");
+        check(sorted(ClipSort::Date, false) == L"20mb_alpha.mp4|clip 9.mp4|Clip 10.mp4|", "oldest first");
+        check(sorted(ClipSort::Size, true) == L"clip 9.mp4|Clip 10.mp4|20mb_alpha.mp4|", "largest first, ties newest first");
+        check(sorted(ClipSort::Size, false) == L"Clip 10.mp4|20mb_alpha.mp4|clip 9.mp4|", "smallest first, ties newest first");
+        check(sorted(ClipSort::Length, true) == L"clip 9.mp4|Clip 10.mp4|20mb_alpha.mp4|", "longest first, unknown last");
+        check(sorted(ClipSort::Length, false) == L"Clip 10.mp4|clip 9.mp4|20mb_alpha.mp4|", "shortest first, unknown still last");
+        check(sorted(ClipSort::Name, false) == L"20mb_alpha.mp4|clip 9.mp4|Clip 10.mp4|",
+              "a to z by the shown name: no 20mb_ prefix, any case, digits as numbers");
+        check(sorted(ClipSort::Name, true) == L"Clip 10.mp4|clip 9.mp4|20mb_alpha.mp4|", "z to a");
+    }
+
+    // Date filter on the local calendar; 2026-10-14 is a Wednesday.
+    {
+        const auto wednesday = day(2026, 10, 14, 9, 0);
+        check(inPeriod(day(2025, 1, 1), ClipPeriod::Any, wednesday), "any time shows everything");
+        check(inPeriod(day(2026, 10, 14, 0, 1), ClipPeriod::Today, wednesday) && !inPeriod(day(2026, 10, 13, 23, 59), ClipPeriod::Today, wednesday),
+              "today starts at midnight");
+        check(inPeriod(day(2026, 10, 12, 0, 0), ClipPeriod::Week, wednesday) && !inPeriod(day(2026, 10, 11, 23, 59), ClipPeriod::Week, wednesday),
+              "this week starts on monday");
+        check(inPeriod(day(2026, 10, 1), ClipPeriod::Month, wednesday) && !inPeriod(day(2026, 9, 30), ClipPeriod::Month, wednesday) &&
+              !inPeriod(day(2025, 10, 14), ClipPeriod::Month, wednesday), "this month is this calendar month");
+        check(inPeriod(day(2026, 10, 18), ClipPeriod::Week, day(2026, 10, 18, 9, 0)) &&
+              !inPeriod(day(2026, 10, 18), ClipPeriod::Week, day(2026, 10, 19, 9, 0)), "sunday ends the week");
+        check(inPeriod(day(2026, 10, 20), ClipPeriod::Today, wednesday), "a clip dated after now still shows");
+    }
     return failures ? 1 : 0;
 }

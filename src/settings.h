@@ -4,6 +4,7 @@
 #include "capture/audio_levels.h"
 #include "capture/mic_filters.h"
 #include "capture/video_settings.h"
+#include "clip_list.h"
 #include "replay_duration.h"
 #include "storage_limit.h"
 #include "text.h"
@@ -46,9 +47,11 @@ struct UserSettings {
     bool storageFullChosen = false;   // The user picked it (the first-time question is not asked again).
     bool smallTiles = false;          // Library tile size: large (default) or small.
     bool groupFolders = false;        // Library: clips shown in a folder per game.
+    ClipOrder clipOrder;              // Library: the sort menu's order (newest first by default).
     bool askBeforeBinning = true;     // Library: ask before moving clips to the recycle bin (the question's box turns it off).
     int playerVolume = 100;           // The built-in player's volume, 0-100%.
     bool compressCopyAfterTrim = false; // The trim bar's "compress & copy" box starts ticked.
+    bool gameColours = true;          // Library and player: a game's icon gives its folder, tiles and seek bar a colour.
     bool closeToTray = false;         // Closing the window hides it in the tray.
     bool startWithWindows = false;    // Parsed and written for the file only; the Run registry key (refreshStartup) is the source, never this value.
     bool startMinimised = true;       // Sign-in starts in the tray; ordinary launches still open the window.
@@ -154,9 +157,12 @@ inline std::vector<SettingEntry> settingEntries(const UserSettings& s) {
         {L"storage", L"when_full", s.storageFullChosen ? storageFullNames[static_cast<int>(s.storageFull)] : L""},
         {L"library", L"density", s.smallTiles ? L"compact" : L"comfortable"},
         {L"library", L"folders", flag(s.groupFolders)},
+        {L"library", L"sort", clipSortNames[static_cast<int>(s.clipOrder.by)]},
+        {L"library", L"sort_order", s.clipOrder.descending ? L"descending" : L"ascending"},
         {L"library", L"ask_before_binning", flag(s.askBeforeBinning)},
         {L"library", L"player_volume", std::to_wstring(s.playerVolume)},
         {L"library", L"compress_copy_after_trim", flag(s.compressCopyAfterTrim)},
+        {L"library", L"game_colours", flag(s.gameColours)},
         {L"window", L"close_to_tray", flag(s.closeToTray)},
         {L"window", L"start_with_windows", flag(s.startWithWindows)},
         {L"window", L"start_minimised", flag(s.startMinimised)},
@@ -240,9 +246,14 @@ inline UserSettings readSettings(const std::map<std::wstring, std::wstring>& val
     }
     s.smallTiles = lower(get(L"library/density")) == L"compact";
     s.groupFolders = toggle(L"library/folders", false);
+    s.clipOrder.by = static_cast<ClipSort>(pick(get(L"library/sort"), clipSortNames, static_cast<int>(s.clipOrder.by)));
+    // Without a readable sort_order the key's usual direction, as choosing it in the menu gives.
+    const auto order = lower(get(L"library/sort_order"));
+    s.clipOrder.descending = order == L"descending" ? true : order == L"ascending" ? false : naturallyDescending(s.clipOrder.by);
     s.askBeforeBinning = toggle(L"library/ask_before_binning", true);
     s.playerVolume = parseNumber(get(L"library/player_volume"), 0, 100).value_or(s.playerVolume);
     s.compressCopyAfterTrim = toggle(L"library/compress_copy_after_trim", false);
+    s.gameColours = toggle(L"library/game_colours", true);
     s.closeToTray = toggle(L"window/close_to_tray", s.closeToTray);
     s.startWithWindows = toggle(L"window/start_with_windows", s.startWithWindows);
     s.startMinimised = toggle(L"window/start_minimised", s.startMinimised);

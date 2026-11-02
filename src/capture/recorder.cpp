@@ -12,6 +12,7 @@
 #include "gpu.h"
 #include "annexb.h"
 #include "replay_buffer.h"
+#include "save_audio.h"
 #include "surface_pool.h"
 #include "graphics_capture.h"
 #include "video_encoder.h"
@@ -365,9 +366,10 @@ std::optional<std::wstring> Recorder::start(CaptureSource source, const VideoSet
         const auto worstCase = replayBytes(p->bitrate.peakKbps, retainSeconds);
         // The PCM rings count too, one per track that will open (see below; the same numbers as the RAM estimate).
         const bool desktopOn = audio.desktop.enabled(), followDiscordRing = !endpointLoopbackForced();
-        const std::uint64_t rings = (desktopOn ? 1 : 0) + (audio.microphone.enabled() ? 1 : 0) +
+        const std::uint64_t stereoRings = (desktopOn ? 1 : 0) +
             (desktopOn && followDiscordRing && !audio.hideDiscord ? 1 : 0) + (desktopOn && followDiscordRing && source.window ? 1 : 0);
-        const auto audioBytes = rings * AudioTrack::ringBytes(settings.replaySeconds);
+        const auto audioBytes = stereoRings * AudioTrack::ringBytes(settings.replaySeconds) +
+            (audio.microphone.enabled() ? AudioTrack::ringBytes(settings.replaySeconds, sourceChannels(MicrophoneSource)) : 0);
         MEMORYSTATUSEX memory{sizeof(memory)};
         if (GlobalMemoryStatusEx(&memory) && worstCase + audioBytes > memory.ullTotalPhys / 4) {
             return L"this quality and replay length need more memory than is safe to reserve; lower one of them";
@@ -459,7 +461,7 @@ std::optional<std::wstring> Recorder::start(CaptureSource source, const VideoSet
                 }
             }
             if (audio.microphone.enabled()) {
-                p->micAudio = std::make_unique<AudioTrack>(audioSeconds);
+                p->micAudio = std::make_unique<AudioTrack>(audioSeconds, sourceChannels(MicrophoneSource));
                 p->micFilters = audio.micFilters;
                 p->micCapture = std::make_unique<AudioCapture>(AudioCapture::Device::Microphone,
                     endpoint(audio.microphone), p->micAudio.get(), [this] { audioChanged(); }, AudioCapture::ProcessTarget{},
@@ -675,12 +677,8 @@ std::optional<std::wstring> Recorder::saveClip(const std::filesystem::path& path
                           pipeline_->encoder ? pipeline_->encoder->sequenceHeader() : pipeline_->sequenceHeader, now};
         format.preserveCaptureTime = pipeline_->preserveCaptureTime;
         if (auto inBand = annexb::parameterSets(codec, packets.front()->data); !inBand.empty()) format.sequenceHeader = std::move(inBand);
-        // Audio for exactly the clip's span, on the shared capture clock. Copied
-        // and mixed on the save thread; stop() waits for it before freeing tracks.
-        const AudioTrack* desktopTrack = pipeline_->desktopAudio.get();
-        const AudioTrack* micTrack = pipeline_->micAudio.get();
-        const AudioTrack* discordTrack = pipeline_->discordAudio.get();
-        const AudioTrack* gameTrack = pipeline_->gameAudio.get();
+        // Audio for exactly the clip's span, on the shared capture clock. Copied out of the rings here, on the
+        // recording worker, so a save queued behind a slow one still has its sound; mixed on the save thread.
         const auto desktopEndpoint = pipeline_->desktopEndpoint;
         const auto gameProcess = pipeline_->gameProcess;
         const auto* lastGameOutput = &pipeline_->gameOutput; // Like the tracks, outlived by stop() waiting for this save.
@@ -689,36 +687,36 @@ std::optional<std::wstring> Recorder::saveClip(const std::filesystem::path& path
         const auto* timing = pipeline_->timing.get();
         const bool throttled = sourceThrottled_;
         const int frameBudget = pipeline_->legacyPacing ? 0 : FrameRateBudget::burstFrames;
+        // Copied before waiting for an earlier save: that wait can be long, and the rings keep being overwritten.
+        SaveAudio audio({pipeline_->desktopAudio.get(), pipeline_->micAudio.get(), pipeline_->discordAudio.get(), pipeline_->gameAudio.get()},
+                        from, to, pipeline_->micFilters, pipeline_->audioLevels);
         if (saver_.joinable()) saver_.join();
         saver_ = std::thread([this, packets = std::move(packets), format = std::move(format), path, done = std::move(done),
-                              desktopTrack, micTrack, discordTrack, gameTrack, desktopEndpoint, gameProcess, lastGameOutput, from, to, start, timing, throttled, micFilters = pipeline_->micFilters,
-                              levels = pipeline_->audioLevels, frameBudget]() mutable {
+                              audio = std::move(audio), desktopEndpoint, gameProcess, lastGameOutput, from, to, start, timing, throttled,
+                              frameBudget]() mutable {
             // Disk work must never compete with the game for CPU time.
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             std::optional<std::wstring> error;
             std::filesystem::path placed = path; // The name the clip ends up with (see writeClip).
             try {
-                auto desktop = desktopTrack ? desktopTrack->read(from, to) : std::vector<std::int16_t>{};
-                auto mic = micTrack ? micTrack->read(from, to) : std::vector<std::int16_t>{};
-                auto discord = discordTrack ? discordTrack->read(from, to) : std::vector<std::int16_t>{};
-                auto game = gameTrack ? gameTrack->read(from, to) : std::vector<std::int16_t>{};
-                const auto silent = [](const std::vector<std::int16_t>& pcm) {
-                    return std::all_of(pcm.begin(), pcm.end(), [](std::int16_t sample) { return sample == 0; });
-                };
+                // The span was copied out of the rings when the save was pressed (before waiting for an earlier
+                // save); it is filtered (here, not while capturing: no cost during play) and mixed a piece at a
+                // time as the clip is written.
                 // Like Discord, the game track is saved only in clips where the game made a sound.
-                if (silent(game)) game.clear();
+                if (!audio.sounds(GameSource)) audio.drop(GameSource);
                 // Discord gets a track only in clips where it made a sound, and not when the
                 // chosen desktop output already holds it (it would play twice in the mix).
-                if (silent(discord) || (!desktopEndpoint.empty() && discordPlaysOn(desktopEndpoint))) discord.clear();
-                applyMicFilters(mic, micFilters); // Here, not while capturing: no cost during play.
+                if (!audio.sounds(DiscordSource) || (!desktopEndpoint.empty() && discordPlaysOn(desktopEndpoint))) audio.drop(DiscordSource);
                 // A chosen output carries the game unless it verifiably plays elsewhere (unknown counts as contained).
                 // The game and its process are usually gone by now, so a live answer is only one of two sources: the
                 // routing seen while recording applies when Windows cannot say.
-                const GameOutput live = game.empty() || !gameProcess || desktopEndpoint.empty() ? GameOutput::Unknown : gamePlaysOn(desktopEndpoint, gameProcess());
+                const GameOutput live = !audio.recorded(GameSource) || !gameProcess || desktopEndpoint.empty() ? GameOutput::Unknown : gamePlaysOn(desktopEndpoint, gameProcess());
                 const bool gameInDesktop = gameInDesktopAudio(desktopEndpoint.empty(), knownGameOutput(live, lastGameOutput->load()));
-                auto prepared = prepareAudioTracks(std::move(desktop), std::move(mic), levels, std::move(discord), std::move(game), gameInDesktop);
-                format.audio = std::move(prepared.tracks);
-                format.audioNames = std::move(prepared.names);
+                const auto layout = audio.layout(gameInDesktop);
+                format.audioNames = layout.names;
+                format.audioChannels = layout.channels;
+                format.audioFrames = audio.frames();
+                format.audio = [&](std::size_t frames, std::vector<std::vector<std::int16_t>>& tracks) { audio.next(layout, frames, tracks); };
                 error = writeClip(path, packets, format, &placed);
             } catch (const std::exception&) {
                 error = L"could not save the clip: insufficient memory or storage";

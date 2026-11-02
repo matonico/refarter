@@ -61,16 +61,43 @@ public:
             }
             packets.assign(start, stop);
         }
-        // A lone keyframe before `from` is still on screen at `from`: the next
-        // picture comes later. Start it there instead of adding the static lead-in.
-        if (packets.front()->time < from && (packets.size() == 1 || packets[1]->time > from)) {
-            auto moved = std::make_shared<EncodedPacket>(*packets.front());
-            moved->duration = std::max<std::int64_t>(0, moved->duration - (from - moved->time));
-            moved->time = from;
-            packets.front() = std::move(moved);
+        // The last picture before `from` is still on screen at `from`: the next one comes later. A lone keyframe
+        // starts there instead of adding the static lead-in. A longer lead-in is needed to decode that picture; it
+        // moves up with it only after a stale hold (a screen that stood still), so a normal clip keeps its sound in
+        // step and starts at most a keyframe interval early instead of hours before the replay asked for.
+        std::size_t lead = 0;
+        while (lead < packets.size() && packets[lead]->time < from) ++lead;
+        if (lead > 0 && (lead == packets.size() || packets[lead]->time > from)) {
+            const auto hold = from - packets[lead - 1]->time;
+            if (lead == 1 || hold > staleHold) {
+                for (std::size_t i = 0; i < lead; ++i) {
+                    auto moved = std::make_shared<EncodedPacket>(*packets[i]);
+                    if (i + 1 == lead) moved->duration = std::max<std::int64_t>(0, moved->duration - hold);
+                    moved->time += hold;
+                    packets[i] = std::move(moved);
+                }
+            }
+            // A still stretch inside the lead-in itself (an encoder that ignores the forced keyframe, so one GOP
+            // spans the stillness) would survive that move and start the clip hours early. Those pictures only
+            // decode the one shown at the start: pack them just before it, a millisecond apart.
+            const auto shown = packets[lead - 1]->time;
+            if (lead > 1 && shown - packets[0]->time > staleHold) {
+                for (std::size_t i = 0; i + 1 < lead; ++i) {
+                    auto packed = std::make_shared<EncodedPacket>(*packets[i]);
+                    packed->time = shown - static_cast<std::int64_t>(lead - 1 - i) * packedTick;
+                    packed->duration = packedTick;
+                    packets[i] = std::move(packed);
+                }
+            }
         }
         return packets;
     }
+
+    // Longer than the encoder's one-second keyframe interval: a hold beyond it before a clip's start means the
+    // source stopped updating.
+    static constexpr std::int64_t staleHold = 10'000'000;
+    // The spacing of lead-in pictures packed before the clip's first shown picture: 1 ms.
+    static constexpr std::int64_t packedTick = 10'000;
 
     std::size_t bytes() const { std::lock_guard lock(mutex_); return bytes_; }
     std::int64_t span() const {
@@ -89,13 +116,15 @@ public:
     }
 
 private:
+    // Up to the next keyframe, found by its flag: an encoder that repeats one time on every picture must still
+    // free memory.
     void dropFirstGop() {
         evicted_ = true;
         keyframes_.pop_front();
-        while (packets_.front()->time != keyframes_.front() || !packets_.front()->keyframe) {
+        do {
             bytes_ -= packets_.front()->data.size();
             packets_.pop_front();
-        }
+        } while (!packets_.front()->keyframe);
     }
 
     const std::int64_t retain_;

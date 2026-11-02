@@ -22,7 +22,8 @@ constexpr std::array names{
     "compression packets", "compression output size", "compression finished", "compression skipped",
     "compression cancelled", "compression error", "compression stage", "compression libraries",
     "compression time base", "compression source frame rate", "compression system error",
-    "compression luma sample", "compression decoded luma", "compression scaled luma"
+    "compression luma sample", "compression decoded luma", "compression scaled luma", "encoder time repaired",
+    "meter foreground hook failed"
 };
 static_assert(names.size() == static_cast<std::size_t>(DiagnosticEvent::Count));
 struct Entry { SYSTEMTIME time; DiagnosticEvent event; HRESULT result; unsigned first, second; };
@@ -112,6 +113,8 @@ struct DiagnosticLog::State {
                     std::snprintf(detail, sizeof(detail), "stage=%u", entry.first); break;
                 case DiagnosticEvent::StartFailed:
                     std::snprintf(detail, sizeof(detail), "retry_on_foreground=%u", entry.first); break;
+                case DiagnosticEvent::EncoderTimeRepaired:
+                    std::snprintf(detail, sizeof(detail), "codec=%u stamped=%u", entry.first, entry.second); break;
                 case DiagnosticEvent::CompressionAttempt:
                     std::snprintf(detail, sizeof(detail), "attempt=%u budget_bytes=%u", entry.first, entry.second); break;
                 case DiagnosticEvent::CompressionInputBytes: case DiagnosticEvent::CompressionOutputBytes:

@@ -8,6 +8,7 @@
 #include <cwctype>
 #include <filesystem>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -196,6 +197,78 @@ inline long long civilDays(int year, unsigned month, unsigned day) {
     const unsigned doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
     const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     return era * 146097 + static_cast<long long>(doe) - 719468;
+}
+
+// The library's order, chosen from its sort menu and kept in refarter.ini ([library] sort, sort_order).
+enum class ClipSort { Date, Size, Length, Name };
+inline constexpr const wchar_t* clipSortNames[] = {L"date", L"size", L"length", L"name"};
+struct ClipOrder {
+    ClipSort by = ClipSort::Date;
+    bool descending = true; // Newest, largest, longest first; for names z → a.
+    bool operator==(const ClipOrder&) const = default;
+};
+
+// A key's usual direction, chosen with it: newest, largest and longest first, names a → z.
+inline bool naturallyDescending(ClipSort by) { return by != ClipSort::Name; }
+
+// The sort menu's words for a direction ("newest first", "a → z").
+inline const wchar_t* clipOrderLabel(ClipOrder order) {
+    static constexpr const wchar_t* labels[][2] = {{L"oldest first", L"newest first"}, {L"smallest first", L"largest first"},
+                                                   {L"shortest first", L"longest first"}, {L"a → z", L"z → a"}};
+    return labels[static_cast<int>(order.by)][order.descending ? 1 : 0];
+}
+
+// Sorts the listed clips; equal keys keep their order (the scan's, newest first). Lengths come from `length`, which
+// returns nothing for a clip whose length is not known (yet): those follow the known ones in either direction.
+// Names compare as Explorer does: case ignored, digits as numbers.
+template <class Length>
+void sortClips(std::vector<ClipFile>& clips, ClipOrder order, Length length) {
+    const auto compare = [&](const ClipFile& a, const ClipFile& b) -> int {
+        switch (order.by) {
+        case ClipSort::Date: return CompareFileTime(&a.written, &b.written);
+        case ClipSort::Size: return a.bytes < b.bytes ? -1 : a.bytes > b.bytes;
+        case ClipSort::Name: {
+            const auto left = clipDisplayName(a.path), right = clipDisplayName(b.path);
+            return CompareStringEx(LOCALE_NAME_USER_DEFAULT, LINGUISTIC_IGNORECASE | SORT_DIGITSASNUMBERS,
+                                   left.c_str(), -1, right.c_str(), -1, nullptr, nullptr, 0) - CSTR_EQUAL;
+        }
+        case ClipSort::Length: break;
+        }
+        const std::optional<std::uint64_t> x = length(a), y = length(b);
+        if (!x || !y) return 0; // Placed by the unknown-last rule below.
+        return *x < *y ? -1 : *x > *y;
+    };
+    std::stable_sort(clips.begin(), clips.end(), [&](const ClipFile& a, const ClipFile& b) {
+        if (order.by == ClipSort::Length) {
+            const bool knownA = length(a).has_value(), knownB = length(b).has_value();
+            if (knownA != knownB) return knownA;
+        }
+        const int result = compare(a, b);
+        return order.descending ? result > 0 : result < 0;
+    });
+}
+
+// The library's date filter, for the session only. Local calendar: today since midnight, this week since Monday,
+// this month since the 1st. A clip dated after now (a clock changed back) always shows.
+enum class ClipPeriod { Any, Today, Week, Month };
+inline constexpr const wchar_t* clipPeriodNames[] = {L"any time", L"today", L"this week", L"this month"};
+
+inline bool inPeriod(const SYSTEMTIME& when, ClipPeriod period, const SYSTEMTIME& now) {
+    const auto day = civilDays(when.wYear, when.wMonth, when.wDay), today = civilDays(now.wYear, now.wMonth, now.wDay);
+    if (period == ClipPeriod::Any || day > today) return true;
+    switch (period) {
+    case ClipPeriod::Today: return day == today;
+    case ClipPeriod::Week: return day >= today - (today + 3) % 7; // 1970-01-01 was a Thursday: Monday is 0.
+    default: return when.wYear == now.wYear && when.wMonth == now.wMonth;
+    }
+}
+
+// The same for a file's last write time (UTC), in the zone's rule for that date as formatClipDate uses.
+inline bool inPeriod(const FILETIME& written, ClipPeriod period, const SYSTEMTIME& now) {
+    if (period == ClipPeriod::Any) return true;
+    SYSTEMTIME utc{}, when{};
+    if (!FileTimeToSystemTime(&written, &utc) || !SystemTimeToTzSpecificLocalTime(nullptr, &utc, &when)) when = utc;
+    return inPeriod(when, period, now);
 }
 
 // "today · 21:57", "yesterday · 18:03", "12 oct · 21:57" this year, "12 oct 2025 · 21:57" before.

@@ -1,9 +1,12 @@
 // App: live audio level meters. The recorder (or, on the Recording page with replay off, a meter-only
 // capture) feeds two LevelMeters; a 20 Hz timer exists only while a meter is on screen and repaints a
 // bar only when its length or colour changes. The speaker and microphone icons beside the sidebar bars are
-// static and drawn by the normal paint; the Recording page's sliders have a segmented meter instead.
+// static and drawn by the normal paint; the Recording page's sliders have a segmented meter instead. While a meter
+// could show, a foreground WinEvent hook tells us when another app's window starts or stops covering ours.
 #include "app_internal.h"
 #include "capture/discord_audio.h"
+#include "diagnostic_log.h"
+#include "meter_rules.h"
 
 #include <commctrl.h>
 #include <algorithm>
@@ -21,7 +24,60 @@ constexpr int sliderIconSize = 16, sliderIconGap = 8; // The Recording page's ic
 constexpr int meterIconSize = 12, sidebarIconLeft = 24, collapsedIconGap = 6;
 constexpr int collapsedBarWidth = 6, collapsedBarGap = 8, collapsedBarTop = 206, collapsedBarBottom = 150; // Their icons follow, above the replay buttons.
 constexpr UINT_PTR meterToolId = 0x4D54; // Tooltip tools: this and the next one (collapsed: the bars and icons; expanded: each icon).
+
+// Another app's window in front covers the monitor `window` is on (a borderless or fullscreen game): nothing of
+// the meters can be seen, although the window is neither hidden nor minimised. The desktop itself can be in front
+// without covering anything, so the window in front must also be above ours.
+bool coveredByForeground(HWND window) {
+    const HWND front = GetAncestor(GetForegroundWindow(), GA_ROOT);
+    if (!front || front == window || GetAncestor(front, GA_ROOTOWNER) == window) return false;
+    MONITORINFO monitor{sizeof(monitor)};
+    RECT bounds{};
+    if (!GetWindowRect(front, &bounds) || !GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor) ||
+        !coversMonitor(bounds, monitor.rcMonitor)) return false;
+    for (HWND above = GetWindow(window, GW_HWNDPREV); above; above = GetWindow(above, GW_HWNDPREV))
+        if (above == front) return true;
+    return false;
+}
+
+HWND meterHookWindow = nullptr; // The one App's window; the hook callback only posts to it.
+void CALLBACK meterForegroundEvent(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD) {
+    if (meterHookWindow) PostMessageW(meterHookWindow, meterForeground, 0, 0); // No work inside the hook.
+}
 } // namespace
+
+// The foreground hook exists only while meters are wanted, so a covering window going away (the game closes or
+// minimises into another app) is noticed with one message per foreground change: no timer and no polling. It skips
+// our own process; activating Refarter is WM_ACTIVATEAPP's job. If Windows refuses the hook, the meters would run
+// on under a game for ever, so without it stepMeters looks at the foreground on each tick instead (the old way), and
+// every sync tries the hook again.
+void App::watchMeterForeground(bool on) {
+    if (!on) {
+        if (meterForegroundHook_) UnhookWinEvent(meterForegroundHook_);
+        meterForegroundHook_ = nullptr;
+        meterHookWindow = nullptr;
+        metersCovered_ = false;
+        return;
+    }
+    if (meterForegroundHook_) return;
+    meterHookWindow = window_;
+    meterForegroundHook_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, meterForegroundEvent,
+                                           0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (!meterForegroundHook_) {
+        meterHookWindow = nullptr;
+        if (!meterHookLogged_) {
+            meterHookLogged_ = true;
+            const DWORD error = GetLastError();
+            diagnosticLog().write(DiagnosticEvent::MeterHookFailed, error ? HRESULT_FROM_WIN32(error) : E_FAIL);
+        }
+    }
+    metersCovered_ = coveredByForeground(window_);
+}
+
+void App::meterForegroundChanged() {
+    metersCovered_ = meterForegroundHook_ && coveredByForeground(window_);
+    syncMeters();
+}
 
 bool App::meterDim(int source) const {
     const auto& device = source == 0 ? audio_.desktop : audio_.microphone;
@@ -208,9 +264,22 @@ void App::joinMeterClosers() {
 // Decides what runs: the meter-only captures (Recording page, replay off) and the timer (any meter on screen).
 // Called whenever the page, window visibility, recording state or an audio choice changes.
 void App::syncMeters(bool reopen) {
-    const bool shown = window_ && !closing_ && IsWindowVisible(window_) && !IsIconic(window_);
-    const bool onPage = shown && state_.page == Page::Recording && !fullscreen_.on;
     const bool buffering = recording_ == capture::RecorderState::Buffering;
+    const bool visible = window_ && !closing_ && IsWindowVisible(window_) && !IsIconic(window_);
+    // Watch the foreground only while a meter could be on screen and a source is on; the hook decides when a covering
+    // window is gone (meterForegroundChanged), so with the hook nothing here or in stepMeters walks the windows.
+    MeterHookFacts facts;
+    facts.windowVisible = window_ && IsWindowVisible(window_);
+    facts.closing = closing_;
+    facts.minimised = window_ && IsIconic(window_);
+    facts.fullscreenPlayback = fullscreen_.on;
+    facts.buffering = buffering;
+    facts.recordingPage = state_.page == Page::Recording;
+    facts.sourceEnabled = audio_.desktop.enabled() || audio_.microphone.enabled();
+    watchMeterForeground(meterHookWanted(facts));
+    // Covered by a game counts as hidden, until the window in front changes or Refarter is activated.
+    const bool shown = visible && !metersCovered_;
+    const bool onPage = shown && state_.page == Page::Recording && !fullscreen_.on;
     const bool idle = onPage && recording_ == capture::RecorderState::Off && !busy_;
     for (int source = 0; source < 2; ++source) {
         const auto& device = source == 0 ? audio_.desktop : audio_.microphone;
@@ -275,6 +344,11 @@ void App::paintMeterNow(int display, HWND target, RECT bar, bool vertical, int s
 }
 void App::stepMeters() {
     if (!meterTimer_) return;
+    if (!meterForegroundHook_ && coveredByForeground(window_)) { // Only while the hook is missing (watchMeterForeground).
+        metersCovered_ = true;
+        syncMeters(); // Stops the timer; Refarter being activated shows the meters again.
+        return;
+    }
     const ULONGLONG now = GetTickCount64();
     const float seconds = std::clamp(static_cast<float>(now - meterTick_) / 1000.f, 0.001f, 0.25f);
     meterTick_ = now;

@@ -5,6 +5,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libswresample/swresample.h>
 }
+#include "player/stereo_resampler.h"
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -49,9 +50,7 @@ public:
             if (!added.decoder || avcodec_parameters_to_context(added.decoder, parameters) < 0 ||
                 avcodec_open2(added.decoder, codec, nullptr) < 0) return false;
             added.decoder->pkt_timebase = input->streams[stream]->time_base;
-            if (swr_alloc_set_opts2(&added.resampler, &stereo, AV_SAMPLE_FMT_FLT, rate, &added.decoder->ch_layout,
-                                    added.decoder->sample_fmt, added.decoder->sample_rate, 0, nullptr) < 0 ||
-                swr_init(added.resampler) < 0) return false;
+            if (!openStereoResampler(&added.resampler, added.decoder, input->streams[stream], rate)) return false;
         }
         const auto* codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
         encoder_ = codec ? avcodec_alloc_context3(codec) : nullptr;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "encoder_times.h"
 #include "replay_buffer.h"
 #include "video_settings.h"
 
@@ -77,6 +78,7 @@ private:
     std::int64_t lastKeyframe_ = -1; // Sample time of the newest keyframe output.
     std::int64_t forcedAt_ = -1; // Sample time of the newest ForceKeyFrame request (one per second at most).
     int inputRequests_ = 0;
+    EncoderTimes times_; // Restores output times the encoder leaves out.
     winrt::com_ptr<IMFSample> pending_;
     std::vector<std::uint8_t> sequenceHeader_;
     bool failed_ = false;

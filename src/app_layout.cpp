@@ -2,6 +2,7 @@
 #include "app_internal.h"
 #include "replay_duration.h"
 #include "text.h"
+#include "capture/audio_levels.h"
 #include "capture/audio_track.h"
 
 #include <algorithm>
@@ -11,7 +12,7 @@ namespace refarter {
 namespace {
 constexpr int handleWidth = 24, handleHeight = 48; // The sidebar's collapse handle.
 // Library controls replaced by the player while a clip is open.
-constexpr int gridIds[] = {AllClips, Favourites, Compressed, GroupFolders, LargeTiles, SmallTiles, OpenFolder, Clips, ClipSearch};
+constexpr int gridIds[] = {AllClips, Favourites, Compressed, SortClips, GroupFolders, LargeTiles, SmallTiles, OpenFolder, Clips, ClipSearch};
 // "2–250" for a range of whole numbers.
 std::wstring rangeText(int low, int high) { return std::to_wstring(low) + L"–" + std::to_wstring(high); }
 constexpr int sectionsTop = 68;          // The first card's heading, under the page title.
@@ -82,7 +83,7 @@ void App::placeControls() {
     const int w = MulDiv(client.right, 96, static_cast<int>(dpi_));
     const int bottom = footerTop();
     const int left = contentLeft();
-    const int contentWidth = w - left - 36;
+    const int contentWidth = w - left - contentGap;
     for (const Page page : {Page::Recording, Page::Settings}) // The window may have grown.
         scroll_[static_cast<int>(page)] = std::clamp(scroll_[static_cast<int>(page)], 0, scrollMax(page));
     auto positions = BeginDeferWindowPos(idCount);
@@ -119,8 +120,10 @@ void App::placeControls() {
     place(Settings, navX, 238, navWidth, 46);
     // At the sidebar's foot (the footer shows the state): save above stop while there is a replay to save.
     saveShown_ = recording_ != capture::RecorderState::Off;
-    place(SaveReplay, navX, bottom - 108, navWidth, 42, saveShown_);
-    place(StartReplay, navX, bottom - 58, navWidth, 42);
+    // The replay buttons are 4 px wider each side so "clear retained replay" fits the 196 px sidebar.
+    const int replayX = collapsed ? navX : 12, replayWidth = sidebarWidth() - 2 * replayX;
+    place(SaveReplay, replayX, bottom - 108, replayWidth, 42, saveShown_);
+    place(StartReplay, replayX, bottom - 58, replayWidth, 42);
     // Library: filters and view buttons on the top row; the tiles fill the card below it,
     // inset so its rounded border stays visible. Tile size changes only the tiles.
     const int filter = libraryRowHeight;
@@ -135,7 +138,8 @@ void App::placeControls() {
     // The two tile sizes as a pair of square icon buttons at the right end, the folders toggle before them.
     place(SmallTiles, w - contentGap - tileButton, tileButtonTop, tileButton, tileButton);
     place(LargeTiles, w - contentGap - tileGap - 2 * tileButton, tileButtonTop, tileButton, tileButton);
-    place(GroupFolders, w - contentGap - libraryButtonsWidth, tileButtonTop, tileButton, tileButton);
+    place(GroupFolders, w - contentGap - folderButtonOffset, tileButtonTop, tileButton, tileButton);
+    place(SortClips, w - contentGap - libraryButtonsWidth, tileButtonTop, tileButton, tileButton);
     // The search field ends at the content edge on the title's line; its frame and magnifier are painted around it.
     place(ClipSearch, w - contentGap - searchFramePad - searchWidth, searchTop, searchWidth, searchHeight);
     // Under the card: the folder button at the right edge, the folder size (painted) to its left.
@@ -251,6 +255,9 @@ std::vector<App::Section> App::buildSections(Page page) const {
         result.push_back({L"trimming", {
             Row{L"compress & copy after trim", L"the trim bar's checkbox starts ticked", false, {CompressCopyAfterTrim}},
         }});
+        result.push_back({L"library", {
+            Row{L"game colours", L"a game's icon tints its folder, tiles and the player's seek bar", false, {GameColours}},
+        }});
         result.push_back({L"sound", {
             Row{L"save chime", L"plays when a save starts or fails", false, {ChimeVolume, ChimeVolumeLabel}},
         }});
@@ -279,7 +286,8 @@ std::vector<App::Section> App::buildSections(Page page) const {
     Section replay{L"replay", {
         Row{target_.name.empty() ? (waitingForGame ? L"auto-capture" : L"no source selected") : lower(sourceLabel), sourceNote,
             recording_ == capture::RecorderState::Buffering && !statusRoutine_, {SelectProcess}},
-        Row{L"auto-capture", L"starts replay for listed games", false, {AutoCaptureSource}},
+        Row{L"auto-capture", target_.source.monitor ? L"listed games also name monitor clips" : L"starts replay for listed games",
+            false, {AutoCaptureSource}},
         Row{L"replay length", off ? replayRange + L" seconds" : L"stop replay to change settings", false,
             {ThirtySeconds, OneMinute, ThreeMinutes, FiveMinutes}},
         Row{L"custom length", state_.replayInputValid ? L"= " + duration : L"enter " + replayRange + L" seconds · kept " + duration,
@@ -350,11 +358,14 @@ std::wstring App::estimateText() const {
     const auto rate = capture::bitrateFor(video_, capture::outputSize(video_.resolution, sourceSize()));
     // Discord gets its own track unless hidden or inseparable (only clips where it spoke).
     const bool discord = audio_.desktop.enabled() && !audio_.hideDiscord && !discordUnavailable_ && !discordSharesOutput_;
-    const int sources = audio_.desktop.enabled() + audio_.microphone.enabled() + discord + gameTrackOn();
+    const int stereoSources = audio_.desktop.enabled() + discord + gameTrackOn();
     const auto clip = estimatedClipBytes();
+    // One PCM ring per source, the microphone's mono.
+    const auto micRing = audio_.microphone.enabled()
+        ? capture::AudioTrack::ringBytes(state_.replaySeconds, capture::sourceChannels(capture::MicrophoneSource)) : 0;
     // The video buffer keeps the same headroom as the audio rings (see Recorder::start).
     const auto memory = capture::replayBytes(rate.peakKbps, capture::AudioTrack::ringSeconds(state_.replaySeconds)) +
-        static_cast<std::uint64_t>(sources) * capture::AudioTrack::ringBytes(state_.replaySeconds); // One PCM ring per source.
+        static_cast<std::uint64_t>(stereoSources) * capture::AudioTrack::ringBytes(state_.replaySeconds) + micRing;
     // Short enough for a half-width card: ≈ for a constant rate, ≤ for presets that vary.
     return (rate.constant ? L"clip ≈ " : L"clip ≤ ") + std::to_wstring(clip / 1'000'000) + L" mb · ram ≤ " +
         std::to_wstring(memory / 1'000'000) + L" mb";

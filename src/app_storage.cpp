@@ -18,7 +18,8 @@ std::uint64_t App::estimatedClipBytes(int seconds) const {
     const bool discord = audio_.desktop.enabled() && !audio_.hideDiscord && !discordUnavailable_ && !discordSharesOutput_;
     const int sources = audio_.desktop.enabled() + audio_.microphone.enabled() + discord + gameTrackOn();
     const int tracks = sources >= 2 ? sources + 1 : sources; // Two or more: a mix first.
-    return capture::replayBytes(rate.averageKbps + tracks * 192, seconds < 0 ? state_.replaySeconds : seconds);
+    const int audioKbps = tracks * 192 - (audio_.microphone.enabled() ? 96 : 0); // AAC 192 kb/s a track, the mono mic 96.
+    return capture::replayBytes(rate.averageKbps + audioKbps, seconds < 0 ? state_.replaySeconds : seconds);
 }
 
 // A save writes what the buffer holds: shorter than the setting just after a start. The time since the buffer began

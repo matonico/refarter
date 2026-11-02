@@ -18,6 +18,12 @@ struct SwrContext;
 
 namespace refarter::player {
 
+// REFARTER_PLAYER_SOFTWARE=1 forces software decoding in the player and the hover preview.
+inline bool softwareOnly() {
+    wchar_t value[8]{};
+    return GetEnvironmentVariableW(L"REFARTER_PLAYER_SOFTWARE", value, 8) && value[0] == L'1';
+}
+
 struct FrameDeleter { void operator()(AVFrame* frame) const; };
 using Frame = std::unique_ptr<AVFrame, FrameDeleter>;
 
@@ -39,6 +45,9 @@ public:
         ID3D11Device* device = nullptr; // Null decodes in software.
         bool audio = true;
         bool software = false;          // Force software decoding (testing, fallback).
+        // Software decoding only: 0 is one per core. Playback asks for fewer (the player passes 4, previews 1), because
+        // one thread per core would hold as many pictures in flight beside a game.
+        int softwareThreads = 0;
     };
 
     MediaFile();

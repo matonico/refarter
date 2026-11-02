@@ -10,9 +10,8 @@ int wmain(int argc, wchar_t** argv) {
         if (!passes) { std::cerr << name << '\n'; ++failures; }
     };
 
-    check(!exitedAutoCapture(true, nullptr), "missing process cannot clear a replay");
-    check(!exitedAutoCapture(true, GetCurrentProcess()), "live automatic game retains replay");
-    check(!exitedAutoCapture(false, GetCurrentProcess()), "live manual game retains replay");
+    check(!capturedProcessExited(nullptr), "missing process cannot clear a replay");
+    check(!capturedProcessExited(GetCurrentProcess()), "a live captured game keeps its replay");
     wchar_t self[MAX_PATH]{};
     GetModuleFileNameW(nullptr, self, MAX_PATH);
     std::wstring command = L"\"" + std::wstring(self) + L"\" --exit-target";
@@ -21,9 +20,8 @@ int wmain(int argc, wchar_t** argv) {
     if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
                         nullptr, nullptr, &startup, &child)) return 1;
     check(WaitForSingleObject(child.hProcess, 5000) == WAIT_OBJECT_0, "test target exits");
-    check(exitedAutoCapture(true, child.hProcess), "any automatic game clears on confirmed process exit");
-    check(!exitedAutoCapture(false, child.hProcess), "exited manual game retains replay");
-    check(!exitedAutoCapture(true, GetCurrentProcess()), "new live instance is independent of the exited instance");
+    check(capturedProcessExited(child.hProcess), "manual or automatic capture recognises confirmed process exit");
+    check(!capturedProcessExited(GetCurrentProcess()), "new live instance is independent of the exited instance");
     CloseHandle(child.hThread);
     CloseHandle(child.hProcess);
 

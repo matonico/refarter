@@ -1,6 +1,9 @@
 #include "clip_library.h"
 #include "clip_sources.h"
 #include "favourites.h"
+#include "game_icons.h"
+#include "local_file.h"
+#include "text.h"
 
 #include <shobjidl.h>
 #include <shellapi.h>
@@ -174,6 +177,7 @@ ClipLibrary::~ClipLibrary() {
     work_.notify_one();
     if (worker_.joinable()) worker_.join();
     for (auto& thumbnail : results_.thumbnails) if (thumbnail.bitmap) DeleteObject(thumbnail.bitmap);
+    for (auto& icon : results_.icons) if (icon.bitmap) DeleteObject(icon.bitmap);
 }
 
 void ClipLibrary::wake() {
@@ -220,8 +224,39 @@ void ClipLibrary::want(std::vector<ClipFile> paths, SIZE size) {
     if (!wanted_.empty()) wake();
 }
 
+void ClipLibrary::rememberGame(std::wstring game, std::filesystem::path executable) {
+    std::lock_guard lock(mutex_);
+    games_.emplace_back(std::move(game), std::move(executable));
+    wake();
+}
+
+void ClipLibrary::icons(std::vector<std::wstring> games, int size) {
+    std::lock_guard lock(mutex_);
+    if (size != iconSize_) iconsWanted_.clear(); // Asked again at the new size.
+    iconSize_ = size;
+    iconsWanted_.insert(iconsWanted_.end(), std::make_move_iterator(games.begin()), std::make_move_iterator(games.end()));
+    if (!iconsWanted_.empty()) wake();
+}
+
+void ClipLibrary::listedGames(std::map<std::wstring, std::wstring> games) {
+    std::lock_guard lock(mutex_);
+    listedGames_ = std::move(games);
+}
+
+void ClipLibrary::lengths(std::vector<ClipFile> clips) {
+    std::lock_guard lock(mutex_);
+    lengths_.insert(lengths_.end(), std::make_move_iterator(clips.begin()), std::make_move_iterator(clips.end()));
+    if (!lengths_.empty()) wake();
+}
+
+void ClipLibrary::cancelLengths() {
+    std::lock_guard lock(mutex_);
+    lengths_.clear();
+}
+
 bool ClipLibrary::hasResults() const {
-    return results_.clips || results_.favouriteSaved || results_.recycleError || !results_.thumbnails.empty();
+    return results_.clips || results_.favouriteSaved || results_.recycleError || !results_.thumbnails.empty() || !results_.icons.empty() ||
+           !results_.lengths.empty();
 }
 
 ClipLibrary::Results ClipLibrary::take() {
@@ -256,10 +291,17 @@ void ClipLibrary::run() {
     std::filesystem::path currentFolder;
     const auto favouritesFile = favouritesPath();
     const auto sourcesFile = clipSourcesPath();
+    const auto gamesFile = gameExecutablesPath();
+    const auto iconsFolder = localAppDataFile(L"icons");
     std::unordered_map<std::wstring, std::optional<std::uint64_t>> durations;
     for (;;) {
         std::optional<std::filesystem::path> folder;
         ClipFile wanted;
+        std::vector<std::pair<std::wstring, std::filesystem::path>> games;
+        std::vector<std::wstring> iconGames;
+        int iconSize = 0;
+        std::map<std::wstring, std::wstring> listedNow; // listedGames_, copied with the icons asked for.
+        std::vector<ClipFile> measuring;
         std::optional<FavouriteChange> change;
         std::optional<std::vector<ClipFile>> recycle;
         std::optional<BinRequest> bin;
@@ -269,8 +311,11 @@ void ClipLibrary::run() {
         bool notify = false;
         {
             std::unique_lock lock(mutex_);
-            work_.wait(lock, [this] { return exit_ || scan_ || favourite_ || !sources_.empty() || recycle_ || bin_ || !wanted_.empty(); });
-            if (exit_ && !favourite_ && sources_.empty() && !recycle_) break; // Finish accepted user operations before teardown.
+            work_.wait(lock, [this] {
+                return exit_ || scan_ || favourite_ || !sources_.empty() || recycle_ || bin_ || !wanted_.empty() || !games_.empty() ||
+                       !iconsWanted_.empty() || !lengths_.empty();
+            });
+            if (exit_ && !favourite_ && sources_.empty() && games_.empty() && !recycle_) break; // Finish accepted user operations before teardown.
             if (recycle_) { recycle = std::exchange(recycle_, std::nullopt); owner = recycleOwner_; }
             else if (bin_) {
                 bin = std::exchange(bin_, std::nullopt);
@@ -280,13 +325,27 @@ void ClipLibrary::run() {
             else if (exit_ && favourite_) change = std::exchange(favourite_, std::nullopt);
             else if (scan_) folder = std::exchange(scan_, std::nullopt);
             else if (favourite_) change = std::exchange(favourite_, std::nullopt);
-            else if (sources_.empty()) {
+            else if (sources_.empty() && !games_.empty()) games = std::exchange(games_, {});
+            else if (sources_.empty() && !wanted_.empty()) {
+                // The tiles on screen first: icons and lengths for the order wait until their thumbnails are made.
                 wanted = std::move(wanted_.front());
                 wanted_.erase(wanted_.begin());
                 size = size_;
+            } else if (sources_.empty() && !iconsWanted_.empty()) {
+                // A few at a time, so thumbnails asked meanwhile are not kept waiting.
+                const auto batch = std::min<std::size_t>(iconsWanted_.size(), 4);
+                iconGames.assign(iconsWanted_.begin(), iconsWanted_.begin() + batch);
+                iconsWanted_.erase(iconsWanted_.begin(), iconsWanted_.begin() + batch);
+                iconSize = iconSize_;
+                listedNow = listedGames_;
+            } else if (sources_.empty() && !lengths_.empty()) {
+                // A few at a time, so a scan, a favourite or new thumbnails asked meanwhile are not kept waiting.
+                const auto batch = std::min<std::size_t>(lengths_.size(), 16);
+                measuring.assign(std::make_move_iterator(lengths_.begin()), std::make_move_iterator(lengths_.begin() + batch));
+                lengths_.erase(lengths_.begin(), lengths_.begin() + batch);
             }
             // Games to remember go with whatever lists the folder next (on their own when nothing else does).
-            if (wanted.path.empty()) remembered = std::exchange(sources_, {});
+            if (wanted.path.empty() && games.empty() && iconGames.empty() && measuring.empty()) remembered = std::exchange(sources_, {});
         }
         if (folder || change || recycle || bin || !remembered.empty()) {
             if (folder) currentFolder = *folder;
@@ -349,6 +408,42 @@ void ClipLibrary::run() {
             results_.clips = std::move(clips);
             results_.driveFree = driveFree;
             results_.binAllowed = binAllowed;
+        } else if (!games.empty()) {
+            // An unreadable file is left as it is: its folders simply show no icon.
+            if (auto known = readGameExecutables(gamesFile)) {
+                bool changed = false;
+                for (auto& [game, executable] : games) {
+                    auto& entry = (*known)[lower(game)];
+                    if (entry != executable.wstring()) { entry = executable.wstring(); changed = true; }
+                }
+                if (changed) writeGameExecutables(gamesFile, *known);
+            }
+        } else if (!iconGames.empty()) {
+            if (!wic) CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(wic.put()));
+            const auto known = readGameExecutables(gamesFile);
+            std::vector<Results::Icon> made;
+            for (auto& game : iconGames) {
+                // The executable a clip of it was saved from, else the one the auto-capture list names for it.
+                std::wstring executable;
+                if (known) if (const auto found = known->find(game); found != known->end()) executable = found->second;
+                if (executable.empty()) if (const auto found = listedNow.find(game); found != listedNow.end()) executable = found->second;
+                const HBITMAP bitmap = executable.empty() ? nullptr : gameIcon(wic.get(), executable, iconSize, iconsFolder);
+                made.push_back({std::move(game), iconSize, bitmap, gameIconAccent(bitmap)}); // Worked out once, with the icon.
+            }
+            std::lock_guard lock(mutex_);
+            notify = !hasResults();
+            results_.icons.insert(results_.icons.end(), made.begin(), made.end());
+        } else if (!measuring.empty()) {
+            std::vector<Results::Length> measured;
+            for (auto& clip : measuring) {
+                const auto key = favouriteKey(clip);
+                auto cached = durations.find(key);
+                if (cached == durations.end()) cached = durations.emplace(key, clipDuration(clip.path)).first;
+                measured.push_back({std::move(clip), cached->second});
+            }
+            std::lock_guard lock(mutex_);
+            notify = !hasResults();
+            results_.lengths.insert(results_.lengths.end(), std::make_move_iterator(measured.begin()), std::make_move_iterator(measured.end()));
         } else {
             Thumbnail thumbnail{wanted};
             const auto key = favouriteKey(wanted);

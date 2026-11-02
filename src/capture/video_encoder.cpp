@@ -1,6 +1,7 @@
 #include "video_encoder.h"
 #include "annexb.h"
 #include "environment.h"
+#include "diagnostic_log.h"
 
 #include <mferror.h>
 #include <strmif.h>
@@ -302,7 +303,8 @@ void VideoEncoder::processInput(IMFSample* sample) {
     // Also start a GOP once a second of capture time has passed. The request is made once and repeated only after
     // another second without a keyframe coming out, not on every input frame while the encoder catches up.
     LONGLONG time = 0;
-    if (codecApi_ && lastKeyframe_ >= 0 && SUCCEEDED(sample->GetSampleTime(&time)) && time - lastKeyframe_ >= 10'000'000 &&
+    const bool timed = SUCCEEDED(sample->GetSampleTime(&time));
+    if (codecApi_ && lastKeyframe_ >= 0 && timed && time - lastKeyframe_ >= 10'000'000 &&
         (forcedAt_ < 0 || time - forcedAt_ >= 10'000'000)) {
         forcedAt_ = time;
         setCodecValue(codecApi_.get(), CODECAPI_AVEncVideoForceKeyFrame, 1); // Unsupported: GOP size alone, as before.
@@ -310,6 +312,8 @@ void VideoEncoder::processInput(IMFSample* sample) {
     if (const HRESULT hr = transform_->ProcessInput(0, sample, 0); FAILED(hr)) {
         failed_ = true;
         if (onError_) onError_(hr);
+    } else if (timed) {
+        times_.submitted(time);
     }
 }
 
@@ -351,9 +355,14 @@ void VideoEncoder::processOutput() {
     auto packet = std::make_shared<EncodedPacket>();
     LONGLONG time = 0;
     LONGLONG duration = 0;
-    sample->GetSampleTime(&time);
+    const bool stamped = SUCCEEDED(sample->GetSampleTime(&time));
     if (FAILED(sample->GetSampleDuration(&duration)) || duration <= 0) duration = 0;
-    packet->time = time;
+    const auto repaired = times_.repaired();
+    packet->time = times_.output(stamped ? std::optional<std::int64_t>(time) : std::nullopt);
+    if (repaired == 0 && times_.repaired() == 1) {
+        // Once per encoder: which codec, and whether the time was missing (0) or unknown (1).
+        diagnosticLog().write(DiagnosticEvent::EncoderTimeRepaired, S_OK, static_cast<unsigned>(codec_), stamped ? 1u : 0u);
+    }
     packet->duration = duration;
     winrt::com_ptr<IMFMediaBuffer> buffer;
     winrt::check_hresult(sample->ConvertToContiguousBuffer(buffer.put()));

@@ -183,6 +183,7 @@ void App::drawButton(const DRAWITEMSTRUCT& item) {
         (id == ThreeMinutes && state_.replayInputValid && state_.replaySeconds == 180) ||
         (id == FiveMinutes && state_.replayInputValid && state_.replaySeconds == 300) ||
         (id == LargeTiles && !state_.smallTiles) || (id == SmallTiles && state_.smallTiles) || (id == GroupFolders && state_.groupFolders) ||
+        (id == SortClips && clipGrid_.filtering()) || // A date filter hides clips: say so.
         (id == AssignHotkey && assigning_ && assigningShortcut_ == saveShortcut) ||
         (id == AssignScreenshot && assigning_ && assigningShortcut_ == screenshotShortcut);
     const bool disabled = (item.itemState & ODS_DISABLED) != 0;
@@ -332,8 +333,8 @@ void App::drawButton(const DRAWITEMSTRUCT& item) {
     }
     roundRect(graphics, item.rcItem, px(7), bg, stroke);
     if (contains(libraryIconIds, id)) {
-        // Drawn on a 20-unit square: 2×2 large tiles, 3×3 small tiles, a folder (folders by game), or a folder
-        // with an arrow out of it (open the clip folder in Explorer).
+        // Drawn on a 20-unit square: 2×2 large tiles, 3×3 small tiles, a folder (folders by game), a folder
+        // with an arrow out of it (open the clip folder in Explorer), or three shortening lines (sort).
         const float unit = scale, size = 20.f * unit;
         graphics.TranslateTransform((item.rcItem.left + item.rcItem.right - size) / 2.f, (item.rcItem.top + item.rcItem.bottom - size) / 2.f);
         graphics.ScaleTransform(unit, unit);
@@ -343,6 +344,12 @@ void App::drawButton(const DRAWITEMSTRUCT& item) {
         if (id == GroupFolders) {
             const Gdiplus::PointF folder[] = {{2.5f, 5.f}, {8.f, 5.f}, {10.f, 7.f}, {17.5f, 7.f}, {17.5f, 16.f}, {2.5f, 16.f}};
             graphics.DrawPolygon(&pen, folder, 6);
+        } else if (id == SortClips) {
+            pen.SetStartCap(Gdiplus::LineCapRound);
+            pen.SetEndCap(Gdiplus::LineCapRound);
+            graphics.DrawLine(&pen, 3.f, 5.5f, 17.f, 5.5f);
+            graphics.DrawLine(&pen, 3.f, 10.f, 13.f, 10.f);
+            graphics.DrawLine(&pen, 3.f, 14.5f, 9.f, 14.5f);
         } else if (id == OpenFolder) {
             // The folder is open at its top right, where the arrow leaves it.
             pen.SetStartCap(Gdiplus::LineCapRound);
@@ -394,7 +401,7 @@ void App::drawButton(const DRAWITEMSTRUCT& item) {
         return;
     }
     if (nav) icon(item.hDC, id, px(15), px(13), px(20), active ? accent : muted);
-    else if (replayButton) replayIcon(item.rcItem.left + px(15), (item.rcItem.top + item.rcItem.bottom - px(20)) / 2, px(20));
+    else if (replayButton) replayIcon(item.rcItem.left + px(11), (item.rcItem.top + item.rcItem.bottom - px(20)) / 2, px(20));
     wchar_t title[128];
     GetWindowTextW(item.hwndItem, title, 128);
     const bool dropdown = contains(dropdownIds, id);
@@ -404,8 +411,8 @@ void App::drawButton(const DRAWITEMSTRUCT& item) {
     // The two shortcut buttons are named for screen readers ("assign save shortcut"); the row already says which.
     else if ((id == AssignHotkey || id == AssignScreenshot) && !wcsncmp(title, L"assign", 6)) shown = L"assign hotkey";
     RECT text = item.rcItem;
-    text.left += px(nav ? 49 : replayButton ? 44 : dropdown ? 12 : 9);
-    text.right -= px(dropdown ? 30 : 9);
+    text.left += px(nav ? 49 : replayButton ? 36 : dropdown ? 12 : 9);
+    text.right -= px(dropdown ? 30 : replayButton ? 2 : 9);
     auto previous = SelectObject(item.hDC, fontOf(Font::Body));
     SetBkMode(item.hDC, TRANSPARENT);
     SetTextColor(item.hDC, fg);
@@ -487,7 +494,7 @@ void App::paint(HDC dc, const RECT& dirty) {
         icon(dc, 0, px(markLeft + logoMarkInset), px(logoTop + logoMarkInset), px(logoIconSize), background);
         if (!collapsed) {
             label(dc, L"refarter", logoNameLeft, logoTop - 1, logoNameWidth, 28, Font::Heading, ink);
-            label(dc, L"keep the good part.", 25, 78, 173, 20, Font::Small, muted);
+            label(dc, L"keep the good part.", 25, 78, 155, 20, Font::Small, muted);
         }
     }
     paintSidebarMeters(dc, dirty);
@@ -521,7 +528,7 @@ void App::paint(HDC dc, const RECT& dirty) {
         }
         if (clipGrid_.scanned()) {
             const auto count = clipGrid_.count();
-            // Ends just before the folders toggle (see placeControls()).
+            // Ends just before the sort menu (see placeControls()).
             label(dc, count == 1 ? L"1 clip" : std::to_wstring(count) + L" clips",
                 w - contentGap - libraryButtonsWidth - countGap - countWidth, tileButtonTop, countWidth, tileButton, Font::Small, muted, DT_RIGHT);
         }
@@ -549,12 +556,16 @@ void App::paint(HDC dc, const RECT& dirty) {
             const int center = x + width / 2;
             const int middle = top + 52;
             const bool favourites = state_.clipView == ClipView::Favourites, compressed = state_.clipView == ClipView::Compressed;
-            if (clipGrid_.searching()) {
-                // Nothing matches the search; the tab itself may have clips.
+            if (clipGrid_.searching() || clipGrid_.filtering()) {
+                // Nothing matches the search or the date filter; the tab itself may have clips.
                 if (touchesLogical(x, top, width, bottom - libraryCardBottom - top)) {
+                    const bool searching = clipGrid_.searching();
                     label(dc, L"no clips match.", x + 24, middle + 4, width - 48, 40, Font::Title, ink, DT_CENTER);
-                    label(dc, L"every word must appear in a clip's name or game.", x + 24, middle + 50, width - 48, 28, Font::Body, muted, DT_CENTER);
-                    label(dc, L"esc in the search field clears it.", x + 24, middle + 79, width - 48, 26, Font::Small, muted, DT_CENTER);
+                    label(dc, searching ? L"every word must appear in a clip's name or game." :
+                        std::wstring(L"no clips were saved ") + clipPeriodNames[static_cast<int>(clipGrid_.period())] + L".",
+                        x + 24, middle + 50, width - 48, 28, Font::Body, muted, DT_CENTER);
+                    label(dc, searching ? L"esc in the search field clears it." : L"the sort menu's \"from any time\" shows every clip.",
+                        x + 24, middle + 79, width - 48, 26, Font::Small, muted, DT_CENTER);
                 }
             } else if (touchesLogical(x, top, width, bottom - libraryCardBottom - top)) {
                 roundRect(dc, {px(center - 38), px(middle - 34), px(center + 28), px(middle + 15)}, px(8), background, border);
