@@ -102,5 +102,21 @@ int main() {
 
     check(displayVersion(L"v1.2.0") == L"1.2.0" && displayVersion(L"1.2.0") == L"1.2.0" && displayVersion(L"") == L"", "the display drops one leading v");
 
+    // ---- Downloading the installer ----
+    check(setupName(L"v1.2.0") == L"Refarter-1.2.0-setup.exe" && setupName(L"1.2.0-beta") == L"Refarter-1.2.0-beta-setup.exe",
+        "the setup is named as build-installer.ps1 names it");
+    check(assetPath(L"v1.2.0", L"SHA256SUMS.txt") == std::wstring(L"/") + std::wstring(repository) + L"/releases/download/v1.2.0/SHA256SUMS.txt",
+        "a release file's path on github.com");
+    check(!assetPath(L"v1.2.0/../../x", L"a") && !assetPath(L"latest", L"a") && !assetPath(L"v1.2.0-a b", L"a") && !assetPath(L"v1.2.0-é", L"a"),
+        "a tag that is not a URL-safe version gets no path");
+    const std::string sums =
+        "3f2a000000000000000000000000000000000000000000000000000000000001  Refarter-1.2.0-portable.zip\r\n"
+        "AB12000000000000000000000000000000000000000000000000000000000002  Refarter-1.2.0-setup.exe\r\n";
+    check(expectedHash(sums, "Refarter-1.2.0-setup.exe") == std::string("ab12000000000000000000000000000000000000000000000000000000000002"),
+        "the setup's hash, lower case, from a CRLF file");
+    check(!expectedHash(sums, "Refarter-1.2.0-setup") && !expectedHash(sums, "Refarter-1.3.0-setup.exe"), "an unlisted file has no hash");
+    check(!expectedHash("zz12000000000000000000000000000000000000000000000000000000000002  a.exe", "a.exe"), "a hash that is not hex is refused");
+    check(!expectedHash("ab12  a.exe", "a.exe") && !expectedHash("", "a.exe"), "a short line or an empty file gives nothing");
+
     return failures ? 1 : 0;
 }

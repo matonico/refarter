@@ -1,6 +1,8 @@
 // App: every menu the app opens. The setting and source pickers, the clip menu, and the one place they are tracked.
 #include "app_internal.h"
+#include "codec_choice.h"
 #include "message_box.h"
+#include "notes_view.h"
 #include "popup_menu.h"
 #include "source_names.h"
 #include "text.h"
@@ -58,8 +60,8 @@ bool App::pickerStale() const {
 void App::chooseQuality() {
     PopupMenu styled;
     const auto menu = styled.root;
-    const wchar_t* entries[] = {L"small · fewest mb, softer in fast motion", L"balanced · about obs replay size",
-        L"high · more detail in fast motion", L"custom · constant bitrate you choose"};
+    const wchar_t* entries[] = {L"small · lightest files, softer in fast action", L"balanced · good for most games",
+        L"high · stays sharp in fast action", L"custom · a fixed bitrate you set"};
     for (int i = 0; i < 4; ++i) {
         styled.append(menu, i + 1, entries[i], static_cast<int>(video_.quality) == i ? MFS_CHECKED : MFS_ENABLED);
     }
@@ -68,63 +70,145 @@ void App::chooseQuality() {
         video_.quality = static_cast<capture::Quality>(selected - 1);
 }
 
+namespace {
+// Each codec in menu order: what it is for (in the menu and the help's heading), then the help's two notes.
+struct CodecText { capture::Codec codec; const wchar_t* pitch; const wchar_t* good; const wchar_t* watchOut; };
+constexpr CodecText codecTexts[] = {
+    {capture::Codec::H264, L"plays everywhere",
+     L"every phone, browser, chat app and editor plays it. smooth editing. every supported gpu records it.",
+     L"biggest files. fast motion can look blocky at low bitrates."},
+    {capture::Codec::HEVC, L"smaller files, fewer apps play it",
+     L"about a third smaller than h.264. most recent gpus record it.",
+     L"many browsers and chat apps can't play it. windows may need a paid extension."},
+    {capture::Codec::AV1, L"smallest files",
+     L"about half the size of h.264, and fast motion stays sharp. discord and youtube play it.",
+     L"needs an rtx 40, rx 7000, arc or newer gpu. older iphones and older editors may not play it."},
+};
+
+// The probe's reason as part of a sentence in the help's markdown: one line (a Windows error message may span several),
+// no markdown markers, lower case, without a closing full stop.
+std::wstring reasonText(const std::wstring& problem) {
+    std::wstring text;
+    for (const wchar_t c : problem) {
+        if (c == L'*' || c == L'`' || c == L'<' || c == L'[') continue;
+        const bool space = c == L'\r' || c == L'\n' || c == L'\t' || c == L' ';
+        if (space) { if (!text.empty() && text.back() != L' ') text += L' '; }
+        else text += c;
+    }
+    while (!text.empty() && (text.back() == L'.' || text.back() == L' ')) text.pop_back();
+    return text.empty() ? L"no reason was given" : lower(text);
+}
+} // namespace
+
 void App::chooseCodec() {
     probeCodecs();
     PopupMenu styled;
     const auto menu = styled.root;
-    const capture::Codec codecs[] = {capture::Codec::H264, capture::Codec::HEVC, capture::Codec::AV1};
-    for (int i = 0; i < 3; ++i) {
-        std::wstring text = capture::codecName(codecs[i]);
-        bool available = i == 0; // h.264 is the baseline every supported gpu records.
-        if (i == 0) text += L" · most compatible";
-        if (i > 0) {
-            const auto* support = codecSupport(codecs[i]);
-            if (probing_) text += L" · checking your gpu…";
-            else if (!support) text += L" · stop replay to check your gpu";
-            else if (!support->records) text += L" · unavailable: " + lower(support->problem);
-            else {
-                available = true;
-                text += L" · recording supported";
-            }
+    const auto recommended = recommendedCodec(codecSupport(capture::Codec::AV1), probing_);
+    for (UINT i = 0; i < std::size(codecTexts); ++i) {
+        const auto& entry = codecTexts[i];
+        const auto state = codecState(entry.codec, codecSupport(entry.codec), probing_);
+        std::wstring text = std::wstring(capture::codecName(entry.codec)) + L" · ";
+        switch (state) {
+        case CodecState::Records:
+            text += entry.pitch;
+            if (recommended == entry.codec) text += L"\t(recommended)";
+            break;
+        case CodecState::Checking: text += L"checking your gpu…"; break;
+        case CodecState::NotChecked: text += L"stop replay to check your gpu"; break;
+        case CodecState::CheckFailed: text += L"recording check failed"; break;
+        case CodecState::TestFailed: text += L"couldn't record a test clip"; break; // The help says why.
         }
         styled.append(menu, i + 1, std::move(text),
-            (available ? MFS_ENABLED : MFS_DISABLED) | (video_.codec == codecs[i] ? MFS_CHECKED : 0));
+            (state == CodecState::Records ? MFS_ENABLED : MFS_DISABLED) | (video_.codec == entry.codec ? MFS_CHECKED : 0));
     }
-    enum Help { AboutPlayback = 100, WindowsAV1, WindowsHEVC, VLC };
-    const auto help = styled.submenu();
-    styled.append(help, AboutPlayback, L"about recording and playback");
-    styled.separator(help);
-    styled.append(help, WindowsAV1, L"windows av1 extension · free");
-    styled.append(help, WindowsHEVC, L"windows hevc extension · may require payment");
-    styled.append(help, VLC, L"vlc · independent playback support");
+    constexpr UINT Help = 100;
     styled.separator(menu);
-    styled.append(menu, 0, L"playback help", MFS_ENABLED, help);
+    styled.append(menu, Help, L"which codec should i pick?", dialogOpen() ? MFS_DISABLED : MFS_ENABLED); // One dialog at a time.
     RECT rect{}; GetWindowRect(control(VideoCodec), &rect);
     if (const auto selected = trackMenu(menu, rect.left, rect.bottom)) {
-        if (selected >= 1 && selected <= std::size(codecs)) {
-            if (!pickerStale()) video_.codec = codecs[selected - 1];
-        }
-        else if (selected == AboutPlayback) {
-            const auto* support = codecSupport(video_.codec);
-            const std::wstring playback = std::wstring(capture::codecName(video_.codec)) +
-                (support ? (support->plays ? L" · windows playback supported\n\n" :
-                    L" · windows playback check failed\n\n") : L" · windows playback not checked\n\n");
-            messageBox(window_,
-                (playback + L"recording and playback are separate.\n\n"
-                L"recording supported means your gpu encoded a test clip and windows saved it successfully. "
-                L"a failed windows playback check does not prevent recording, and does not test vlc or other independent players.\n\n"
-                L"windows media player may need a decoder extension. a failed check can also have other causes. "
-                L"the playback help menu links to the official extensions and vlc. "
-                L"buying a playback extension is not required to use a working gpu encoder.\n\n"
-                L"h.264 is the default for compatibility. hevc and av1 can make smaller clips, but sizes and quality depend on the content and settings.").c_str(),
-                L"codec playback", MB_OK | MB_ICONINFORMATION);
-        } else {
-            const wchar_t* url = selected == WindowsAV1 ? L"https://apps.microsoft.com/detail/9mvzqvxjbq9v" :
-                selected == WindowsHEVC ? L"https://apps.microsoft.com/detail/9nmzlz57r3t7" :
-                selected == VLC ? L"https://www.videolan.org/vlc/" : nullptr;
-            if (url) shellOpen(url, L"windows could not open the link in your browser.");
+        if (selected >= 1 && selected <= std::size(codecTexts)) {
+            if (!pickerStale()) video_.codec = codecTexts[selected - 1].codec;
+        } else if (selected == Help) {
+            showCodecHelp();
         }
     }
+}
+
+void App::showCodecHelp() {
+    if (closing_ || dialogOpen()) return;
+    const auto recommended = recommendedCodec(codecSupport(capture::Codec::AV1), probing_);
+    // Each codec's rate at the current quality, frame rate and encoded size; nothing while no source gives a size. Custom
+    // quality is one fixed rate for every codec, so it is said once instead.
+    const auto output = encodedSize();
+    const bool rates = output.width > 0 && output.height > 0;
+    const bool custom = video_.quality == capture::Quality::Custom;
+    std::wstring markdown;
+    if (rates) {
+        // An invalid custom field holds no rate yet: quoting the last valid one would contradict it.
+        if (custom && bitrateValid_) {
+            const auto rate = codecRate(video_, video_.codec, output);
+            markdown += L"at custom quality every codec records at " + std::to_wstring(rate.averageMbps) + L" mbps (about " +
+                std::to_wstring(rate.mbPerMinute) + L" mb of video a minute), so hevc and av1 make sharper clips at that size, "
+                L"not smaller ones.\n\n";
+        } else if (!custom) {
+            const auto size = std::to_wstring(output.width) + L"×" + std::to_wstring(output.height);
+            markdown += L"sizes are for your settings: " + std::wstring(qualityNames[static_cast<int>(video_.quality)]) +
+                L" quality, " + size + L", " + std::to_wstring(video_.fps) + L" fps.\n\n";
+        }
+    }
+    for (const auto& entry : codecTexts) {
+        const std::wstring name = capture::codecName(entry.codec);
+        markdown += L"## " + name + L" · " + entry.pitch + (recommended == entry.codec ? L" (recommended)" : L"") + L"\n\n";
+        markdown += L"- **good:** " + std::wstring(entry.good) + L"\n";
+        markdown += L"- **watch out:** " + std::wstring(entry.watchOut) + L"\n";
+        if (rates && !custom) {
+            const auto rate = codecRate(video_, entry.codec, output);
+            markdown += L"- **size:** about " + std::to_wstring(rate.averageMbps) + L" mbps, up to " +
+                std::to_wstring(rate.peakMbps) + L" in fast motion (about " + std::to_wstring(rate.mbPerMinute) +
+                L" mb of video a minute)\n";
+        }
+        // Only what this PC changes: a check still to come, its failure reason, or a failed Windows playback check.
+        const auto* support = codecSupport(entry.codec);
+        std::wstring local;
+        switch (codecState(entry.codec, support, probing_)) {
+        case CodecState::Checking: local = L"checking your gpu…"; break;
+        case CodecState::NotChecked: local = L"not checked yet: stop replay, then open the codec menu again."; break;
+        case CodecState::CheckFailed:
+        case CodecState::TestFailed:
+            local = L"the recording check failed (" + reasonText(support->problem) + L").";
+            break;
+        case CodecState::Records:
+            if (support && !support->plays && entry.codec != capture::Codec::H264)
+                local = entry.codec == capture::Codec::AV1
+                    ? L"windows couldn't play the test clip. it may need the free av1 extension from the microsoft store, but other playback failures are possible. refarter's player supports av1 without it."
+                    : L"windows couldn't play the test clip. it may need the hevc extension from the microsoft store, which may cost a little, but other playback failures are possible. refarter's player supports hevc without it.";
+            break;
+        default: break;
+        }
+        if (!local.empty()) markdown += L"- **on this pc:** " + local + L"\n";
+        markdown += L"\n";
+    }
+    const auto blocks = notes::parse(markdown);
+
+    // Other dialogs wait while it is open, but a save still runs (as with what's new).
+    infoOpen_ = true;
+    NotesView view;
+    // Up to 800 px tall (the dialog keeps within the screen), then shrunk to the text so nothing scrolls.
+    contentBox(window_, L"which codec should i pick?", 520, 800, [&](HWND parent, RECT area) {
+        const HWND body = view.create(parent, contentBoxBodyId, L"which codec should i pick?");
+        if (!body) return body;
+        view.setBackground(surface);
+        if (!view.setStyle(GetDpiForWindow(parent))) { // Without fonts the body would be blank: the dialog shows plain text.
+            DestroyWindow(body);
+            return static_cast<HWND>(nullptr);
+        }
+        view.setNotes(blocks);
+        SetWindowPos(body, nullptr, area.left, area.top, area.right - area.left, area.bottom - area.top, SWP_NOZORDER | SWP_SHOWWINDOW);
+        return body;
+    }, [&] { return view.contentHeight(); }, L"got it", notes::plainText(blocks));
+    infoOpen_ = false;
+    resumeHeldDialogs(); // A save under the dialog may have queued an error or the storage question.
 }
 
 void App::chooseSource() {
@@ -300,7 +384,7 @@ void App::showClipMenu() {
     const auto at = clipGrid_.menuPoint();
     const auto count = clipGrid_.selectedCount();
     const bool several = count > 1; // Open, rename and the rest work on one clip only.
-    enum { Open = 1, External, ShowInFolder, Rename, Copy, Favourite, Recycle, Compress, CancelCompression };
+    enum { Open = 1, External, ShowInFolder, Rename, Copy, Favourite, Recycle, Compress, CancelCompression, Combine, CancelCombine };
     PopupMenu styled;
     const UINT single = several ? MFS_DISABLED : MFS_ENABLED;
     styled.append(styled.root, Open, L"open", single);
@@ -310,7 +394,9 @@ void App::showClipMenu() {
     styled.append(styled.root, Copy, several ? L"copy " + std::to_wstring(count) + L" clips" : L"copy");
     const bool addFavourite = !clipGrid_.selectedAreFavourites(); // Decided once: the label and the click agree.
     styled.append(styled.root, Favourite, addFavourite ? L"add favourite" : L"remove favourite");
-    if (!several && path == compression_.clip()) styled.append(styled.root, CancelCompression, L"cancel compression", compression_.cancelling() ? MFS_DISABLED : MFS_ENABLED);
+    if (combining_) styled.append(styled.root, CancelCombine, L"cancel combining clips", compression_.cancelling() ? MFS_DISABLED : MFS_ENABLED);
+    else if (several) styled.append(styled.root, Combine, L"combine clips…", !compression_.active() && !playerOpen_ && !player_.trimBusy() && !closing_ ? MFS_ENABLED : MFS_DISABLED);
+    if (!combining_ && !several && path == compression_.clip()) styled.append(styled.root, CancelCompression, L"cancel compression", compression_.cancelling() ? MFS_DISABLED : MFS_ENABLED);
     else styled.append(styled.root, Compress, L"compress to 20mb", !several && !compression_.active() && !closing_ ? MFS_ENABLED : MFS_DISABLED);
     styled.append(styled.root, Recycle, several ? L"move " + std::to_wstring(count) + L" clips to recycle bin" : L"move to recycle bin",
         !several && path == compression_.clip() ? MFS_DISABLED : MFS_ENABLED);
@@ -323,6 +409,8 @@ void App::showClipMenu() {
     case Favourite: clipGrid_.favouriteSelection(addFavourite); break;
     case Recycle: clipGrid_.recycleSelection(); break;
     case Compress: startCompression(path); break;
+    case Combine: startCombine(); break;
+    case CancelCombine: compression_.cancel(); break;
     case CancelCompression:
         compression_.cancel();
         trimFollowUp_.cancel(); // A copy that was waiting for this compression is cancelled with it.

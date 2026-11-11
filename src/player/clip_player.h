@@ -69,7 +69,6 @@ public:
     HWND create(HWND parent, int id, Callbacks callbacks);
     // `date` is the line the library shows under the clip; empty: from the file's time.
     void open(const std::filesystem::path& path, int volume, const std::wstring& date = {}, bool muted = false);
-    void setTint(std::optional<COLORREF> tint); // The open clip's game colour for the seek bar, or none (after open()).
     // Stops playback and releases the decoder, GPU surfaces and audio device.
     void close();
     void setDpi(UINT dpi);
@@ -79,6 +78,10 @@ public:
     void setCompressCopyDefault(bool on) { compressDefault_ = on; }
     // A compression is running: the box is disabled (and unticked in effect). Updates a trim bar that is open.
     void setCompressionBusy(bool busy, const std::filesystem::path& clip = {}); // `clip`: the one being compressed.
+    // Refarter is about to be closed by its update: no trim or frame export can start, and a toast says `reason`.
+    void setWritesHeld(bool held, std::wstring reason = {});
+    // A saved frame is queued or being written (P or the camera button).
+    bool frameSaveBusy() const;
     // The toast line: `hold` keeps it until replaced (progress), otherwise it fades after a few seconds.
     void showToast(const std::wstring& text, ToastKind kind, bool hold);
     const std::filesystem::path& clipPath() const { return path_; }
@@ -118,6 +121,7 @@ private:
     void zoomBy(int steps, float px = 0.5f, float py = 0.5f);
     void setZoom(Zoom zoom);
     void startTrim();
+    void saveFrame();
     void endTrim();
     void leaveTrim(); // endTrim, also cancelling a copy that is still being written.
     void save(bool replace);
@@ -163,6 +167,8 @@ private:
     TemporaryClipIdentity trimmedIdentity_;
     bool replace_ = false;      // The finished copy replaces the clip; the original goes to the recycle bin.
     bool compressDefault_ = false, compressBusy_ = false;
+    bool writesHeld_ = false;
+    std::wstring writesHeldReason_;
     std::filesystem::path compressClip_;
     bool followUp_ = false;     // The box was ticked when the running trim was saved.
     bool followUpBlocksTrim() const;

@@ -257,6 +257,13 @@ void ClipGrid::inheritSource(const std::filesystem::path& clip, const std::files
     if (!clip.empty() && !game.empty()) pendingSources_.push_back({clip, game});
 }
 
+std::filesystem::path ClipGrid::commonSource(const std::vector<ClipFile>& clips) const {
+    if (clips.empty()) return {};
+    const auto game = lower(sourceOf(clips.front()));
+    if (game.empty() || std::any_of(clips.begin(), clips.end(), [&](const auto& clip) { return lower(sourceOf(clip)) != game; })) return {};
+    return clips.front().path;
+}
+
 void ClipGrid::toggleFavourite(int index) {
     if (savingFavourite_ || index < 0 || index >= static_cast<int>(clips_.size())) return;
     savingFavourite_ = true;
@@ -492,15 +499,6 @@ void ClipGrid::setGameColours(bool on) {
     askIcons();
     if (!window_) return;
     InvalidateRect(window_, nullptr, FALSE);
-    SendMessageW(parent_, WM_COMMAND, MAKEWPARAM(id_, coloursChanged), reinterpret_cast<LPARAM>(window_)); // The open player too.
-}
-
-std::optional<COLORREF> ClipGrid::gameColour(const std::filesystem::path& clip) const {
-    if (!gameColours_) return std::nullopt;
-    const auto listed = std::find_if(allClips_.begin(), allClips_.end(), [&](const ClipFile& c) { return c.path == clip; });
-    const auto game = lower(listed != allClips_.end() ? sourceOf(*listed) : clipSourceFromName(clip));
-    const auto found = accents_.find(game);
-    return found != accents_.end() ? std::optional(found->second) : std::nullopt;
 }
 
 std::optional<COLORREF> ClipGrid::tileColour(int index) const {
@@ -658,7 +656,6 @@ void ClipGrid::receive() {
         }
         if (!remember.empty()) library_->remember(std::move(remember));
     }
-    bool coloured = false;
     for (const auto& icon : results.icons) {
         if (!icon.bitmap) continue; // No known executable, or it has no icon: the plain folder mark stays.
         if (icon.size != iconSize_ || !iconsAsked_.contains(icon.game)) { DeleteObject(icon.bitmap); continue; } // Asked before a change.
@@ -666,10 +663,8 @@ void ClipGrid::receive() {
         icons_[icon.game] = icon.bitmap;
         if (icon.accent) accents_[icon.game] = *icon.accent;
         else accents_.erase(icon.game);
-        everything = coloured = true;
+        everything = true;
     }
-    // A clip already open in the player before its colour arrived takes it now.
-    if (coloured) SendMessageW(parent_, WM_COMMAND, MAKEWPARAM(id_, coloursChanged), reinterpret_cast<LPARAM>(window_));
     // Lengths asked for the order: kept like a thumbnail's, then sorted in once the last has arrived.
     const bool measuring = !lengthsAsked_.empty();
     std::unordered_map<std::wstring, const ClipFile*> listed; // By path: one look-up per answer, not a scan of the folder.
@@ -729,8 +724,7 @@ void ClipGrid::updateList() {
     for (const auto& clip : allClips_) {
         if (!search_.empty() && !matchesSearch(clipDisplayName(clip.path), sourceOf(clip), search_)) continue;
         if (!inPeriod(clip.written, period_, now)) continue;
-        const bool compressed = isCompressedCopy(clip.path);
-        if (view_ == ClipView::Compressed ? compressed : view_ == ClipView::All || (!compressed && clip.favourite)) shown.push_back(clip);
+        if (inClipView(clip, view_)) shown.push_back(clip);
     }
     if (order_.by == ClipSort::Length) {
         // Lengths come with thumbnails; the rest are read once, without thumbnails, and sorted in when all have arrived.
@@ -1026,7 +1020,7 @@ std::wstring ClipGrid::renameClip(const std::filesystem::path& path, const std::
     }
     const auto found = std::find_if(allClips_.begin(), allClips_.end(), [&](const auto& clip) { return clip.path == path; });
     if (found == allClips_.end()) return L"this clip is not in the library yet · try again in a moment.";
-    if (!canRename(path)) return path == exporting_ || path == pendingTrimSource_ ? L"finish or cancel compression before renaming this clip." : L"wait for the bin to finish, then try again.";
+    if (!canRename(path)) return path == exporting_ || path == pendingTrimSource_ || combiningInput(path) ? L"finish or cancel the export before renaming this clip." : L"wait for the bin to finish, then try again.";
     const auto clip = *found; // A modal prompt could replace the list.
     const auto target = renamedClipPath(path, name);
     // No replace flag: an existing clip is never overwritten.
@@ -1132,7 +1126,7 @@ void ClipGrid::paint(HDC dc) {
     Gdiplus::Graphics g(dc); // One for the whole paint.
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     // Rounded corners for thumbnails, built once at the origin and moved onto each tile.
-    const HRGN corners = CreateRoundRectRgn(1, 1, tileWidth_ + 1, thumbHeight_ + 1, px(14), px(14));
+    const HRGN corners = CreateRoundRectRgn(1, 1, tileWidth_, thumbHeight_, px(14), px(14));
     // A rounded badge on the thumbnail with one centred line of small text.
     const auto pill = [&](RECT box, int radius, COLORREF edge, const wchar_t* value, COLORREF colour) {
         roundRect(g, box, radius, background, edge);
@@ -1185,7 +1179,7 @@ void ClipGrid::paint(HDC dc) {
             g.DrawPath(&pen, &path);
         }
         const RECT thumb{tile.left, tile.top, tile.right, tile.top + thumbHeight_};
-        roundRect(g, thumb, px(8), background, overview() && gameTint ? *gameTint : border);
+        roundRect(g, thumb, px(8), background, background); // The edge is drawn once, after the pictures.
         // A clip fills the frame; a folder shows its four newest clips 2 × 2 (cells without a clip stay empty).
         const SIZE cell = thumbnailFrame();
         const auto shown = tileClips(i);
@@ -1225,6 +1219,14 @@ void ClipGrid::paint(HDC dc) {
             }
         }
         SelectClipRgn(dc, nullptr);
+        {   // The frame's edge over the pictures: the clip region is aliased and the edge anti-aliased, so an edge
+            // drawn before them would have a picture's corner pixels on top of it (a folder's coloured edge shows it).
+            Gdiplus::GraphicsPath edge;
+            roundPath(edge, thumb.left + 0.5f, thumb.top + 0.5f, static_cast<float>(thumb.right - thumb.left) - 1,
+                      static_cast<float>(thumb.bottom - thumb.top) - 1, static_cast<float>(px(8) * 2));
+            Gdiplus::Pen pen(color(overview() && gameTint ? *gameTint : border));
+            g.DrawPath(&pen, &edge);
+        }
         if (overview()) {
             // A folder: a folder mark where a clip has its star, the clip count where it has its size, then its game
             // and the date of its newest clip.

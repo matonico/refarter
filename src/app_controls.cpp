@@ -159,6 +159,7 @@ void App::createControls() {
     addButton(StartWithWindows, L"start with windows · off", Page::Settings, ButtonBackdrop::Card);
     addButton(StartMinimised, L"start minimised · on", Page::Settings, ButtonBackdrop::Card);
     addButton(DiagnosticLogging, L"diagnostic logging · off", Page::Settings, ButtonBackdrop::Card);
+    addButton(ShowNotes, L"changelog", Page::Settings, ButtonBackdrop::Card); // First in the updates row, so first in tab order.
     addButton(UpdateCheckNow, L"check for updates", Page::Settings, ButtonBackdrop::Card);
     addButton(UpdateCheckSwitch, L"updates · off", Page::Settings, ButtonBackdrop::Card);
     HWND previous = control(Gate);
@@ -356,7 +357,8 @@ void App::refreshControls() {
     setTextIfChanged(control(GameColours), state_.gameColours ? L"game colours · on" : L"game colours · off");
     EnableWindow(control(AskBeforeBinning), !closing_);
     EnableWindow(control(UpdateCheckSwitch), !closing_);
-    EnableWindow(control(UpdateCheckNow), !closing_ && !(updates_.running() && updateManual_));
+    const auto updateUi = updateView();
+    EnableWindow(control(UpdateCheckNow), updateUi.buttonEnabled);
     EnableWindow(control(StorageLimitField), !closing_);
     EnableWindow(control(StorageBehaviour), !closing_);
     setTextIfChanged(control(StorageBehaviour), state_.storageFull == StorageFull::Warn ? L"when full · warn and save" :
@@ -365,9 +367,11 @@ void App::refreshControls() {
     setTextIfChanged(control(AskBeforeBinning), state_.askBeforeBinning ? L"ask before binning · on" : L"ask before binning · off");
     setTextIfChanged(control(DiagnosticLogging), state_.diagnosticLogging ? L"diagnostic logging · on" : L"diagnostic logging · off");
     setTextIfChanged(control(UpdateCheckSwitch), state_.updateCheck == UpdateChoice::On ? L"updates · on" : L"updates · off");
-    // With a newer version known the button opens its page (the footer's text does too, but only for the mouse).
-    setTextIfChanged(control(UpdateCheckNow), updates_.running() && updateManual_ ? L"checking…" :
-        updateTag_.empty() ? L"check for updates" : L"open release page");
+    // With a newer version known the button updates to it, or opens its page for a portable copy (as the footer's text
+    // does, but only for the mouse).
+    // Orange while the label is an action on the newer version (updateView); a change of state always changes the
+    // label too, so the button is repainted with it.
+    setTextIfChanged(control(UpdateCheckNow), updateUi.button);
     // The sort icon's text is its tooltip and what a screen reader says: the order, and the date filter when one is set.
     setTextIfChanged(control(SortClips), std::wstring(L"sort · ") + clipOrderLabel(clipGrid_.order()) +
         (clipGrid_.filtering() ? std::wstring(L" · ") + clipPeriodNames[static_cast<int>(clipGrid_.period())] : std::wstring{}));

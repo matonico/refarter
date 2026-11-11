@@ -6,6 +6,7 @@
 #include "popup_menu.h"
 #include "text.h"
 #include "player/export_plan.h"
+#include "combine_dialog.h"
 
 #include <shellapi.h>
 #include <shlobj.h>
@@ -46,8 +47,8 @@ player::ClipPlayer::Callbacks App::playerCallbacks() {
 }
 
 void App::openClip(const std::filesystem::path& path) {
-    if (path == compression_.clip()) {
-        messageBox(window_, L"finish or cancel compression before editing this clip.", L"refarter", MB_OK | MB_ICONINFORMATION);
+    if (path == compression_.clip() || clipGrid_.combiningInput(path)) {
+        messageBox(window_, L"finish or cancel the export before editing this clip.", L"refarter", MB_OK | MB_ICONINFORMATION);
         return;
     }
     std::error_code error;
@@ -66,7 +67,6 @@ void App::openClip(const std::filesystem::path& path) {
     playerOpen_ = true;
     clipGrid_.setOpenClip(path);
     player_.open(path, playerVolume_, clipGrid_.dateOf(path));
-    player_.setTint(clipGrid_.gameColour(path));
     layout();
     SetFocus(control(Player));
     InvalidateRect(window_, nullptr, FALSE);
@@ -113,6 +113,7 @@ void App::closePlayer() {
 
 void App::startCompression(const std::filesystem::path& path, bool discardIntermediate) {
     if (closing_ || compression_.active() || path.empty()) return;
+    if (installing()) { setStatus(updatingNote); return; } // Setup would cut the job short.
     if (!SetTimer(window_, exportTimer, 250, nullptr)) {
         messageBox(window_, L"could not start compression.", L"refarter", MB_OK | MB_ICONERROR);
         return;
@@ -161,6 +162,31 @@ void App::trimSaved(const player::ClipPlayer::SavedTrim& trim) {
 
 void App::receiveCompression() {
     if (!compression_.active()) return;
+    if (combining_) {
+        clipGrid_.say(compression_.cancelling() ? L"cancelling combination…" :
+            L"combining clips · " + std::to_wstring(static_cast<int>(compression_.progress() * 100)) + L"%");
+        const auto result = compression_.poll();
+        if (!result) return;
+        KillTimer(window_, exportTimer);
+        combining_ = false;
+        clipGrid_.setCombineInputs({});
+        player_.setCompressionBusy(false);
+        if (closing_) { if (recorderClosed_) DestroyWindow(window_); return; }
+        if (!result->error.empty()) {
+            clipGrid_.say(L"clips could not be combined · " + result->error);
+            // Finishing an export must never put a question over a game or the hidden app.
+            // The recording error inbox: same bound and duplicate suppression.
+            if (!quietDialogs() && queueMessage(result->error, MB_ICONERROR)) showQueuedErrors();
+        }
+        else if (result->cancelled) clipGrid_.say(L"combination cancelled · originals kept");
+        else {
+            if (!combineSource_.empty()) clipGrid_.inheritSource(result->path, combineSource_);
+            clipGrid_.say(result->overLimit ? L"combined clip saved · over storage limit" : L"combined clip saved · originals kept");
+            clipGrid_.scan(clipFolder_);
+        }
+        combineSource_.clear();
+        return;
+    }
     const auto clip = compression_.clip();
     clipGrid_.compression(clip, compression_.progress(), compression_.cancelling());
     const bool followUp = trimFollowUp_.pending() && trimFollowUp_.clip() == clip;
@@ -240,6 +266,45 @@ void App::receiveCompression() {
     }
     if (!result->error.empty()) report(lower(result->error), MB_ICONERROR);
     else if (result->alreadyFits) report(L"this clip already fits under " + formatClipBytes(player::exportLimit) + L".", MB_ICONINFORMATION);
+}
+
+void App::startCombine() {
+    if (installing()) { setStatus(updatingNote); return; } // Setup would cut the job short.
+    if (closing_ || quietDialogs() || compression_.active() || playerOpen_ || player_.trimBusy() || dialogOpen() ||
+        showingErrors_ || assigning_ || !IsWindowEnabled(window_)) return;
+    auto chosen = clipGrid_.selectedClips();
+    if (chosen.size() < 2) return;
+    sortClips(chosen, {ClipSort::Date, false}, [](const ClipFile&) { return std::optional<std::uint64_t>{}; });
+    std::vector<std::filesystem::path> paths;
+    for (const auto& clip : chosen) paths.push_back(clip.path);
+    const auto source = clipGrid_.commonSource(chosen);
+    // Saves still run while the order window is open: "bin oldest clips" must not take a chosen clip meanwhile.
+    clipGrid_.setCombineInputs(paths);
+    orderingClips_ = true;
+    const bool accepted = orderCombinedClips(window_, paths);
+    orderingClips_ = false;
+    PostMessageW(window_, updateQuestion, 0, 0);
+    showQueuedErrors();
+    askQueuedStorageQuestion();
+    if (!accepted || closing_ || quietDialogs() || compression_.active() || playerOpen_ || player_.trimBusy()) {
+        clipGrid_.setCombineInputs({}); return;
+    }
+    if (!SetTimer(window_, exportTimer, 250, nullptr)) {
+        clipGrid_.setCombineInputs({}); report(L"could not start the export timer", MB_ICONERROR); return;
+    }
+    clipGrid_.setCombineInputs(paths); // The chosen order of the same clips.
+    // An export never bins clips, so "bin oldest" behaves like "warn" here. "Refuse", or no answer yet to the
+    // first-time question (a save would ask it; an export cannot), stops it at the limit.
+    const player::CombineStorage storage{limitBytes(state_.maxStorageGb), saveReserve + estimatedClipBytes(bufferedClipSeconds()),
+        state_.storageFull == StorageFull::Refuse || !state_.storageFullChosen};
+    if (!compression_.startCombine(std::move(paths), storage)) {
+        KillTimer(window_, exportTimer); clipGrid_.setCombineInputs({});
+        report(L"could not start the export worker", MB_ICONERROR); return;
+    }
+    combining_ = true;
+    combineSource_ = source;
+    player_.setCompressionBusy(true);
+    clipGrid_.say(L"checking clips for compatibility…");
 }
 
 void App::setFullscreen(bool on) {

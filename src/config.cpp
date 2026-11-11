@@ -79,9 +79,11 @@ void Config::loadFrom(std::filesystem::path path) {
     path_ = std::move(path);
     values_.clear();
     utf16_ = false;
+    created_ = false;
     std::error_code error;
     if (!path_.empty() && !std::filesystem::exists(path_, error) && !error) {
         // First launch: write the commented defaults. If that fails, defaults still apply.
+        created_ = true;
         const auto text = defaultText();
         utf16_ = writeUtf16(path_, text);
         values_ = parseConfig(text);

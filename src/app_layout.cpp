@@ -2,6 +2,7 @@
 #include "app_internal.h"
 #include "replay_duration.h"
 #include "text.h"
+#include "version.h"
 #include "capture/audio_levels.h"
 #include "capture/audio_track.h"
 
@@ -256,7 +257,7 @@ std::vector<App::Section> App::buildSections(Page page) const {
             Row{L"compress & copy after trim", L"the trim bar's checkbox starts ticked", false, {CompressCopyAfterTrim}},
         }});
         result.push_back({L"library", {
-            Row{L"game colours", L"a game's icon tints its folder, tiles and the player's seek bar", false, {GameColours}},
+            Row{L"game colours", L"a game's icon tints its folder and tiles", false, {GameColours}},
         }});
         result.push_back({L"sound", {
             Row{L"save chime", L"plays when a save starts or fails", false, {ChimeVolume, ChimeVolumeLabel}},
@@ -266,7 +267,7 @@ std::vector<App::Section> App::buildSections(Page page) const {
             Row{L"start with windows", startupNote, startupReadFailed_ || startupOtherCopy_, {StartWithWindows}},
             Row{L"start minimised", L"starts in the tray instead of opening a window", false, {StartMinimised}},
             Row{L"diagnostic logging", L"local session events · up to 6 mb", false, {DiagnosticLogging}},
-            Row{L"updates", updateRowNote(), false, {UpdateCheckNow, UpdateCheckSwitch}},
+            Row{L"updates", updateRowNote(), false, {ShowNotes, UpdateCheckNow, UpdateCheckSwitch}},
         }});
         const int width = std::min(settingsMaxWidth, available);
         int y = sectionsTop;
@@ -355,7 +356,7 @@ std::vector<App::Section> App::buildSections(Page page) const {
 
 std::wstring App::estimateText() const {
     // Clip size at the average rate (calm scenes come out smaller); memory at the peak rate.
-    const auto rate = capture::bitrateFor(video_, capture::outputSize(video_.resolution, sourceSize()));
+    const auto rate = capture::bitrateFor(video_, encodedSize());
     // Discord gets its own track unless hidden or inseparable (only clips where it spoke).
     const bool discord = audio_.desktop.enabled() && !audio_.hideDiscord && !discordUnavailable_ && !discordSharesOutput_;
     const int stereoSources = audio_.desktop.enabled() + discord + gameTrackOn();

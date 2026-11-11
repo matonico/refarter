@@ -21,6 +21,12 @@ constexpr UINT updateChecked = WM_APP + 9;   // The release check's worker has a
 constexpr UINT updateQuestion = WM_APP + 10; // Ask the opt-in question now if Refarter is in front.
 constexpr UINT errorDialogs = WM_APP + 11;   // Show the error messages that waited for Refarter's own window to be in front.
 constexpr UINT meterForeground = WM_APP + 12; // The window in front may have changed: look at what covers the meters (see app_meters.cpp).
+constexpr UINT storageQuestion = WM_APP + 8; // Asks the storage question that a save over a game had to leave for later.
+constexpr UINT notesDue = WM_APP + 13;      // Show this version's release notes now if they are due and Refarter is in front.
+constexpr UINT updateDownloaded = WM_APP + 14; // The installer download ended (UpdateDownload::take; see app_updates.cpp).
+constexpr UINT updateProgress = WM_APP + 15;   // The installer download reached another whole percent (wParam; lParam: UpdateDownload::current).
+constexpr UINT updateSetupEnded = WM_APP + 16; // The update's setup process ended while Refarter still runs (see App::setupEnded).
+constexpr wchar_t updatingNote[] = L"refarter is updating · nothing new is saved"; // Setup is about to close Refarter (installing()).
 // The right end of the footer reserves this much (logical px) for the version text; an "update available" text adds its own width.
 constexpr int footerVersionReserve = 220;
 constexpr std::chrono::seconds startupUpdateDelay{30}; // The automatic check waits this long after start-up (a worker asleep on an event, not a timer).
@@ -90,6 +96,7 @@ inline Slot rowSlot(int id) {
     case GateOpen: case GateClose: return {40, 23, 60, 28};
     case GateAttack: case GateHold: case GateRelease: return {40, 23, 60, 30};
     case Suppression: case Gate: case RecordDiscord: case CloseToTray: case StartWithWindows: case StartMinimised: case DiagnosticLogging: case CompressCopyAfterTrim: case AskBeforeBinning: case UpdateCheckSwitch: case GameColours: return {40, 22, 0, 0};
+    case ShowNotes: return {100, 34, 0, 8};       // "changelog", left of the update button.
     case UpdateCheckNow: return {160, 34, 0, 16}; // Left of the switch, 16 px away.
     case ThirtySeconds: case OneMinute: case ThreeMinutes: case FiveMinutes: return {54, 34, 4, 0};
     case SelectProcess: return {130, 34, 0, 0};

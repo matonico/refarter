@@ -17,8 +17,6 @@
 
 namespace refarter {
 
-enum class ClipView { All, Favourites, Compressed };
-
 // The library's clip tiles, newest first: thumbnail, name and date. A child
 // window with its own scrolling and keyboard focus (arrows, Home/End, Page
 // Up/Down; single click selects; double click, Enter or Space opens). Opening a tile
@@ -35,7 +33,6 @@ public:
     static constexpr WORD clipMenu = 0x8003;   // target() and menuPoint(): show the clip's menu.
     static constexpr WORD noteChanged = 0x8004; // note() changed: repaint the strip under the grid.
     static constexpr WORD askChanged = 0x8005;  // The question's "don't ask again" box was used: read askBeforeBinning().
-    static constexpr WORD coloursChanged = 0x8006; // A game colour arrived or changed: read gameColour() again.
 
     const std::filesystem::path& target() const { return target_; }
     // The line shown under a clip's name ("yesterday · 21:42"), or empty for a clip not listed.
@@ -50,6 +47,12 @@ public:
     // The multi-selection (click, Ctrl+click, Shift+click, Ctrl+A, a dragged rectangle; Esc clears). Bulk actions
     // work on the selected clips of the current tab only.
     std::size_t selectedCount() const { return selection_.size(); }
+    std::vector<ClipFile> selectedClips() const { return selection_.clips(clips_); }
+    std::filesystem::path commonSource(const std::vector<ClipFile>& clips) const;
+    void setCombineInputs(std::vector<std::filesystem::path> clips) { combineInputs_ = std::move(clips); }
+    bool combiningInput(const std::filesystem::path& path) const {
+        return std::find(combineInputs_.begin(), combineInputs_.end(), path) != combineInputs_.end();
+    }
     bool selectedAreFavourites() const;
     bool clearSelection();
     bool cancelBand();          // Esc during a rectangle drag: restores the selection from before it.
@@ -57,13 +60,16 @@ public:
     void favouriteSelection(std::optional<bool> add = std::nullopt); // Adds the mark to all, or removes it when all have it (or as told).
     bool copySelection();       // Puts the files on the clipboard.
     void setOpenClip(const std::filesystem::path& path) { open_ = path; } // The clip open in the player: never binned.
-    const std::filesystem::path& openClip() const { return open_; }
     void setTrimSource(const std::filesystem::path& path) { pendingTrimSource_ = path; } // Protected through trim compression.
     void say(std::wstring text) { showNote(std::move(text)); } // A short note beside the folder size.
     // Every clip in the folder, newest first, as of the last scan (compressed copies and favourites included).
     const std::vector<ClipFile>& allClips() const { return allClips_; }
     // Bulk actions protect the export input, open player clip and original of a trim/compression pipeline.
-    std::vector<std::filesystem::path> busyClips() const { return {exporting_, open_, pendingTrimSource_}; }
+    std::vector<std::filesystem::path> busyClips() const {
+        auto result = combineInputs_;
+        for (const auto& path : {exporting_, open_, pendingTrimSource_}) result.push_back(path);
+        return result;
+    }
     // The storage limit's "bin oldest clips": no question and no dialog, whatever the window is doing. The library worker
     // reads the folder afresh and moves only what the Recycle Bin can take (see ClipLibrary::binOldest). Refused (false)
     // while another bin is running. The result arrives as a note on the strip.
@@ -74,7 +80,7 @@ public:
     // A short status for the strip ("copied 2 clips"), cleared after a few seconds.
     const std::wstring& note() const { return note_; }
     // Edits a clip's name in place over its tile; the parent's menu, F2 and the pencil all start it.
-    bool canRename(const std::filesystem::path& path) const { return !recycling_ && path != exporting_ && path != pendingTrimSource_; }
+    bool canRename(const std::filesystem::path& path) const { return !recycling_ && !combiningInput(path) && path != exporting_ && path != pendingTrimSource_; }
     void rename(const std::filesystem::path& path);
     // Renames a clip's file (the player's rename too): checks the name, keeps its star and its folder. Returns what
     // went wrong (empty on success or when nothing changed); `renamed` is the new file, or empty.
@@ -85,8 +91,6 @@ public:
     // Game colours (Settings → app): a folder's edge and a tile's hover outline take the colour of its game's icon. On,
     // icons are also read for the games of clip tiles, not only for folders.
     void setGameColours(bool on);
-    // The colour of a clip's game (for the player's progress bar), while game colours are on and its icon gives one.
-    std::optional<COLORREF> gameColour(const std::filesystem::path& clip) const;
     // The auto-capture list (label → executable): folders of listed games show the icon even before a clip of them
     // was saved from the game's window. Given again whenever the list changes; folders still without one are asked anew.
     void setListedGames(const std::vector<std::pair<std::wstring, std::wstring>>& games);
@@ -268,6 +272,7 @@ private:
     bool automaticRecycle_ = false; // The running bin was started by the storage limit: its result is a note.
     std::filesystem::path target_;
     std::filesystem::path exporting_;
+    std::vector<std::filesystem::path> combineInputs_;
     int exportPercent_ = -1;
     bool exportCancelling_ = false;
     POINT menuPoint_{};

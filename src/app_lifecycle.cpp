@@ -5,6 +5,7 @@
 #include "text.h"
 #include "window_target.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -214,6 +215,15 @@ void App::endSession(bool ending, LPARAM flags) {
 }
 
 void App::report(const std::wstring& text, UINT icon) {
+    if (orderingClips_ && !quietDialogs()) {
+        // Never a second modal over the clip-order window: the message waits in the inbox, with its own icon, until
+        // the window closes. A full inbox still leaves it in the status line.
+        if (!queueMessage(text, icon)) {
+            setStatus(lower(text));
+            InvalidateRect(window_, nullptr, FALSE);
+        }
+        return;
+    }
     if (!quietDialogs()) {
         messageBox(window_, text.c_str(), L"refarter", MB_OK | icon);
         return;

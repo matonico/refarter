@@ -76,6 +76,8 @@ Name: "{autodesktop}\Refarter"; Filename: "{app}\{#AppExeName}"; Tasks: desktopi
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Start Refarter"; Flags: nowait postinstall skipifsilent
+; Refarter's own "update" runs this setup silently with /RELAUNCH=1 and has quit by now: open it again.
+Filename: "{app}\{#AppExeName}"; Flags: nowait; Check: RelaunchRequested
 
 [Registry]
 ; Record cleanup even when startup is first enabled later from the app.
@@ -85,6 +87,12 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 const
   StartupRunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
   MediaPackUrl = 'https://support.microsoft.com/topic/media-feature-pack-list-for-windows-n-editions-c1c6fffa-d052-8338-7a79-a4bb980a700a';
+
+// Only a silent setup started by Refarter's update (/RELAUNCH=1) starts it again; an ordinary silent install does not.
+function RelaunchRequested: Boolean;
+begin
+  Result := WizardSilent and (ExpandConstant('{param:RELAUNCH|0}') = '1');
+end;
 
 function MediaFoundationPresent: Boolean;
 begin

@@ -52,10 +52,13 @@ public:
     bool set(std::wstring_view section, std::wstring_view key, const std::wstring& value);
     // Everything read, keyed "section/key" as parseConfig returns it.
     const std::map<std::wstring, std::wstring>& values() const { return values_; }
+    // The last load found no file and wrote the template: a fresh install (or deleted settings), not an update.
+    bool created() const { return created_; }
 
 private:
     std::filesystem::path path_;
     bool utf16_ = false;
+    bool created_ = false;
     std::map<std::wstring, std::wstring> values_;
 };
 

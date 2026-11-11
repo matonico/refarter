@@ -268,4 +268,44 @@ inline std::wstring displayVersion(std::wstring_view tag) {
     return std::wstring(tag);
 }
 
+// ---- Downloading the installer --------------------------------------------------------------------------------------
+
+inline constexpr std::wstring_view downloadHost = L"github.com";
+inline constexpr std::uint64_t maxSetupBytes = 64ull * 1024 * 1024; // The setup is about 5 MB; anything far larger is not ours.
+inline constexpr std::size_t maxSumsBytes = 64 * 1024;
+
+// "Refarter-1.2.0-setup.exe" for "v1.2.0", as scripts\build-installer.ps1 names it.
+inline std::wstring setupName(std::wstring_view tag) { return L"Refarter-" + displayVersion(tag) + L"-setup.exe"; }
+
+// The path of one of a release's files on github.com, which redirects to the download. Only a tag that is a version
+// and made of URL-safe characters gets one, so nothing from the answer can change the host or the path's shape.
+inline std::optional<std::wstring> assetPath(std::wstring_view tag, std::wstring_view file) {
+    if (!parseVersion(tag)) return std::nullopt;
+    for (const wchar_t c : tag)
+        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || c == L'.' || c == L'-' || c == L'+'))
+            return std::nullopt;
+    return L"/" + std::wstring(repository) + L"/releases/download/" + std::wstring(tag) + L"/" + std::wstring(file);
+}
+
+// The SHA-256 that SHA256SUMS.txt gives `file` ("<64 hex>  <name>" per line, as Get-FileHash writes it), lower case;
+// nothing when the file is not listed or its line is malformed.
+inline std::optional<std::string> expectedHash(std::string_view sums, std::string_view file) {
+    for (size_t start = 0; start < sums.size();) {
+        auto end = sums.find('\n', start);
+        if (end == std::string_view::npos) end = sums.size();
+        auto line = sums.substr(start, end - start);
+        start = end + 1;
+        if (line.ends_with('\r')) line.remove_suffix(1);
+        if (line.size() < 66 || line.substr(64, 2) != "  " || line.substr(66) != file) continue;
+        std::string hash;
+        for (const char c : line.substr(0, 64)) {
+            const char low = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (!((low >= '0' && low <= '9') || (low >= 'a' && low <= 'f'))) return std::nullopt;
+            hash += low;
+        }
+        return hash;
+    }
+    return std::nullopt;
+}
+
 } // namespace refarter::update

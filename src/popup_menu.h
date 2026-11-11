@@ -3,8 +3,18 @@
 #include <windows.h>
 
 #include <string>
+#include <utility>
 
 namespace refarter {
+
+// An item's text and its muted detail: "text\tdetail", split at the first tab; no tab, no detail.
+inline std::pair<std::wstring, std::wstring> splitDetail(std::wstring text) {
+    const auto tab = text.find(L'\t');
+    if (tab == std::wstring::npos) return {std::move(text), {}};
+    std::wstring detail = text.substr(tab + 1);
+    text.resize(tab);
+    return {std::move(text), std::move(detail)};
+}
 
 // Shows a menu built with the Win32 menu API (text, checks, disabled rows,
 // separators, submenus) as Refarter's own popup: dark, rounded, with a hover
@@ -13,6 +23,7 @@ namespace refarter {
 // apps. Opens below `at` (screen pixels), or above it near the screen bottom.
 // Keyboard: arrows, Home/End, Enter/Space, Esc, ←/→ for submenus, and the
 // first letter of an item. The owner keeps keyboard focus; nothing activates.
+// Text after a tab is secondary detail, drawn right after the item's text in muted grey.
 UINT showPopupMenu(HWND owner, HMENU menu, POINT at, UINT dpi);
 
 // A menu described with the Win32 menu API and shown by showPopupMenu. Submenus are destroyed with the root.

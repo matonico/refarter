@@ -13,7 +13,7 @@ bool App::gameTrackOn() const {
 }
 
 std::uint64_t App::estimatedClipBytes(int seconds) const {
-    const auto rate = capture::bitrateFor(video_, capture::outputSize(video_.resolution, sourceSize()));
+    const auto rate = capture::bitrateFor(video_, encodedSize());
     // Discord gets its own track unless hidden or inseparable (only clips where it spoke).
     const bool discord = audio_.desktop.enabled() && !audio_.hideDiscord && !discordUnavailable_ && !discordSharesOutput_;
     const int sources = audio_.desktop.enabled() + audio_.microphone.enabled() + discord + gameTrackOn();
@@ -99,7 +99,7 @@ void App::askStorageQuestion(std::uint64_t used, std::uint64_t limit, std::uint6
 // Refarter was activated (the player clicked its window after the game): the question a save over the game could not
 // ask. Posted from WM_ACTIVATEAPP; never during a shutdown or sleep wait.
 void App::askQueuedStorageQuestion() {
-    if (!storageQuestionQueued_ || asking_ || showingErrors_ || quietDialogs() || !ownWindowForeground()) return;
+    if (!storageQuestionQueued_ || dialogOpen() || showingErrors_ || quietDialogs() || !ownWindowForeground()) return;
     const std::uint64_t limit = limitBytes(state_.maxStorageGb);
     const std::uint64_t estimate = estimatedClipBytes(bufferedClipSeconds());
     const auto verdict = checkSave({limit ? clipGrid_.bytes() : 0, limit, clipGrid_.driveFree(), estimate});

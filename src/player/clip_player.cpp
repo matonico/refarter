@@ -68,10 +68,30 @@ struct ClipPlayer::FrameWriter {
         if (thread.joinable()) thread.join(); // Pending frames are still written.
     }
     void write(Job job) {
+        std::wstring refused;
+        {
+            std::lock_guard lock(mutex);
+            if (!held) {
+                jobs.push_back(std::move(job));
+                if (!thread.joinable()) thread = std::thread([this] { run(); });
+                work.notify_all();
+                return;
+            }
+            refused = L"frame not saved · " + heldReason;
+        }
+        // Refused while held: a frame the engine read back after the hold began is not written.
+        report({job.session, std::move(refused), false});
+    }
+    // While held (Refarter's update is about to close it), new frames are refused; one already queued or being
+    // written still finishes, and busy() says so.
+    void hold(bool on, std::wstring reason) {
         std::lock_guard lock(mutex);
-        jobs.push_back(std::move(job));
-        if (!thread.joinable()) thread = std::thread([this] { run(); });
-        work.notify_all();
+        held = on;
+        heldReason = std::move(reason);
+    }
+    bool busy() {
+        std::lock_guard lock(mutex);
+        return !jobs.empty() || writing;
     }
     void report(Result result) { // An outcome known without writing (no picture, no folder).
         { std::lock_guard lock(mutex); results.push_back(std::move(result)); }
@@ -94,6 +114,7 @@ private:
                 if (jobs.empty()) break; // Stopping, with nothing left to write.
                 job = std::move(jobs.front());
                 jobs.pop_front();
+                writing = true;
             }
             std::optional<std::wstring> error;
             try {
@@ -105,6 +126,7 @@ private:
                 error = L"frame not saved · not enough memory";
             }
             // writePng speaks of screenshots; a frame from the player says so in its own words.
+            { std::lock_guard lock(mutex); writing = false; } // The file is finished (or gone) before it is reported.
             report({job.session, error ? L"frame not saved · " + std::wstring(error->substr(error->find(L"·") == std::wstring::npos ? 0 : error->find(L"·") + 2))
                                        : L"frame saved · " + job.file.filename().wstring(), !error});
         }
@@ -117,6 +139,8 @@ private:
     std::deque<Job> jobs;
     std::vector<Result> results;
     bool stop = false;
+    bool held = false, writing = false;
+    std::wstring heldReason;
     std::thread thread;
 };
 
@@ -596,11 +620,9 @@ void ClipPlayer::open(const std::filesystem::path& path, int volume, const std::
     path_ = path;
     const float scale = view_.scale;
     const bool fullscreen = view_.fullscreen;
-    const auto tint = view_.tint; // A trim or rename reopening its clip keeps the game colour; the app sets it for a new one.
     view_ = {};
     view_.scale = scale;
     view_.fullscreen = fullscreen;
-    view_.tint = tint;
     view_.volume = std::clamp(volume, 0, 100);
     view_.muted = muted; // Set before the engine starts, so a muted clip never blips.
     setTitle(path);
@@ -612,13 +634,11 @@ void ClipPlayer::open(const std::filesystem::path& path, int volume, const std::
         if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &info)) view_.date = formatClipDate(info.ftLastWriteTime, now);
     }
     thumbnailsFor_ = 0;
-    if (!frameWriter_) frameWriter_ = std::make_shared<FrameWriter>(window_);
+    if (!frameWriter_) {
+        frameWriter_ = std::make_shared<FrameWriter>(window_);
+        frameWriter_->hold(writesHeld_, writesHeldReason_);
+    }
     engine_ = std::make_unique<Engine>(window_, path, view_, frameWriter_, session_);
-}
-
-void ClipPlayer::setTint(std::optional<COLORREF> tint) {
-    view_.tint = tint;
-    publish();
 }
 
 void ClipPlayer::setTitle(const std::filesystem::path& path) {
@@ -761,7 +781,22 @@ void ClipPlayer::requestThumbnails() {
     engine_->push(request);
 }
 
+void ClipPlayer::setWritesHeld(bool held, std::wstring reason) {
+    writesHeld_ = held;
+    writesHeldReason_ = std::move(reason);
+    if (frameWriter_) frameWriter_->hold(writesHeld_, writesHeldReason_); // Also a frame the engine reads back after this.
+}
+
+bool ClipPlayer::frameSaveBusy() const { return frameWriter_ && frameWriter_->busy(); }
+
+// P or the camera button. While writes are held it is refused here; the writer refuses one already on its way.
+void ClipPlayer::saveFrame() {
+    if (writesHeld_) { showToast(writesHeldReason_, ToastKind::Notice, false); return; }
+    command(SaveFrame);
+}
+
 void ClipPlayer::startTrim() {
+    if (writesHeld_ && !view_.editing) { showToast(writesHeldReason_, ToastKind::Notice, false); return; }
     if (followUpBlocksTrim()) { showToast(L"finish or cancel compression before starting another trim", ToastKind::Notice, false); return; }
     const auto current = info();
     if (!current->ready || view_.editing) return;
@@ -1033,7 +1068,7 @@ void ClipPlayer::activate(Part part) {
     switch (part) {
     case Part::Play: case Part::Stage: command(Toggle); break;
     case Part::Speed: setSpeed(stepSpeed(view_.speed, 1, true)); break; // Round: 1×, 1.5×, 2×, 0.25×, 0.5×.
-    case Part::Frame: command(SaveFrame); break;
+    case Part::Frame: saveFrame(); break;
     case Part::Mute:
         view_.muted = !view_.muted || view_.volume == 0;
         if (!view_.muted && view_.volume == 0) setVolume(50, true);
@@ -1435,7 +1470,7 @@ LRESULT ClipPlayer::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             else setLoop(loop);
             break;
         case VK_BACK: if (!repeat && !view_.editing && view_.loop.in >= 0) setLoop({}); break;
-        case 'P': if (!repeat) command(SaveFrame); break; // The picture on screen as a PNG, beside the screenshots.
+        case 'P': if (!repeat) saveFrame(); break; // The picture on screen as a PNG, beside the screenshots.
         case 'F': if (!repeat) toggleFullscreen(); break;
         case 'T': if (!repeat) { if (view_.editing) endTrim(); else startTrim(); } break;
         case VK_F2: if (!repeat) beginRename(); break;

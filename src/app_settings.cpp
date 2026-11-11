@@ -1,6 +1,7 @@
 // App: settings and shortcuts. Loading and saving refarter.ini, the start-with-Windows switch, and the save shortcut.
 #include "app_internal.h"
 #include "config.h"
+#include "local_file.h"
 #include "message_box.h"
 #include "startup.h"
 #include "text.h"
@@ -9,6 +10,7 @@
 #include "diagnostic_log.h"
 #include "version.h"
 #include "update_check.h"
+#include "notes_view.h"
 
 #include <shellapi.h>
 
@@ -37,10 +39,30 @@ void App::loadSettings() {
     state_.sidebarCollapsed = saved.sidebarCollapsed;
     state_.updateCheck = saved.updateCheck;
     state_.lastUpdateCheck = saved.lastUpdateCheck;
+    std::error_code noUninstaller;
+    installed_ = std::filesystem::exists(executablePath().parent_path() / L"unins000.exe", noUninstaller); // Inno Setup's uninstaller.
+    // An installer from an update that is done, or was never run, is not kept: an update downloads afresh. Right after
+    // an update relaunched Refarter, setup still runs from it and the delete fails; quit() deletes it then.
+    std::error_code noFolder;
+    if (installed_) std::filesystem::remove_all(localAppDataFile(L"updates"), noFolder);
     if (const auto known = update::cachedRelease(saved.availableUpdateTag, saved.availableUpdateUrl, L"" REFARTER_VERSION_FULL_STRING)) {
         updateTag_ = known->tag;
         updateUrl_ = known->url;
         updateNote_ = L"version " + update::displayVersion(updateTag_) + L" is available";
+    }
+    // An update opens its notes once (showNotes records them as seen); a fresh install or a step back records the
+    // version straight away, so the next start is not taken for an update. A build without notes does neither.
+    seenVersion_ = saved.seenVersion;
+    if (!embeddedNotes().empty()) {
+        notesDue_ = notes::showOnStart(seenVersion_, L"" REFARTER_VERSION_FULL_STRING, config_.created());
+        if (!notesDue_ && seenVersion_ != L"" REFARTER_VERSION_FULL_STRING) {
+            seenVersion_ = L"" REFARTER_VERSION_FULL_STRING;
+            // Only this line: the rest of the state is not loaded yet, so saveSettings would write defaults.
+            for (auto& entry : stored_) {
+                if (wcscmp(entry.section, L"updates") || wcscmp(entry.key, L"seen_version")) continue;
+                if (config_.set(entry.section, entry.key, seenVersion_)) entry.value = seenVersion_;
+            }
+        }
     }
     state_.compressCopyAfterTrim = saved.compressCopyAfterTrim;
     state_.gameColours = saved.gameColours;
@@ -146,6 +168,7 @@ UserSettings App::settings() const {
     s.lastUpdateCheck = state_.lastUpdateCheck;
     s.availableUpdateTag = updateTag_;
     s.availableUpdateUrl = updateUrl_;
+    s.seenVersion = seenVersion_;
     s.compressCopyAfterTrim = state_.compressCopyAfterTrim;
     s.gameColours = state_.gameColours;
     s.chimePercent = chimes_.percent();

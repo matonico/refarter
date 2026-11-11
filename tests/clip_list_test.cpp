@@ -46,6 +46,15 @@ int main() {
     check(formatClipBytes(999999) == L"1.0mb", "rounded size promotes unit");
     check(formatClipBytes(1234567890) == L"1.2gb", "gigabytes");
     check(isCompressedCopy(L"d:\\clips\\20MB_cs2 (2).mp4") && !isCompressedCopy(L"x\\cs2 20mb_.mp4"), "compressed prefix");
+    {
+        auto plain = clip(L"d:\\clips\\cs2.mp4", 100), copy = clip(L"d:\\clips\\20mb_cs2.mp4", 100);
+        check(inClipView(plain, ClipView::All) && inClipView(copy, ClipView::All), "all clips lists originals and copies");
+        check(!inClipView(plain, ClipView::Favourites) && !inClipView(copy, ClipView::Favourites), "favourites leaves out unstarred clips");
+        check(!inClipView(plain, ClipView::Compressed) && inClipView(copy, ClipView::Compressed), "compressed lists only the copies");
+        plain.favourite = copy.favourite = true;
+        check(inClipView(plain, ClipView::Favourites) && inClipView(copy, ClipView::Favourites), "a starred compressed copy shows under favourites");
+        check(!inClipView(plain, ClipView::Compressed) && inClipView(copy, ClipView::Compressed), "a star does not change the compressed tab");
+    }
     check(clipDisplayName(L"20mb_cs2 (2).mp4") == L"cs2 (2)" && clipDisplayName(L"cs2.mp4") == L"cs2", "display name");
     check(compressedSourceStem(L"20mb_cs2 (2).mp4") == L"cs2" && compressedSourceStem(L"20mb_cs2 ().mp4") == L"cs2 ()" &&
           compressedSourceStem(L"20mb_cs2.mp4") == L"cs2", "source stem");

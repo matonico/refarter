@@ -51,7 +51,7 @@ struct UserSettings {
     bool askBeforeBinning = true;     // Library: ask before moving clips to the recycle bin (the question's box turns it off).
     int playerVolume = 100;           // The built-in player's volume, 0-100%.
     bool compressCopyAfterTrim = false; // The trim bar's "compress & copy" box starts ticked.
-    bool gameColours = true;          // Library and player: a game's icon gives its folder, tiles and seek bar a colour.
+    bool gameColours = true;          // Library: a game's icon gives its folder and tiles a colour.
     bool closeToTray = false;         // Closing the window hides it in the tray.
     bool startWithWindows = false;    // Parsed and written for the file only; the Run registry key (refreshStartup) is the source, never this value.
     bool startMinimised = true;       // Sign-in starts in the tray; ordinary launches still open the window.
@@ -60,6 +60,7 @@ struct UserSettings {
     UpdateChoice updateCheck = UpdateChoice::Ask; // [updates] check: the daily release check is opt-in.
     std::wstring availableUpdateTag, availableUpdateUrl; // Last known newer release, retained across restarts.
     long long lastUpdateCheck = 0;   // [updates] last_check: unix seconds of the last check that got an answer; 0 for none.
+    std::wstring seenVersion;        // [updates] seen_version: the version whose release notes were last shown.
 };
 
 struct SettingEntry {
@@ -172,6 +173,7 @@ inline std::vector<SettingEntry> settingEntries(const UserSettings& s) {
         {L"updates", L"last_check", std::to_wstring(s.lastUpdateCheck)},
         {L"updates", L"available_tag", s.availableUpdateTag},
         {L"updates", L"available_url", s.availableUpdateUrl},
+        {L"updates", L"seen_version", s.seenVersion},
     };
 }
 
@@ -263,6 +265,7 @@ inline UserSettings readSettings(const std::map<std::wstring, std::wstring>& val
     s.lastUpdateCheck = parseUnixSeconds(get(L"updates/last_check"));
     s.availableUpdateTag = get(L"updates/available_tag");
     s.availableUpdateUrl = get(L"updates/available_url");
+    s.seenVersion = get(L"updates/seen_version");
     return s;
 }
 

@@ -45,7 +45,6 @@ struct View {
     bool saving = false;
     bool compressing = false; // The saved trim is being compressed; keep its original trim view until completion.
     float progress = 0;
-    std::optional<COLORREF> tint; // The clip's game colour for the seek bar's progress (game colours on), else the accent.
     Zoom zoom;                // The magnifier (wheel over the picture, + - 0); a new clip starts at 1×.
     float speed = 1;          // Playback speed (playbackSpeeds); silent other than at 1×. A new clip starts at 1×.
     Loop loop;                // A-B loop (keys A, B, Backspace); a new clip starts without one. Not while trimming.

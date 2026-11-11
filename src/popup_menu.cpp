@@ -6,6 +6,7 @@
 #include <cwctype>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace refarter {
@@ -13,10 +14,18 @@ namespace refarter {
 namespace {
 using namespace theme;
 constexpr wchar_t className[] = L"RefarterPopupMenu";
-constexpr int rowHeight = 34, separatorHeight = 9, edge = 6;
+constexpr int rowHeight = 34, separatorHeight = 9, edge = 6, detailGap = 5;
+
+int measureText(HDC dc, const std::wstring& text) {
+    RECT r{};
+    DrawTextW(dc, text.c_str(), -1, &r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    return static_cast<int>(r.right);
+}
 
 struct Item {
     std::wstring text;
+    std::wstring detail; // Text after a tab, drawn right after the text in muted grey.
+    int textWidth = 0;   // The text's width, device pixels: where the detail starts.
     UINT id = 0;
     bool separator = false, disabled = false, checked = false;
     HMENU submenu = nullptr;
@@ -116,14 +125,14 @@ private:
             item.checked = (info.fState & MFS_CHECKED) != 0;
             item.id = info.wID;
             item.submenu = info.hSubMenu;
-            item.text = plain(text);
+            std::tie(item.text, item.detail) = splitDetail(plain(text));
             const int height = px(item.separator ? separatorHeight : rowHeight);
             item.rect = {0, y, 0, y + height};
             y += height;
             if (!item.separator) {
-                RECT measure{};
-                DrawTextW(dc, item.text.c_str(), -1, &measure, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
-                width = std::max(width, static_cast<int>(measure.right));
+                item.textWidth = measureText(dc, item.text);
+                const int detail = item.detail.empty() ? 0 : px(detailGap) + measureText(dc, item.detail);
+                width = std::max(width, item.textWidth + detail);
             }
             level->items.push_back(std::move(item));
         }
@@ -337,6 +346,13 @@ private:
                 SetTextColor(dc, item.disabled ? muted : item.checked ? accent : ink);
                 RECT text{px(36), item.rect.top, item.rect.right - px(item.submenu ? 30 : 16), item.rect.bottom};
                 DrawTextW(dc, item.text.c_str(), -1, &text, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+                if (!item.detail.empty()) {
+                    // Secondary detail stays muted on the checked row too.
+                    RECT detail{text.left + item.textWidth + px(detailGap), text.top, text.right, text.bottom};
+                    SetTextColor(dc, muted);
+                    if (detail.left < detail.right)
+                        DrawTextW(dc, item.detail.c_str(), -1, &detail, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+                }
                 if (item.submenu) {
                     Gdiplus::Pen pen(color(lit ? ink : muted), 1.5f * scale);
                     pen.SetStartCap(Gdiplus::LineCapRound);

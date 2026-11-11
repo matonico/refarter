@@ -13,6 +13,7 @@
 #include "text.h"
 #include "startup.h"
 #include "jump_list.h"
+#include "local_file.h"
 #include "window_target.h"
 #include "diagnostic_log.h"
 
@@ -31,7 +32,6 @@ constexpr size_t maxQueuedErrors = 4; // Error messages kept for the next activa
 
 constexpr UINT afterToggle = WM_APP + 5; // Saves and refreshes after a switch has already repainted.
 constexpr UINT meterSync = WM_APP + 6;   // Rechecks the meters once a show or hide has taken effect.
-constexpr UINT storageQuestion = WM_APP + 8; // Asks the storage question that a save over a game had to leave for later.
 constexpr int initialClientWidth = 1120, initialClientHeight = 760;
 
 // Whether this process runs elevated (as administrator); false when the token cannot be read.
@@ -74,6 +74,7 @@ void App::restoreWindow() {
     }
     ShowWindow(window_, firstStartupOpen || IsIconic(window_) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(window_);
+    if (notesDue_) PostMessageW(window_, notesDue, 0, 0); // The first time the window shows after an update, from a hidden sign-in start too.
     if (state_.updateCheck == UpdateChoice::Ask) PostMessageW(window_, updateQuestion, 0, 0); // Asked now if this brought Refarter to the front.
     if (!queuedErrors_.empty()) PostMessageW(window_, errorDialogs, 0, 0); // Likewise the errors that waited for it.
     if (!clipGrid_.scanned()) clipGrid_.scan(clipFolder_);
@@ -86,6 +87,15 @@ void App::quit() {
     syncMeters(); // Closing: the timer and any meter-only capture end.
     compression_.cancel();
     updates_.cancel(); // A check in flight ends on its own and posts nothing.
+    const bool downloading = updateStage_ == UpdateStage::Downloading;
+    cancelDownload(); // So does a download (its partial file goes now, or with the next download).
+    // The installer of an update that relaunched this Refarter was still running at start, so start-up could not
+    // delete it: it goes now. Not while a cancelled download may still write there, or while setup runs from it.
+    if (installed_ && !downloading && !installing()) {
+        dropSetup();
+        std::error_code noFolder;
+        std::filesystem::remove_all(localAppDataFile(L"updates"), noFolder);
+    }
     auto_.unwatchGameExit();
     rawHotkey_.configure(window_, {}, false);
     setStatus(L"finishing pending saves and closing…");
@@ -141,6 +151,7 @@ void App::command(int id) {
         break;
     case Recording: navigate(Page::Recording); redrawn = true; break;
     case Settings: navigate(Page::Settings); redrawn = true; break;
+    case ShowNotes: showNotes(); redrawn = true; break;
     case AllClips: case Favourites: case Compressed:
         state_.clipView = id == AllClips ? ClipView::All : id == Favourites ? ClipView::Favourites : ClipView::Compressed;
         clipGrid_.setView(state_.clipView);
@@ -217,13 +228,14 @@ void App::command(int id) {
         else {
             if (updates_.running() && !updateManual_) updates_.cancel(); // A pending automatic check is dropped.
             updateTried_ = false; // Switching it on again in this session may check again (the daily rule still applies).
+            abandonUpdate(); // Off means no network at all: a download stops too.
             updateTag_.clear();
             updateUrl_.clear();
             updateNote_.clear();
         }
         break;
     case UpdateCheckNow:
-        if (!updateTag_.empty()) { openUpdatePage(); return; } // A newer version is known: the button opens its page.
+        if (!updateTag_.empty()) { updateClicked(); return; } // A newer version is known: update to it, or open its page.
         if (updates_.running() && updateManual_) return;
         startUpdateCheck(true, std::chrono::seconds(0)); // Ignores the daily rule and the choice: the click is the consent.
         break;
@@ -275,12 +287,45 @@ void App::afterToggleChanged(int) {
 }
 
 capture::Size App::sourceSize() const {
-    RECT client{};
-    if (target_.source.window && GetClientRect(target_.source.window, &client)) return {client.right, client.bottom};
+    if (const HWND window = target_.source.window) {
+        RECT client{};
+        if (!IsIconic(window) && GetClientRect(window, &client) && client.right >= 2 && client.bottom >= 2) {
+            // Its frame is kept for when it is minimised: measured, so DPI and custom frames do not matter.
+            RECT outer{};
+            if (!IsZoomed(window) && GetWindowRect(window, &outer)) {
+                sizedWindow_ = window;
+                sizedFrame_ = {(outer.right - outer.left) - client.right, (outer.bottom - outer.top) - client.bottom};
+            }
+            return {client.right, client.bottom};
+        }
+        // A minimised window has no client area: the size it restores to, less its frame (measured when last seen, or
+        // else estimated). One that restores maximised, or whose size cannot be read, falls back to its monitor.
+        WINDOWPLACEMENT placement{sizeof(placement)};
+        if (IsIconic(window) && GetWindowPlacement(window, &placement) && !(placement.flags & WPF_RESTORETOMAXIMIZED)) {
+            capture::Size frame = sizedFrame_;
+            if (window != sizedWindow_) {
+                RECT estimate{};
+                const auto style = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE)) & ~static_cast<DWORD>(WS_MINIMIZE);
+                const auto exStyle = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE));
+                const UINT dpi = GetDpiForWindow(window);
+                AdjustWindowRectExForDpi(&estimate, style, GetMenu(window) != nullptr, exStyle, dpi ? dpi : 96);
+                frame = {estimate.right - estimate.left, estimate.bottom - estimate.top};
+            }
+            const RECT& normal = placement.rcNormalPosition;
+            const int width = (normal.right - normal.left) - frame.width;
+            const int height = (normal.bottom - normal.top) - frame.height;
+            if (width >= 2 && height >= 2) return {width, height};
+        }
+    }
     MONITORINFO info{sizeof(info)};
-    const auto monitor = target_.source.monitor ? target_.source.monitor : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    const auto monitor = target_.source.window ? MonitorFromWindow(target_.source.window, MONITOR_DEFAULTTOPRIMARY) :
+        target_.source.monitor ? target_.source.monitor : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
     if (GetMonitorInfoW(monitor, &info)) return {info.rcMonitor.right - info.rcMonitor.left, info.rcMonitor.bottom - info.rcMonitor.top};
     return {1920, 1080};
+}
+
+capture::Size App::encodedSize() const {
+    return capture::outputSize(video_.resolution, sourceSize());
 }
 
 void App::probeCodecs() {
@@ -505,6 +550,7 @@ std::wstring App::saveName(std::wstring* executable) const {
 
 void App::saveReplay() {
     if (recording_ == capture::RecorderState::Off || busy_ || saving_ || closing_ || asking_ || showingErrors_) return; // asking_: a second press under the question.
+    if (installing()) { setStatus(updatingNote); return; } // Setup is about to close Refarter.
     // The clip ends at the press: the save worker may start seconds later (a queue, a sleeping clip drive).
     const auto requestedAt = capture::captureClock();
     std::wstring note;
@@ -534,6 +580,7 @@ void App::shortcutPressed(int shortcut) {
 // The screenshot shortcut: the next picture of the running capture, saved beside the clips (see RecordingController).
 void App::takeScreenshot() {
     if (closing_ || shooting_) return;
+    if (installing()) { setStatus(updatingNote); return; }
     if (recording_ != capture::RecorderState::Buffering || busy_) {
         setStatus(L"screenshots need replay running");
         return;
@@ -663,28 +710,34 @@ void App::receiveEvents() {
         if (quiet || quietDialogs()) break; // Quitting or a session end can begin while an earlier dialog is open.
         // Never a dialog over a game or while the window is hidden: the status line and the failed-save sound have
         // told the player, and the message waits for the next activation (see showQueuedErrors).
-        if (queuedErrors_.size() < maxQueuedErrors && std::none_of(queuedErrors_.begin(), queuedErrors_.end(), [&](const auto& queued) { return queued.first == error; }))
-            queuedErrors_.emplace_back(error, sounded);
+        queueMessage(error, sounded ? 0u : static_cast<UINT>(MB_ICONERROR)); // The chime already sounded: no error beep.
     }
     showQueuedErrors();
 }
 
+bool App::queueMessage(const std::wstring& text, UINT icon) {
+    if (queuedErrors_.size() >= maxQueuedErrors ||
+        std::any_of(queuedErrors_.begin(), queuedErrors_.end(), [&](const auto& queued) { return queued.first == text; })) return false;
+    queuedErrors_.emplace_back(text, icon & MB_ICONMASK);
+    return true;
+}
+
 // Refarter's window came to the front: the error messages that arrived meanwhile, now where a dialog is welcome.
 void App::showQueuedErrors() {
-    if (queuedErrors_.empty() || showingErrors_ || asking_ || quietDialogs() || !ownWindowForeground()) return;
+    if (queuedErrors_.empty() || showingErrors_ || dialogOpen() || quietDialogs() || !ownWindowForeground()) return;
     showingErrors_ = true;
     // One bounded batch. Nested messages append to the same queue without opening another dialog.
     const auto count = queuedErrors_.size();
     for (std::size_t i = 0; i < count && !queuedErrors_.empty(); ++i) {
-        if (asking_ || quietDialogs() || !ownWindowForeground()) break;
-        auto [error, sounded] = std::move(queuedErrors_.front());
+        if (dialogOpen() || quietDialogs() || !ownWindowForeground()) break;
+        auto [error, icon] = std::move(queuedErrors_.front());
         queuedErrors_.erase(queuedErrors_.begin());
-        messageBox(window_, error.c_str(), L"refarter", sounded ? MB_OK : MB_OK | MB_ICONERROR);
+        messageBox(window_, error.c_str(), L"refarter", MB_OK | icon);
     }
     showingErrors_ = false;
     // A dialog's nested loop may have consumed the notification for newly arrived errors.
     // Focus loss leaves the unshown tail for activation; another question resumes it on dismissal.
-    if (!asking_ && !quietDialogs() && ownWindowForeground()) {
+    if (!dialogOpen() && !quietDialogs() && ownWindowForeground()) {
         if (!queuedErrors_.empty()) PostMessageW(window_, errorDialogs, 0, 0);
         if (storageQuestionQueued_) PostMessageW(window_, storageQuestion, 0, 0);
         if (state_.updateCheck == UpdateChoice::Ask) PostMessageW(window_, updateQuestion, 0, 0);
@@ -825,8 +878,8 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         GetClientRect(window_, &client);
         const int footerTopPx = client.bottom - px(footerHeight);
         if (message != WM_MOUSEMOVE || closing_ || at.y < footerTopPx) {
-            if (footerHot_ || updateHot_) {
-                footerHot_ = updateHot_ = false;
+            if (footerHot_ || updateHot_ || versionHot_) {
+                footerHot_ = updateHot_ = versionHot_ = false;
                 const RECT footer{0, footerTopPx, client.right, client.bottom};
                 InvalidateRect(window_, &footer, FALSE);
             }
@@ -834,22 +887,28 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         const RECT status = footerStatusBounds();
         const RECT update = footerUpdateBounds();
+        const RECT version = footerVersionBounds();
         const bool hot = PtInRect(&status, at);
-        const bool updateOver = !IsRectEmpty(&update) && PtInRect(&update, at);
+        const bool updateOver = !IsRectEmpty(&update) && PtInRect(&update, at) &&
+            updateClick() != UpdateView::Click::Nothing; // Progress is not a link.
+        const bool versionOver = PtInRect(&version, at);
         TRACKMOUSEEVENT track{sizeof track, TME_LEAVE, window_, 0}; // Only in the footer is there a flag to clear on leaving.
         TrackMouseEvent(&track);
         if (hot != footerHot_) { footerHot_ = hot; InvalidateRect(window_, &status, FALSE); }
         if (updateOver != updateHot_) { updateHot_ = updateOver; InvalidateRect(window_, &update, FALSE); }
+        if (versionOver != versionHot_) { versionHot_ = versionOver; InvalidateRect(window_, &version, FALSE); }
         return 0;
     }
     case WM_SETCURSOR:
-        if (LOWORD(lParam) == HTCLIENT && (footerHot_ || updateHot_)) { SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE; }
+        if (LOWORD(lParam) == HTCLIENT && (footerHot_ || updateHot_ || versionHot_)) { SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE; }
         break;
     case WM_LBUTTONUP: {
         POINT point{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
         const RECT status = footerStatusBounds();
         const RECT update = footerUpdateBounds();
-        if (!closing_ && waiting_ == 0 && !IsRectEmpty(&update) && PtInRect(&update, point)) { openUpdatePage(); return 0; }
+        const RECT version = footerVersionBounds();
+        if (!closing_ && waiting_ == 0 && !IsRectEmpty(&update) && PtInRect(&update, point)) { updateClicked(); return 0; }
+        if (!closing_ && waiting_ == 0 && PtInRect(&version, point)) { command(ShowNotes); return 0; }
         if (!closing_ && waiting_ == 0 && PtInRect(&status, point)) {
             scroll_[static_cast<int>(Page::Recording)] = 0;
             if (state_.page == Page::Recording) placeControls(); else command(Recording);
@@ -862,6 +921,7 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         // Returning from Explorer or a player: show clips added, renamed or deleted there.
         if (wParam && ((state_.page == Page::Library) || (state_.maxStorageGb && clipGrid_.scanOlderThan(std::chrono::seconds(30)))) && clipGrid_.scanned()) clipGrid_.scan(clipFolder_); // A limit needs a current size, but saves and bins already rescan: not on every activation.
         if (wParam && storageQuestionQueued_) PostMessageW(window_, storageQuestion, 0, 0); // Not inside the activation itself.
+        if (wParam && notesDue_) PostMessageW(window_, notesDue, 0, 0); // This version's notes, if they waited for Refarter to be in front.
         if (wParam && state_.updateCheck == UpdateChoice::Ask) PostMessageW(window_, updateQuestion, 0, 0); // The opt-in question, if Refarter is in front.
         if (wParam && !queuedErrors_.empty()) PostMessageW(window_, errorDialogs, 0, 0); // Errors that arrived while a game was in front.
         if (wParam) PostMessageW(window_, meterForeground, 0, 0); // Meters stopped under a game run again; foreground settles first (the hook skips our own process).
@@ -975,9 +1035,6 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             refreshControls();
             InvalidateRect(control(AskBeforeBinning), nullptr, FALSE);
         }
-        else if (LOWORD(wParam) == Clips && HIWORD(wParam) == ClipGrid::coloursChanged) {
-            if (playerOpen_) player_.setTint(clipGrid_.gameColour(clipGrid_.openClip())); // Its colour arrived after it opened.
-        }
         else if (LOWORD(wParam) == Clips && HIWORD(wParam) == ClipGrid::noteChanged) {
             invalidateStrip(); // The strip under the card shows the note.
         }
@@ -1022,7 +1079,17 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case recordingEvent: receiveEvents(); return 0;
     case storageQuestion: askQueuedStorageQuestion(); return 0;
     case updateChecked: updateCheckDone(); return 0;
+    case notesDue: showNotesIfDue(); return 0;
     case updateQuestion: askUpdateQuestion(); return 0;
+    case updateDownloaded: downloadDone(); return 0;
+    case updateSetupEnded: setupEnded(); return 0;
+    case updateProgress:
+        if (download_.current(lParam) && static_cast<int>(wParam) != downloadPercent_) { // Not a late one from a cancelled download.
+            downloadPercent_ = static_cast<int>(wParam);
+            if (downloadBox_) SendMessageW(downloadBox_, progressPercent, wParam, 0); // It shows the percent; the footer catches up when it closes.
+            else invalidateFooter();
+        }
+        return 0;
     case errorDialogs: showQueuedErrors(); return 0;
     case AutoSession::gameExited:
         if (auto_.clearExitedGameReplay()) {
@@ -1058,7 +1125,7 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         closePlayer(); // Hidden in the tray or quitting: playback stops either way.
         if (!closing_ && state_.closeToTray) {
             if (addTrayIcon()) ShowWindow(window_, SW_HIDE);
-            else messageBox(window_, L"windows could not create the tray icon. refarter will stay open.", L"refarter", MB_OK | MB_ICONERROR);
+            else report(L"windows could not create the tray icon. refarter will stay open.", MB_ICONERROR); // Waits while clips are ordered.
             return 0;
         }
         quit();
@@ -1187,6 +1254,7 @@ int App::run(HINSTANCE instance, int showCommand, bool startup) {
         // sign-in start leaves this shell work for the first time its window opens (restoreWindow).
         registerJumpList(executablePath());
         SetFocus(control(Library));
+        if (notesDue_) PostMessageW(window_, notesDue, 0, 0); // Before the opt-in question: the notes come first.
         PostMessageW(window_, updateQuestion, 0, 0);
         if (!clipGrid_.scanned()) clipGrid_.scan(clipFolder_);
     }

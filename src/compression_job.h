@@ -1,14 +1,18 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <thread>
+#include <vector>
 #include "player/clip_export.h"
+#include "player/combine_storage.h"
 
 namespace refarter {
 
-// One clip compression on its own worker thread (never the recorder queue). The owner polls it
+// One export (compression or lossless combination) on its own worker thread, never the recorder queue. The owner polls it
 // from a timer that exists only while a job runs; nothing exists at idle.
 class CompressionJob {
 public:
@@ -17,6 +21,8 @@ public:
     // `discardIntermediate` is only for a trim created by this app: remove it after publishing a distinct
     // compressed result, never on failure/cancellation or when the trim already fits.
     bool start(const std::filesystem::path& clip, bool discardIntermediate = false);
+    // Shares the single export slot, progress, cancellation and shutdown with compression.
+    bool startCombine(std::vector<std::filesystem::path> clips, const player::CombineStorage& storage);
     bool active() const { return !clip_.empty(); }
     const std::filesystem::path& clip() const { return clip_; } // Empty when idle.
     float progress() const { return progress_.load(); }
@@ -27,6 +33,8 @@ public:
     void stop(); // Cancels and waits; for shutdown.
 
 private:
+    // The one place a worker starts: below-normal priority, result released through done_.
+    bool launch(std::filesystem::path identity, std::function<player::ExportResult()> work);
     std::thread thread_;
     std::atomic<bool> cancel_ = false, done_ = false;
     std::atomic<float> progress_ = 0;

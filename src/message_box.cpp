@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cwchar>
+#include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace refarter {
@@ -23,8 +25,10 @@ constexpr COLORREF accentPressed = RGB(255, 170, 119); // Held down: slightly li
 // (IDOK, IDYES, IDNO, IDCANCEL), which is also what UI Automation reports as their automation id.
 constexpr int headingId = 200, messageId = 201, checkId = 202;
 constexpr int checkBox = 16, checkGap = 8, checkToButtons = 16; // The optional checkbox: box size, box-to-label gap, gap to the buttons.
+constexpr int barHeight = 6; // A progress dialog's bar.
 constexpr COLORREF checkOutline = RGB(58, 62, 72);
 constexpr int choiceBase = 101; // Result of the first custom button in choiceBox.
+constexpr UINT refitBody = progressDone + 1; // Posted after a DPI change: fit a contentBox body to its height again.
 
 struct Button {
     std::wstring label;
@@ -66,6 +70,32 @@ public:
         focus_ = primary_ = static_cast<int>(buttons_.size()) - 1; // The dismiss is the default: Enter never persists a choice.
         result_ = cancel_;
     }
+    // A progress dialog: one plain (not accent) button that cancels, and a bar under the text.
+    Dialog(HWND owner, const wchar_t* text, const wchar_t* caption, const wchar_t* cancelLabel, HWND* handle)
+        : Dialog(owner, text, caption, static_cast<UINT>(MB_OK)) {
+        buttons_ = {{cancelLabel ? cancelLabel : L"cancel", IDCANCEL}};
+        cancel_ = result_ = IDCANCEL;
+        focus_ = primary_ = 0;
+        plainButtons_ = true;
+        progress_ = 0;
+        base_ = text ? text : L""; // Without the full stop the constructor adds: " · N%" follows it.
+        text_ = base_ + L" · 100%"; // Measured at its longest, so the text never wraps out of its control; run() sets 0 %.
+        handle_ = handle;
+    }
+    // A body made by the caller in place of the message, at most width × height logical pixels, with one button.
+    // `text` is the body as plain text: the dialog's description for screen readers, and what shows when the body
+    // cannot be made.
+    Dialog(HWND owner, const wchar_t* caption, int width, int height, std::function<HWND(HWND, RECT)> content, const wchar_t* button,
+           std::wstring text)
+        : Dialog(owner, L"", caption, static_cast<UINT>(MB_OK)) {
+        text_ = std::move(text);
+        buttons_ = {{button ? button : L"ok", IDOK}};
+        content_ = std::move(content);
+        contentSize_ = {width, height};
+        fitMax_ = height;
+    }
+    // The body's own height once made (device pixels): the dialog fits it, and again after a DPI change.
+    void setFit(std::function<int()> fit) { fit_ = std::move(fit); }
     // Adds a checkbox in the button row; `checked` is read as the starting state and written when the dialog closes.
     void addCheck(const wchar_t* label, bool* checked) {
         checkLabel_ = label ? label : L"";
@@ -91,6 +121,8 @@ public:
         SetFocus(focusWindow()); // The safe (default) button has the focus, for keyboard and screen readers.
         const UINT icon = type_ & MB_ICONMASK;
         if (icon != 0) MessageBeep(icon);
+        if (progress_ >= 0) setProgress(0);
+        if (handle_) *handle_ = window_;
         while (!done_) {
             MSG message{};
             const BOOL status = GetMessageW(&message, nullptr, 0, 0);
@@ -103,11 +135,16 @@ public:
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+        // Read before re-enabling and destroying change activation. Any window of Refarter's in front counts, as in
+        // App::ownWindowForeground: the owner comes back only if the user is still in Refarter, never over a game.
+        const HWND front = GetForegroundWindow();
+        const bool userInRefarter = front && GetAncestor(front, GA_ROOTOWNER) == GetAncestor(window_, GA_ROOTOWNER);
+        if (handle_) *handle_ = nullptr;
         if (checked_) *checked_ = checkValue_;
         if (disabled) EnableWindow(root_, TRUE);
         clearDescription();
         DestroyWindow(window_);
-        if (disabled) SetForegroundWindow(root_);
+        if (disabled && userInRefarter) SetForegroundWindow(root_);
         return result_;
     }
 
@@ -127,6 +164,23 @@ public:
             }
             case WM_PRINTCLIENT: dialog->paint(reinterpret_cast<HDC>(wParam)); return 0;
             case WM_CLOSE: dialog->finish(dialog->cancel_); return 0;
+            case WM_DPICHANGED:
+                dialog->rescale(HIWORD(wParam), *reinterpret_cast<const RECT*>(lParam));
+                // The body lays out at its new DPI on WM_DPICHANGED_AFTERPARENT, after this: fit it once that is done.
+                if (dialog->content_) PostMessageW(window, refitBody, 0, 0);
+                return 0;
+            case refitBody: {
+                RECT around{};
+                GetWindowRect(window, &around);
+                dialog->refit(around);
+                return 0;
+            }
+            case progressPercent:
+                if (dialog->progress_ >= 0) dialog->setProgress(static_cast<int>(std::min<WPARAM>(wParam, 100)));
+                return 0;
+            case progressDone:
+                if (dialog->progress_ >= 0) { dialog->ownerClosed_ = true; dialog->finish(IDOK); }
+                return 0;
             case WM_COMMAND:
                 // A button was pressed, with the mouse, Enter/Space, or an accessibility client's invoke.
                 if (HIWORD(wParam) == BN_CLICKED && LOWORD(wParam) == checkId) {
@@ -150,6 +204,8 @@ public:
         return DefDlgProcW(window, message, wParam, lParam);
     }
 
+    bool closedByOwner() const { return ownerClosed_; } // A progress dialog closed by progressDone.
+
 private:
     int px(int value) const { return MulDiv(value, static_cast<int>(dpi_), 96); }
 
@@ -165,9 +221,6 @@ private:
     bool create() {
         dpi_ = root_ ? GetDpiForWindow(root_) : GetDpiForSystem();
         if (!dpi_) dpi_ = 96;
-        body_ = theme::font(dpi_, 14, FW_NORMAL);
-        title_ = theme::font(dpi_, 17, FW_SEMIBOLD);
-        small_ = theme::font(dpi_, 13, FW_NORMAL);
         RECT bounds{};
         MONITORINFO monitor{sizeof(monitor)};
         if (root_) {
@@ -177,13 +230,42 @@ private:
             GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &monitor);
             bounds = monitor.rcWork;
         }
-        const RECT work = monitor.rcWork;
+        const RECT place = arrange(monitor.rcWork, bounds);
+
+        if (!registerClass()) return false;
+        const DWORD extra = root_ ? 0 : WS_EX_APPWINDOW | WS_EX_TOPMOST;
+        const HINSTANCE instance = GetModuleHandleW(nullptr);
+        // WS_CLIPCHILDREN: the controls paint themselves; the dialog paints only the gaps.
+        window_ = CreateWindowExW(extra, className, heading_.empty() ? L"refarter" : heading_.c_str(), WS_POPUP | WS_CLIPCHILDREN,
+                                  place.left, place.top, place.right - place.left, place.bottom - place.top, root_, nullptr, instance, this);
+        if (!window_) return false;
+        roundedByDwm_ = roundWindowCorners(window_);
+        setWindowBorderColour(window_, border);
+        createControls(instance);
+        refit(bounds);
+        describe();
+        return true;
+    }
+
+    // The fonts and every part's rectangle at dpi_, for a dialog centred on `around` and kept within `work`.
+    // Returns the window's rectangle.
+    RECT arrange(const RECT& work, const RECT& around) {
+        for (HFONT* font : {&body_, &title_, &small_})
+            if (*font) DeleteObject(std::exchange(*font, nullptr));
+        body_ = theme::font(dpi_, 14, FW_NORMAL);
+        title_ = theme::font(dpi_, 17, FW_SEMIBOLD);
+        small_ = theme::font(dpi_, 13, FW_NORMAL);
         HDC dc = GetDC(nullptr);
         int headingHeight = 0, textHeight = 0, buttonRow = 0, content = 0;
         // DT_EDITCONTROL breaks over-long words (clip names without spaces) instead of widening the dialog.
         const int maxWidth = px(maxTextWidth);
         if (!heading_.empty()) content = std::min(maxWidth, measure(dc, title_, heading_, maxWidth, wrapFlags, headingHeight));
-        if (!text_.empty()) content = std::max(content, std::min(maxWidth, measure(dc, body_, text_, maxWidth, wrapFlags, textHeight)));
+        if (!text_.empty() && !content_) content = std::max(content, std::min(maxWidth, measure(dc, body_, text_, maxWidth, wrapFlags, textHeight)));
+        if (content_) {
+            // A caller's body: its own size, narrowed to the work area; its height is capped with the text's below.
+            content = std::max(content, std::min(px(contentSize_.cx), static_cast<int>(work.right - work.left) - px(padding * 4)));
+            textHeight = px(contentSize_.cy);
+        }
         for (auto& button : buttons_) {
             int unused = 0;
             const int labelWidth = measure(dc, body_, button.label, px(200), DT_SINGLELINE, unused);
@@ -202,7 +284,8 @@ private:
         const int textWidth = width - px(padding * 2);
         // Keep very long text within ~60% of the work area; the last visible line gets an ellipsis.
         const int fixedHeight = px(padding * 3 + 8 + buttonHeight);
-        const int maxTextBlock = std::max<int>(px(80), (work.bottom - work.top) * 6 / 10 - fixedHeight);
+        // A caller's body scrolls itself, so it may take up to 80%.
+        const int maxTextBlock = std::max<int>(px(80), (work.bottom - work.top) * (content_ ? 8 : 6) / 10 - fixedHeight);
         headingHeight = std::min(headingHeight, maxTextBlock / 3);
         textHeight = std::min(textHeight, maxTextBlock - headingHeight);
         int y = px(padding);
@@ -210,6 +293,10 @@ private:
         if (headingHeight) y += headingHeight + px(8);
         textRect_ = {px(padding), y, px(padding) + textWidth, y + textHeight};
         y += textHeight + (textHeight || headingHeight ? px(padding) : 0);
+        if (progress_ >= 0) {
+            barRect_ = {px(padding), y, px(padding) + textWidth, y + px(barHeight)};
+            y += px(barHeight) + px(padding);
+        }
         int x = width - px(padding);
         for (size_t i = buttons_.size(); i-- > 0;) {
             const int w = buttons_[i].rect.right;
@@ -222,22 +309,51 @@ private:
         }
         const int height = y + px(buttonHeight) + px(padding);
 
-        int left = (bounds.left + bounds.right - width) / 2, top = (bounds.top + bounds.bottom - height) / 2;
+        int left = (around.left + around.right - width) / 2, top = (around.top + around.bottom - height) / 2;
         left = std::max<int>(work.left, std::min<int>(left, work.right - width));
         top = std::max<int>(work.top, std::min<int>(top, work.bottom - height));
+        return {left, top, left + width, top + height};
+    }
 
-        if (!registerClass()) return false;
-        const DWORD extra = root_ ? 0 : WS_EX_APPWINDOW | WS_EX_TOPMOST;
-        const HINSTANCE instance = GetModuleHandleW(nullptr);
-        // WS_CLIPCHILDREN: the controls paint themselves; the dialog paints only the gaps.
-        window_ = CreateWindowExW(extra, className, heading_.empty() ? L"refarter" : heading_.c_str(), WS_POPUP | WS_CLIPCHILDREN,
-                                  left, top, width, height, root_, nullptr, instance, this);
-        if (!window_) return false;
-        roundedByDwm_ = roundWindowCorners(window_);
-        setWindowBorderColour(window_, border);
-        createControls(instance);
-        describe();
-        return true;
+    // A body that needs less than its largest height takes only that, and the dialog fits around it, centred on `around`.
+    // A body that could not be made leaves its plain text, which takes only its own height too.
+    void refit(const RECT& around) {
+        if (!content_) return;
+        int wanted = 0;
+        if (contentWindow_) {
+            if (fit_) wanted = fit_();
+        } else if (messageWindow_) {
+            HDC dc = GetDC(nullptr);
+            measure(dc, body_, text_, textRect_.right - textRect_.left, wrapFlags, wanted);
+            ReleaseDC(nullptr, dc);
+        }
+        if (wanted <= 0) return;
+        const int height = std::min<int>(fitMax_, MulDiv(wanted, 96, static_cast<int>(dpi_)) + 1);
+        if (height == contentSize_.cy) return;
+        contentSize_.cy = height;
+        rescale(dpi_, around);
+    }
+
+    // The dialog moved to a monitor with another scale (Win+Shift+arrow, or the scale changed while it was open):
+    // everything is measured again at the new DPI and the controls take their new places and fonts. A caller's body
+    // gets WM_DPICHANGED_AFTERPARENT from Windows for its own sizes.
+    void rescale(UINT dpi, const RECT& suggested) {
+        dpi_ = dpi ? dpi : 96;
+        MONITORINFO monitor{sizeof(monitor)};
+        GetMonitorInfoW(MonitorFromRect(&suggested, MONITOR_DEFAULTTONEAREST), &monitor);
+        const RECT place = arrange(monitor.rcWork, suggested);
+        SetWindowPos(window_, nullptr, place.left, place.top, place.right - place.left, place.bottom - place.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        const auto move = [](HWND control, const RECT& rect, HFONT font) {
+            if (!control) return;
+            // The font first: arrange has deleted the old one, which the control must not use while it moves.
+            if (font) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
+            SetWindowPos(control, nullptr, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        };
+        move(GetDlgItem(window_, headingId), headingRect_, title_);
+        move(contentWindow_ ? contentWindow_ : GetDlgItem(window_, messageId), textRect_, contentWindow_ ? nullptr : body_);
+        for (const auto& button : buttons_) move(button.window, button.rect, body_);
+        move(checkWindow_, checkRect_, small_);
+        InvalidateRect(window_, nullptr, FALSE);
     }
 
     // A dialog class (DLGWINDOWEXTRA, DefDlgProc) lets the system treat the window as a dialog box.
@@ -263,11 +379,13 @@ private:
                 rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, window_,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance, nullptr);
             if (!control) return;
+            if (id == messageId) messageWindow_ = control;
             SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(id == headingId ? title_ : body_), FALSE);
             SetWindowSubclass(control, textProc, static_cast<UINT_PTR>(id), reinterpret_cast<DWORD_PTR>(this));
         };
         addText(heading_, headingRect_, headingId);
-        addText(text_, textRect_, messageId);
+        if (content_) contentWindow_ = content_(window_, textRect_);
+        if (!contentWindow_) addText(text_, textRect_, messageId); // A body that could not be made shows as plain text.
         for (size_t i = 0; i < buttons_.size(); ++i) {
             auto& button = buttons_[i];
             // The default button is a real BS_DEFPUSHBUTTON, so it reports as the default to assistive technology.
@@ -297,8 +415,10 @@ private:
     void describe() const {
         IAccPropServices* services = nullptr;
         if (FAILED(CoCreateInstance(CLSID_AccPropServices, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&services))) || !services) return;
-        if (!text_.empty())
-            services->SetHwndPropStr(window_, static_cast<DWORD>(OBJID_CLIENT), CHILDID_SELF, PROPID_ACC_DESCRIPTION, text_.c_str());
+        // A progress dialog is described without its percent: text_ holds the "· 100%" it was measured with.
+        const std::wstring& description = progress_ >= 0 ? base_ : text_;
+        if (!description.empty())
+            services->SetHwndPropStr(window_, static_cast<DWORD>(OBJID_CLIENT), CHILDID_SELF, PROPID_ACC_DESCRIPTION, description.c_str());
         services->Release();
     }
 
@@ -396,6 +516,17 @@ private:
             if (i >= 0 && i < static_cast<int>(buttons_.size()) && buttons_[i].window) InvalidateRect(buttons_[i].window, nullptr, FALSE);
     }
 
+    // The bar and the text, which screen readers read from the message control, follow the work.
+    void setProgress(int percent) {
+        progress_ = percent;
+        text_ = base_ + L" · " + std::to_wstring(percent) + L"%";
+        if (messageWindow_) {
+            SetWindowTextW(messageWindow_, text_.c_str());
+            InvalidateRect(messageWindow_, nullptr, FALSE);
+        }
+        InvalidateRect(window_, &barRect_, FALSE);
+    }
+
     void finish(int result) {
         result_ = result;
         done_ = true;
@@ -417,6 +548,18 @@ private:
 
     // Keys are taken in this loop, so the app's own Esc/Enter/Tab routing never sees them.
     bool key(const MSG& message) {
+        // A caller's body scrolls with the wheel wherever the pointer is, and with the scrolling keys.
+        if (contentWindow_ && message.message == WM_MOUSEWHEEL && message.hwnd != contentWindow_) {
+            SendMessageW(contentWindow_, WM_MOUSEWHEEL, message.wParam, message.lParam);
+            return true;
+        }
+        if (contentWindow_ && message.message == WM_KEYDOWN) {
+            switch (message.wParam) {
+            case VK_UP: case VK_DOWN: case VK_PRIOR: case VK_NEXT: case VK_HOME: case VK_END:
+                SendMessageW(contentWindow_, WM_KEYDOWN, message.wParam, message.lParam);
+                return true;
+            }
+        }
         switch (message.message) {
         case WM_KEYDOWN: case WM_SYSKEYDOWN:
             switch (message.wParam) {
@@ -445,6 +588,13 @@ private:
         const HDC dc = buffer_.acquire(target, client.right, client.bottom);
         if (!dc) return;
         fill(dc, client, surface);
+        if (progress_ >= 0 && barRect_.right > barRect_.left) {
+            const int radius = px(barHeight) / 2;
+            roundRect(dc, barRect_, radius, raised, raised);
+            RECT done = barRect_;
+            done.right = barRect_.left + MulDiv(barRect_.right - barRect_.left, progress_, 100);
+            if (done.right - done.left >= px(barHeight)) roundRect(dc, done, radius, accent, accent); // Narrower would not round.
+        }
         if (!roundedByDwm_) {
             const auto brush = CreateSolidBrush(border);
             FrameRect(dc, &client, brush);
@@ -510,7 +660,7 @@ private:
         const HDC dc = itemBuffer_.acquire(target, rect.right, rect.bottom);
         if (!dc) return;
         fill(dc, rect, surface);
-        const bool primary = i == primary_, lit = i == hover_;
+        const bool primary = i == primary_ && !plainButtons_, lit = i == hover_;
         // Held down (mouse button or space): a lighter accent or the border fill, with the label one pixel lower.
         const bool pressed = (SendMessageW(window, BM_GETSTATE, 0, 0) & BST_PUSHED) != 0;
         const COLORREF fillColour = primary ? (pressed ? accentPressed : lit ? accentHover : accent) : (pressed ? border : lit ? raised : surface);
@@ -526,7 +676,13 @@ private:
         itemBuffer_.present(target);
     }
 
-    std::wstring text_, heading_, checkLabel_;
+    std::wstring text_, heading_, checkLabel_, base_;
+    int progress_ = -1;          // A progress dialog's percent (0-100); -1 for every other dialog.
+    RECT barRect_{};
+    HWND messageWindow_ = nullptr;
+    HWND* handle_ = nullptr;     // A progress dialog's window, for its owner, while it is open.
+    bool plainButtons_ = false;  // No accent button: a progress dialog's only button cancels.
+    bool ownerClosed_ = false;   // progressDone closed it, not the user or the MessageBoxW fallback (which answers IDOK).
     theme::BackBuffer buffer_, itemBuffer_;
     UINT type_;
     HWND root_ = nullptr, window_ = nullptr;
@@ -537,7 +693,12 @@ private:
     HWND checkWindow_ = nullptr;
     RECT checkRect_{};
     std::vector<Button> buttons_;
-    RECT headingRect_{}, textRect_{};
+    RECT headingRect_{}, textRect_{}; // textRect_ also holds a caller's body.
+    std::function<HWND(HWND, RECT)> content_; // Makes the body in place of the message (contentBox).
+    SIZE contentSize_{};                      // Its largest size, logical pixels.
+    std::function<int()> fit_;                // The body's own height once made, device pixels (contentBox with a fit).
+    int fitMax_ = 0;                          // The body's largest height before fitting, logical pixels.
+    HWND contentWindow_ = nullptr;
     int cancel_ = IDOK, result_ = IDOK;
     int focus_ = 0, primary_ = 0, hover_ = -1;
     bool keyboard_ = false, roundedByDwm_ = false, done_ = false;
@@ -577,6 +738,30 @@ int choiceBox(HWND owner, const wchar_t* text, const wchar_t* caption, const std
     Dialog dialog(owner, text, caption, choices);
     const int result = dialog.run();
     return result >= choiceBase && result < choiceBase + static_cast<int>(choices.size()) - 1 ? result - choiceBase : -1;
+}
+
+bool progressBox(HWND owner, const wchar_t* text, const wchar_t* caption, const wchar_t* cancelLabel, HWND* handle) {
+    if (handle) *handle = nullptr;
+    if (suppressed > 0) return false; // Nothing opens during a bounded wait: cancelled.
+    Dialog dialog(owner, text, caption, cancelLabel, handle);
+    dialog.run();
+    return dialog.closedByOwner();
+}
+
+void contentBox(HWND owner, const wchar_t* caption, int width, int height,
+                const std::function<HWND(HWND parent, RECT area)>& content, const wchar_t* button, const std::wstring& text) {
+    if (suppressed > 0 || !content) return;
+    Dialog dialog(owner, caption, width, height, content, button, text);
+    dialog.run();
+}
+
+void contentBox(HWND owner, const wchar_t* caption, int width, int height,
+                const std::function<HWND(HWND parent, RECT area)>& content, const std::function<int()>& fit,
+                const wchar_t* button, const std::wstring& text) {
+    if (suppressed > 0 || !content) return;
+    Dialog dialog(owner, caption, width, height, content, button, text);
+    dialog.setFit(fit);
+    dialog.run();
 }
 
 } // namespace refarter

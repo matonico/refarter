@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(Refarter VERSION 1.1.0 LANGUAGES CXX)
+project(Refarter VERSION 1.2.0 LANGUAGES CXX)
 
 if(NOT WIN32)
   message(FATAL_ERROR "Refarter currently targets Windows only.")
@@ -12,6 +12,39 @@ if(REFARTER_VERSION_SUFFIX)
   string(APPEND REFARTER_VERSION_FULL "-${REFARTER_VERSION_SUFFIX}")
 endif()
 configure_file(src/version.h.in ${CMAKE_CURRENT_BINARY_DIR}/generated/version.h @ONLY)
+# The running version's release notes, embedded for the "what's new" page. A version without notes yet (between
+# releases, or the public source, which has no docs/) embeds an empty file and the page says so.
+set(REFARTER_NOTES ${CMAKE_CURRENT_SOURCE_DIR}/docs/releases/${REFARTER_VERSION_FULL}.md)
+# Watch the set of notes files, including an initially absent folder. A directory itself is not a valid MSBuild
+# file dependency (MSB8064), whereas CONFIGURE_DEPENDS detects additions/removals through CMake's glob check.
+file(GLOB REFARTER_NOTES_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/docs/releases/*.md")
+set(REFARTER_NOTES_RESOURCE ${CMAKE_CURRENT_BINARY_DIR}/generated/release-notes.md)
+# What is embedded is made safe to ship first: the popup shows a link's text only, so link targets and bare
+# addresses are removed here, not just left undisplayed (the notes of a private release link the private
+# repository). The release_notes_resource test checks the built exe for every address in the notes.
+set(notes "")
+if(EXISTS ${REFARTER_NOTES})
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${REFARTER_NOTES})
+  file(READ ${REFARTER_NOTES} notes)
+  # Inline links (a target may hold one pair of parentheses), reference definitions, then reference links.
+  string(REGEX REPLACE "\\[([^]\n]*)\\]\\(([^()\n]|\\([^()\n]*\\))*\\)" "\\1" notes "${notes}")
+  string(REGEX REPLACE "(^|\n)[ \t]*\\[[^]\n]*\\]:[^\n]*" "\\1" notes "${notes}")
+  string(REGEX REPLACE "\\[([^]\n]*)\\]\\[[^]\n]*\\]" "\\1" notes "${notes}")
+  string(REGEX REPLACE "<?[A-Za-z][A-Za-z0-9+.-]*://[^ \t\r\n<>)]*>?" "" notes "${notes}")
+  string(REGEX REPLACE "www\\.[^ \t\r\n<>)]*" "" notes "${notes}")
+  # A list item that was only an address would be an empty bullet.
+  # A pass skips every other one of several in a row, so until none is left.
+  while(notes MATCHES "\n[ \t]*[-*+][ \t]*\r?(\n|$)")
+    string(REGEX REPLACE "\n[ \t]*[-*+][ \t]*\r?(\n|$)" "\\1" notes "${notes}")
+  endwhile()
+  if(notes MATCHES "://|www\\.")
+    message(FATAL_ERROR "${REFARTER_NOTES} still holds an address after removing links; it must not be embedded")
+  endif()
+endif()
+# Written only when it changed, so configuring again does not rebuild the resources.
+file(WRITE ${REFARTER_NOTES_RESOURCE}.new "${notes}")
+configure_file(${REFARTER_NOTES_RESOURCE}.new ${REFARTER_NOTES_RESOURCE} COPYONLY)
+file(REMOVE ${REFARTER_NOTES_RESOURCE}.new)
 
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
@@ -94,6 +127,7 @@ add_library(refarter_player STATIC
   src/player/clip_player.cpp
   src/player/clip_preview.cpp
   src/player/clip_trim.cpp
+  src/player/clip_combine.cpp
   src/player/clip_export.cpp
   src/player/media.cpp
   src/player/player_view.cpp
@@ -101,15 +135,20 @@ add_library(refarter_player STATIC
   src/recycle_bin.cpp)
 refarter_defaults(refarter_player)
 target_link_libraries(refarter_player PUBLIC refarter_capture ffmpeg d2d1 dwrite dcomp)
+add_executable(clip_combine_check tools/clip_combine_check.cpp)
+refarter_defaults(clip_combine_check)
+target_link_libraries(clip_combine_check PRIVATE refarter_player psapi)
 
 enable_language(RC)
-add_executable(Refarter WIN32 src/main.cpp src/app.cpp src/app_layout.cpp src/app_paint.cpp src/app_controls.cpp src/app_menus.cpp src/app_settings.cpp src/app_storage.cpp src/app_library.cpp src/app_meters.cpp src/app_updates.cpp src/update_client.cpp src/auto_session.cpp src/chime.cpp src/tray_icon.cpp src/compression_job.cpp src/recording_controller.cpp
+add_executable(Refarter WIN32 src/main.cpp src/app.cpp src/app_layout.cpp src/app_paint.cpp src/app_controls.cpp src/app_menus.cpp src/app_settings.cpp src/app_storage.cpp src/app_library.cpp src/app_meters.cpp src/app_updates.cpp src/notes_view.cpp src/update_client.cpp src/update_download.cpp src/https_get.cpp src/auto_session.cpp src/chime.cpp src/tray_icon.cpp src/compression_job.cpp src/recording_controller.cpp
   src/clip_grid.cpp src/clip_library.cpp src/clip_sources.cpp src/game_icons.cpp src/favourites.cpp src/config.cpp src/startup.cpp src/jump_list.cpp src/auto_capture.cpp src/auto_capture_card.cpp src/tray_flyout.cpp src/value_bubble.cpp
   src/popup_menu.cpp src/message_box.cpp src/window_target.cpp src/app_lifecycle.cpp src/leftover_files.cpp src/crash_dumps.cpp src/resources.rc)
 refarter_defaults(Refarter)
-# assets: icon, save chime and failed-save sound; config: the refarter.ini template embedded for first launch.
+target_sources(Refarter PRIVATE src/combine_dialog.cpp src/combine_job.cpp)
+# assets: icon, save chime and failed-save sound; config: the refarter.ini template embedded for first launch;
+# generated: version.h and the release notes.
 target_include_directories(Refarter PRIVATE assets config ${CMAKE_CURRENT_BINARY_DIR}/generated)
-target_link_libraries(Refarter PRIVATE gdiplus dwmapi comctl32 ole32 msimg32 propsys winmm uxtheme windowscodecs advapi32 winhttp refarter_capture refarter_player)
+target_link_libraries(Refarter PRIVATE gdiplus dwmapi comctl32 ole32 msimg32 propsys winmm uxtheme windowscodecs advapi32 winhttp bcrypt refarter_capture refarter_player)
 # The shipped exe names its PDB without the build machine's path.
 if(MSVC)
   target_link_options(Refarter PRIVATE $<$<CONFIG:Release>:/PDBALTPATH:$<TARGET_PDB_FILE_NAME:Refarter>>)
@@ -121,7 +160,7 @@ target_link_libraries(refarter-record PRIVATE refarter_capture pdh psapi windows
 
 include(CTest)
 if(BUILD_TESTING)
-  foreach(test replay_duration capture_logic clip_list clip_selection hotkey config settings chime timing_trace source_names startup favourites auto_capture auto_session auto_session_wiring accent_colour clip_preview player_timeline player_zoom export_plan power_resume leftover_files save_errors startup_retry diagnostic_log compression_diagnostics trim_follow_up storage_limit audio_device_state player_view value_bubble volume_input temporary_clip trim_cancel long_path update_check mp4_tracks track_workers meter_rules clip_writer)
+  foreach(test replay_duration capture_logic clip_list clip_selection hotkey config settings chime timing_trace source_names startup favourites auto_capture auto_session auto_session_wiring accent_colour clip_preview player_timeline player_zoom export_plan power_resume leftover_files save_errors startup_retry diagnostic_log compression_diagnostics trim_follow_up storage_limit audio_device_state player_view value_bubble volume_input temporary_clip trim_cancel long_path update_check update_download release_notes mp4_tracks track_workers meter_rules clip_writer codec_choice)
     add_executable(${test}_test tests/${test}_test.cpp)
     refarter_defaults(${test}_test)
     target_include_directories(${test}_test PRIVATE src)
@@ -129,6 +168,15 @@ if(BUILD_TESTING)
   endforeach()
   target_sources(leftover_files_test PRIVATE src/leftover_files.cpp)
   target_sources(config_test PRIVATE src/config.cpp) # Config::loadFrom/set on temporary files.
+  # The real downloader with httpsGet scripted by the test itself, so every answer and failure path runs offline.
+  target_sources(update_download_test PRIVATE src/update_download.cpp)
+  target_link_libraries(update_download_test PRIVATE bcrypt user32)
+  add_executable(progress_dialog_test tests/progress_dialog_test.cpp)
+  refarter_defaults(progress_dialog_test)
+  target_include_directories(progress_dialog_test PRIVATE src)
+  target_link_libraries(progress_dialog_test PRIVATE user32 gdi32 comctl32 gdiplus dwmapi ole32 oleacc)
+  add_test(NAME progress_dialog COMMAND progress_dialog_test)
+  set_tests_properties(progress_dialog PROPERTIES TIMEOUT 15)
   target_compile_definitions(chime_test PRIVATE REFARTER_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")
   target_compile_definitions(settings_test PRIVATE REFARTER_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/config")
   # Crashes copies of itself: each must leave one minidump.
@@ -136,9 +184,18 @@ if(BUILD_TESTING)
   refarter_defaults(crash_dumps_test)
   target_include_directories(crash_dumps_test PRIVATE src)
   add_test(NAME crash_dumps COMMAND crash_dumps_test)
+  # The built exe, not just the popup's output: no address from the release notes may be embedded.
+  add_test(NAME release_notes_resource COMMAND ${CMAKE_COMMAND} -DNOTES=${REFARTER_NOTES} -DRESOURCE=${REFARTER_NOTES_RESOURCE}
+    -DEXE=$<TARGET_FILE:Refarter> -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/release_notes_resource.cmake)
   target_link_libraries(diagnostic_log_test PRIVATE refarter_diagnostics)
   target_link_libraries(compression_diagnostics_test PRIVATE refarter_player)
   target_sources(compression_diagnostics_test PRIVATE src/compression_job.cpp)
+  add_executable(clip_combine_test tests/clip_combine_test.cpp src/compression_job.cpp src/combine_job.cpp)
+  refarter_defaults(clip_combine_test)
+  target_include_directories(clip_combine_test PRIVATE src)
+  target_compile_definitions(clip_combine_test PRIVATE REFARTER_COMBINE_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/combine")
+  target_link_libraries(clip_combine_test PRIVATE refarter_player)
+  add_test(NAME clip_combine COMMAND clip_combine_test)
   target_link_libraries(player_view_test PRIVATE refarter_player)
   target_link_libraries(trim_cancel_test PRIVATE refarter_player gdiplus)
   # Exhaust the encoder list without activating an encoder or submitting frames.

@@ -23,6 +23,7 @@
 #include "settings.h"
 #include "storage_limit.h"
 #include "update_client.h"
+#include "update_download.h"
 #include "theme.h"
 #include "chime.h"
 #include "power_resume.h"
@@ -49,7 +50,7 @@ enum Id {
     ChimeVolumeLabel, ChimeVolume, StartWithWindows, AutoCaptureSource, Player, RecordDiscord,
     SidebarToggle, Compressed, DesktopReset, MicrophoneReset,
     DiagnosticLogging, CompressCopyAfterTrim, StorageLimitField, StorageBehaviour, GroupFolders, AskBeforeBinning, ClipSearch,
-    AssignScreenshot, UpdateCheckSwitch, UpdateCheckNow, StartMinimised, GameColours, SortClips, LastId = SortClips
+    AssignScreenshot, UpdateCheckSwitch, UpdateCheckNow, StartMinimised, GameColours, SortClips, ShowNotes, LastId = ShowNotes
 };
 // The global shortcuts, as indexes into App's shortcut arrays.
 inline constexpr int saveShortcut = 0, screenshotShortcut = 1, shortcutCount = 2;
@@ -162,8 +163,10 @@ private:
     bool quietDialogs() const { return closing_ || endingSession_ || asleep_ || waiting_ > 0; } // Report in the status line, never open a dialog.
     void report(const std::wstring& text, UINT icon); // A dialog, or the status line while dialogs must stay closed.
     // Error messages from the recorder (a failed save on a full disk, a failed start) that arrived while Refarter's own
-    // window was not in front: never a dialog over a game. Each is kept with whether its sound already played; shown on activation.
-    std::vector<std::pair<std::wstring, bool>> queuedErrors_;
+    // window was not in front, or while clips were being ordered: never a dialog over a game or another modal. Each is
+    // kept with its dialog icon (none when the failed-save chime already sounded); shown on activation.
+    std::vector<std::pair<std::wstring, UINT>> queuedErrors_;
+    bool queueMessage(const std::wstring& text, UINT icon); // False: the inbox is full (four) or already holds it.
     bool showingErrors_ = false; // Modal loops may dispatch activation and recording events again.
     void showQueuedErrors();
     bool shellOpen(const wchar_t* target, const wchar_t* failure = nullptr, UINT icon = MB_ICONERROR); // Opens a file, folder or link as Explorer would; `failure`, if given, is the dialog on error.
@@ -240,6 +243,10 @@ private:
     void closePlayer();
     void showClipMenu();
     void startCompression(const std::filesystem::path& path, bool discardIntermediate = false);
+    void startCombine();
+    bool combining_ = false;
+    bool orderingClips_ = false; // Defers other questions, but never replay saves.
+    std::filesystem::path combineSource_; // Common game only; mixed-game compilations stay generic.
     void receiveCompression();
     void trimSaved(const player::ClipPlayer::SavedTrim& trim);
     std::uint64_t trimPlayerSession_ = 0; // The player session in which the trim started.
@@ -320,6 +327,57 @@ private:
     std::wstring updateTag_, updateUrl_;       // The newer release found, if any.
     std::wstring updateNote_;                  // The result of the last check, shown on the Settings row.
     bool updateHot_ = false;                   // The pointer is over the footer's update text.
+    // Updating itself (app_updates.cpp): only an installed copy, and only when the user chooses "update". The
+    // installer is downloaded and checked (UpdateDownload), then run silently; setup closes Refarter and opens it again.
+    enum class UpdateStage {
+        None,        // Nothing under way: a known newer version (updateTag_) can be downloaded.
+        Downloading, // download_ runs; the user chose "update" for updateTag_. Stop it only with cancelDownload(), which leaves this stage.
+        Ready,       // updateSetup_ is checked and held (updateLock_): "restart to update".
+        ByHand,      // This update can't install itself (no checksum, admin rights): open its release page.
+        Installing,  // Setup is running and will close Refarter: no new save or screenshot starts.
+    };
+    UpdateStage updateStage_ = UpdateStage::None;
+    bool installing() const { return updateStage_ == UpdateStage::Installing; }
+    // What the footer's update text and Settings' update button show and do, all from updateStage_ (updateView).
+    struct UpdateView {
+        enum class Click { Nothing, OpenPage, Install, Download } click = Click::Nothing; // What updateClicked does.
+        std::wstring footer;                   // "update available · v1.2.0", the progress, or empty.
+        const wchar_t* button = L"";           // Settings' update button.
+        bool buttonEnabled = false;
+        bool primary = false;                  // The button acts on the newer version: drawn orange.
+        bool keepsNote = false;                // Something is under way: a check naming the same version keeps the note.
+    };
+    UpdateView updateView() const;
+    UpdateView::Click updateClick() const;     // updateView().click without building its texts (the footer's hover test).
+    UpdateDownload download_;
+    int downloadPercent_ = -1;                 // Downloading: the footer's progress; -1 until the first whole percent.
+    HWND downloadBox_ = nullptr;               // Downloading: its progress dialog while it is open (askToUpdate).
+    bool replayAgreed_ = false;                // Downloading: the user was told that the unsaved replay would be cleared.
+    std::filesystem::path updateSetup_;        // Ready: a checked installer for updateTag_.
+    std::shared_ptr<void> updateLock_;         // It, held open read-only from its check until setup starts (DownloadResult::lock).
+    bool installed_ = false;                   // Installed by setup (its uninstaller is beside the exe), not a portable copy.
+    HANDLE setupProcess_ = nullptr, setupWait_ = nullptr; // Installing: setup, and the wait that posts updateSetupEnded.
+    void updateClicked();                      // The footer's update text or the Settings button.
+    void cancelDownload();                     // Stops download_ and leaves Downloading.
+    void askToUpdate();
+    void resumeHeldDialogs();                  // After a dialog that dialogOpen() counted: post what it held back.
+    void invalidateFooter();                   // Redraws the footer (its update text and progress).
+    void downloadDone();
+    void abandonUpdate();                      // Stops the download, closes its dialog and drops the installer.
+    void dropSetup();                          // Forgets the checked installer (and lets go of it), leaving Ready; the next update downloads or checks it again.
+    void installUpdate(bool chosen);           // `chosen`: straight after the user's "update", with nothing changed since.
+    void setupEnded();                         // Setup ended without closing Refarter.
+    // What's new (app_updates.cpp): this version's release notes, built into the exe, in a popup over Refarter's own
+    // window. It opens by itself once, the first time Refarter is in front after an update; otherwise from the
+    // footer's version or Settings.
+    std::wstring seenVersion_;                 // [updates] seen_version: whose notes were last shown, or skipped on a fresh install.
+    bool notesDue_ = false;                    // This start is an update and its notes have not been shown yet.
+    bool infoOpen_ = false;                    // What's new or the codec help is open: other dialogs wait, saves do not (unlike asking_).
+    bool dialogOpen() const { return asking_ || orderingClips_ || infoOpen_ || downloadBox_; } // A dialog that opens by itself must wait.
+    bool versionHot_ = false;                  // The pointer is over the footer's version text.
+    void showNotes();                          // Opens the popup and records the version as seen.
+    void showNotesIfDue();                     // Only with Refarter's own window in front and no other dialog open.
+    RECT footerVersionBounds() const;          // Device pixels: the version text at the footer's right end.
     bool replayKeptNow() const; // The replay survives a failed save: nothing is stopping, quitting or clearing it (a sleep pause keeps it).
     std::wstring trayTip() const;
     void updateTrayTip();
@@ -399,9 +457,13 @@ private:
     void chooseFrameRate();
     void chooseQuality();
     void chooseCodec();
+    void showCodecHelp(); // "which codec should i pick?": each codec's strengths and limits, the recommended one tagged.
     void probeCodecs();
     const capture::CodecSupport* codecSupport(capture::Codec codec) const;
     capture::Size sourceSize() const;
+    mutable HWND sizedWindow_ = nullptr;  // The source window whose frame sourceSize last measured (not maximised),
+    mutable capture::Size sizedFrame_{}; // and that frame: window size less client size, for when it is minimised.
+    capture::Size encodedSize() const; // What recording would encode now: the source's size under the resolution limit.
     void saveReplay();
     void takeScreenshot();
     // What clips and screenshots of the current source are named after; `executable` gets the game behind that name

@@ -187,8 +187,10 @@ void App::drawButton(const DRAWITEMSTRUCT& item) {
         (id == AssignHotkey && assigning_ && assigningShortcut_ == saveShortcut) ||
         (id == AssignScreenshot && assigning_ && assigningShortcut_ == screenshotShortcut);
     const bool disabled = (item.itemState & ODS_DISABLED) != 0;
-    // One orange button: enable replay while it is off, then save replay (stop turns plain).
-    const bool primary = ((id == StartReplay && recording_ == capture::RecorderState::Off) || id == SaveReplay) && !disabled;
+    // Orange buttons: enable replay while it is off, then save replay (stop turns plain); and Settings' update button
+    // while it acts on a newer version (not while checking, downloading or installing).
+    const bool primary = ((id == StartReplay && recording_ == capture::RecorderState::Off) || id == SaveReplay ||
+                          (id == UpdateCheckNow && updateView().primary)) && !disabled;
     COLORREF bg = nav ? sidebar : surface;
     COLORREF fg = disabled ? muted : ink;
     COLORREF stroke = nav ? sidebar : border;
@@ -507,7 +509,7 @@ void App::paint(HDC dc, const RECT& dirty) {
         label(dc, footerStatus(), 38, bottom, w - 38 - footerReserve(), footerHeight, Font::Small, statusColour);
         if (const RECT update = footerUpdateBounds(); !IsRectEmpty(&update))
             drawText(dc, fontOf(Font::Small), footerUpdateText(), {update.left, px(bottom), update.right + px(2), client.bottom}, updateHot_ ? ink : accent);
-        label(dc, footerVersion(), w - 216, bottom, 200, footerHeight, Font::Small, muted, DT_RIGHT);
+        label(dc, footerVersion(), w - 216, bottom, 200, footerHeight, Font::Small, versionHot_ ? ink : muted, DT_RIGHT); // A click opens what's new.
     }
     // Scrolled settings never paint over the footer.
     IntersectClipRect(dc, 0, 0, client.right, px(bottom));

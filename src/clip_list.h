@@ -80,6 +80,18 @@ inline bool isCompressedCopy(const std::filesystem::path& path) {
     return name.rfind(compressedPrefix, 0) == 0;
 }
 
+enum class ClipView { All, Favourites, Compressed };
+
+// The library tabs. A compressed copy is a clip like any other: it shows under all clips and, once starred, under favourites.
+inline bool inClipView(const ClipFile& clip, ClipView view) {
+    switch (view) {
+    case ClipView::Favourites: return clip.favourite;
+    case ClipView::Compressed: return isCompressedCopy(clip.path);
+    case ClipView::All: break;
+    }
+    return true;
+}
+
 // The name shown for a clip: a compressed copy loses its prefix.
 inline std::wstring clipDisplayName(const std::filesystem::path& path) {
     auto stem = path.stem().wstring();

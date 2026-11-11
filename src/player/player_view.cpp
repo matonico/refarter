@@ -526,18 +526,16 @@ void Painter::draw(ID2D1DeviceContext* dc, IDWriteFactory* write, ID2D1Factory1*
         const float thickness = using_ ? d(6) : d(4), y = middle(l.seek);
         const float px = static_cast<float>(scale.x(playback.position));
         rounded({l.seek.left, y - thickness / 2, l.seek.right, y + thickness / 2}, thickness / 2, rail);
-        // The progress in the clip's game colour when it has one (game colours), otherwise the accent.
-        const auto progress = view.tint ? colour(*view.tint) : accent;
-        if (px > l.seek.left) rounded({l.seek.left, y - thickness / 2, px, y + thickness / 2}, thickness / 2, progress);
-        // The A-B loop, in the progress colour: a soft band over its stretch with a tick at each end; A alone is a single tick.
+        if (px > l.seek.left) rounded({l.seek.left, y - thickness / 2, px, y + thickness / 2}, thickness / 2, accent);
+        // The A-B loop, in the accent: a soft band over its stretch with a tick at each end; A alone is a single tick.
         if (view.loop.in >= 0) {
             const float ax = static_cast<float>(scale.x(view.loop.in));
             if (view.loop.active()) {
                 const float bx = static_cast<float>(scale.x(view.loop.out));
-                rounded({ax, y - d(5), bx, y + d(5)}, d(3), colour(view.tint.value_or(theme::accent), 0.28f));
-                line(bx, y - d(7), bx, y + d(7), progress, d(2));
+                rounded({ax, y - d(5), bx, y + d(5)}, d(3), colour(theme::accent, 0.28f));
+                line(bx, y - d(7), bx, y + d(7), accent, d(2));
             }
-            line(ax, y - d(7), ax, y + d(7), progress, d(2));
+            line(ax, y - d(7), ax, y + d(7), accent, d(2));
         }
         if (using_) {
             if (view.hoverTime >= 0 && view.pressed != Part::Seek) {
@@ -545,7 +543,7 @@ void Painter::draw(ID2D1DeviceContext* dc, IDWriteFactory* write, ID2D1Factory1*
                 line(hx, y - thickness / 2, hx, y + thickness / 2, ink, d(2));
                 bubble(view.hoverTime, hx, y - d(10));
             }
-            dc->FillEllipse({{px, y}, d(7), d(7)}, paint(progress));
+            dc->FillEllipse({{px, y}, d(7), d(7)}, paint(accent));
             dc->DrawEllipse({{px, y}, d(7), d(7)}, paint(colour(stageColour, 0.6f)), d(1.5f));
             if (view.pressed == Part::Seek) bubble(playback.position, px, y - d(12));
         }

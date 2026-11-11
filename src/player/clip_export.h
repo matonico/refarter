@@ -10,6 +10,7 @@ struct ExportResult {
     bool cancelled = false;
     bool alreadyFits = false;
     std::wstring cleanupWarning; // A valid export exists, but its owned intermediate could not be removed.
+    bool overLimit = false;      // Combine only: saved past the folder's storage limit, as the setting allows.
 };
 // Synchronous worker entry point. Never call on the UI or recording worker.
 // One stereo AAC mix, hardware H.264, original timestamps unless reducing to ~30 fps.
