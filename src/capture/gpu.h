@@ -14,6 +14,8 @@ struct Gpu {
     std::wstring name;
 };
 
+inline bool sameLuid(LUID a, LUID b) { return a.LowPart == b.LowPart && a.HighPart == b.HighPart; }
+
 // Creates a multithread-protected D3D11 device on the adapter that drives the
 // monitor. Captured frames already live there, so nothing crosses
 // adapters on hybrid-graphics machines.

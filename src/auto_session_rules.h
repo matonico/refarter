@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "auto_capture.h"
+#include "text.h" // samePath: the one path comparison auto-capture and per-game settings share.
 
 namespace refarter {
 
@@ -22,8 +23,6 @@ inline constexpr ULONGLONG shortSessionMs = 60'000;
 
 // What the user answered on the card ("TimedOut": nothing yet; "Closed": the X, not now).
 enum class OfferAnswer { Add, Decline, Closed, TimedOut };
-
-inline bool samePath(const std::wstring& a, const std::wstring& b) { return _wcsicmp(a.c_str(), b.c_str()) == 0; }
 
 // ---- A listed game, or the app in front, coming to the front ------------------------------------
 

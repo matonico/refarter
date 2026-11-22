@@ -28,6 +28,10 @@ void suppressDialogs(bool on);
 // are suppressed. The first answer is the default.
 int choiceBox(HWND owner, const wchar_t* text, const wchar_t* caption, const std::vector<std::wstring>& choices);
 
+// A question with a one-line text field: `name` is its starting text (selected) and receives what was typed when
+// `save`, the default button (Enter in the field), answers; returns true then. Esc, Alt+F4 and "cancel" leave `name`
+// as it was and return false, as does a suppressed dialog. At most `limit` characters can be typed.
+bool nameBox(HWND owner, const wchar_t* text, const wchar_t* caption, const wchar_t* save, std::wstring& name, int limit);
 // A modal dialog with `text`, a progress bar and one plain button (`cancelLabel`) while work runs elsewhere: the
 // owner's messages are dispatched in its loop, so the work reports through them. `*handle` is the dialog's window
 // while it is open, nullptr otherwise. Send it progressPercent (wParam 0-100) to move the bar and add " · N%" to the

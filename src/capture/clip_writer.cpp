@@ -403,7 +403,7 @@ void write(const std::filesystem::path& path, const std::vector<PacketPtr>& pack
     winrt::check_hresult(MFSetAttributeRatio(type.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1));
     winrt::check_hresult(type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive));
     winrt::check_hresult(type->SetUINT32(MF_MT_AVG_BITRATE, static_cast<UINT32>(format.averageKbps) * 1000u));
-    winrt::check_hresult(type->SetUINT32(MF_MT_MPEG2_PROFILE, mediaProfile(format.codec)));
+    winrt::check_hresult(type->SetUINT32(MF_MT_MPEG2_PROFILE, mediaProfile(format.codec, format.tenBit)));
     if (!format.sequenceHeader.empty()) {
         winrt::check_hresult(type->SetBlob(MF_MT_MPEG_SEQUENCE_HEADER, format.sequenceHeader.data(),
                                            static_cast<UINT32>(format.sequenceHeader.size())));

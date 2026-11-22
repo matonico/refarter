@@ -1,5 +1,6 @@
 #include "auto_capture.h"
 #include "local_file.h"
+#include "path_list.h"
 #include "text.h"
 
 #include <shlobj.h>
@@ -13,39 +14,28 @@ namespace refarter {
 namespace {
 constexpr const wchar_t* header = L"refarter auto-capture 1";
 constexpr std::uintmax_t maxBytes = 1024 * 1024;
-
-bool same(const std::wstring& a, const std::wstring& b) { return _wcsicmp(a.c_str(), b.c_str()) == 0; }
-
-bool clean(const std::wstring& text) { return text.find_first_of(L"\r\n\0", 0, 3) == std::wstring::npos; }
 } // namespace
 
 bool capturedProcessExited(HANDLE process) {
     return process && WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
 }
 
-const AutoCaptureGame* AutoCaptureList::find(const std::wstring& path) const {
-    const auto found = std::find_if(games.begin(), games.end(), [&](const auto& game) { return same(game.path, path); });
-    return found == games.end() ? nullptr : &*found;
-}
+const AutoCaptureGame* AutoCaptureList::find(const std::wstring& path) const { return findByPath(games, path); }
 
 bool AutoCaptureList::isDeclined(const std::wstring& path) const {
-    return std::any_of(declined.begin(), declined.end(), [&](const auto& entry) { return same(entry, path); });
+    return std::any_of(declined.begin(), declined.end(), [&](const auto& entry) { return samePath(entry, path); });
 }
 
 void AutoCaptureList::add(std::wstring path, std::wstring label) {
-    std::erase_if(declined, [&](const auto& entry) { return same(entry, path); });
-    for (auto& c : label) if (c == L'\r' || c == L'\n') c = L' ';
-    for (auto& game : games) {
-        if (!same(game.path, path)) continue;
-        game.label = std::move(label);
+    std::erase_if(declined, [&](const auto& entry) { return samePath(entry, path); });
+    if (auto* game = findByPath(games, path)) {
+        game->label = oneLineLabel(std::move(label));
         return;
     }
-    games.push_back({std::move(path), std::move(label)});
+    games.push_back({std::move(path), oneLineLabel(std::move(label))});
 }
 
-void AutoCaptureList::remove(const std::wstring& path) {
-    std::erase_if(games, [&](const auto& game) { return same(game.path, path); });
-}
+void AutoCaptureList::remove(const std::wstring& path) { eraseByPath(games, path); }
 
 void AutoCaptureList::decline(std::wstring path) {
     remove(path);
@@ -75,7 +65,7 @@ std::optional<AutoCaptureList> parseAutoCapture(const std::wstring& text) {
         if (kind == L"game" && !(record >> std::quoted(label))) return std::nullopt;
         if (kind != L"game" && kind != L"declined") return std::nullopt;
         record >> std::ws;
-        if (!record.eof() || !std::filesystem::path(path).is_absolute() || !clean(path) || !clean(label)) return std::nullopt;
+        if (!record.eof() || !std::filesystem::path(path).is_absolute() || !singleLine(path) || !singleLine(label)) return std::nullopt;
         if (kind == L"game") list.add(std::move(path), std::move(label));
         else list.decline(std::move(path));
     }

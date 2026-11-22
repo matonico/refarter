@@ -12,12 +12,19 @@
 
 namespace refarter {
 namespace {
-// Every page starts with its title; the library's filter row and the other pages' cards follow it.
-constexpr int pageTitleTop = 20, pageTitleHeight = 40;
 // Row buttons drawn as dropdowns (text after " · " is the shown value, a chevron marks the menu);
 // the on/off switches are ui::toggleIds.
-constexpr int dropdownIds[] = {DesktopAudio, Microphone, Resolution, FrameRate, QualityPreset, VideoCodec, AutoCaptureSource, StorageBehaviour};
+constexpr int dropdownIds[] = {DesktopAudio, Microphone, Resolution, FrameRate, QualityPreset, VideoCodec, AutoCaptureSource, StorageBehaviour, SettingsFor, WelcomeLength};
 constexpr ULONGLONG switchMillis = 100;
+
+// A closed folder on the 20-unit icon square whose top left is (left, top): "folders by game" and the welcome
+// screen's clip folder.
+void folderOutline(Gdiplus::Graphics& graphics, const Gdiplus::Pen& pen, float left, float top, float unit) {
+    const Gdiplus::PointF folder[] = {{left + 2.5f * unit, top + 5.f * unit}, {left + 8.f * unit, top + 5.f * unit},
+        {left + 10.f * unit, top + 7.f * unit}, {left + 17.5f * unit, top + 7.f * unit}, {left + 17.5f * unit, top + 16.f * unit},
+        {left + 2.5f * unit, top + 16.f * unit}};
+    graphics.DrawPolygon(&pen, folder, 6);
+}
 } // namespace
 
 namespace internal {
@@ -100,6 +107,7 @@ void App::createFonts() {
     for (const auto& c : controls_) if (c.window) SendMessageW(c.window, WM_SETFONT,
         reinterpret_cast<WPARAM>(fontOf(Font::Body)), TRUE);
     clipGrid_.setStyle(dpi_, fontOf(Font::Body), fontOf(Font::Small), state_.smallTiles);
+    styleTooltips();
     // Tab widths depend only on the font: border, padding on each side, a 16 icon and its 8 gap.
     const HDC dc = GetDC(window_);
     const auto previous = SelectObject(dc, fontOf(Font::Body));
@@ -173,35 +181,45 @@ void App::stepSwitches() {
 void App::drawButton(const DRAWITEMSTRUCT& item) {
     const int id = static_cast<int>(item.CtlID);
     const bool nav = id == Library || id == Recording || id == Settings;
-    const bool active = (id == Library && state_.page == Page::Library) ||
-        (id == Recording && state_.page == Page::Recording) ||
-        (id == Settings && state_.page == Page::Settings) ||
+    // The replay presets light up for the length of the scope the page edits.
+    const bool preset = id >= ThirtySeconds && id <= FiveMinutes;
+    const int replaySeconds = preset ? scopeVideo().replaySeconds : 0;
+    // The welcome screen mutes the sidebar: no page is shown as chosen behind it.
+    const bool active = (!welcome_ && id == Library && state_.page == Page::Library) ||
+        (!welcome_ && id == Recording && state_.page == Page::Recording) ||
+        (!welcome_ && id == Settings && state_.page == Page::Settings) ||
         (id == AllClips && state_.clipView == ClipView::All) || (id == Favourites && state_.clipView == ClipView::Favourites) ||
         (id == Compressed && state_.clipView == ClipView::Compressed) ||
-        (id == ThirtySeconds && state_.replayInputValid && state_.replaySeconds == 30) ||
-        (id == OneMinute && state_.replayInputValid && state_.replaySeconds == 60) ||
-        (id == ThreeMinutes && state_.replayInputValid && state_.replaySeconds == 180) ||
-        (id == FiveMinutes && state_.replayInputValid && state_.replaySeconds == 300) ||
+        (id == ThirtySeconds && state_.replayInputValid && replaySeconds == 30) ||
+        (id == OneMinute && state_.replayInputValid && replaySeconds == 60) ||
+        (id == ThreeMinutes && state_.replayInputValid && replaySeconds == 180) ||
+        (id == FiveMinutes && state_.replayInputValid && replaySeconds == 300) ||
         (id == LargeTiles && !state_.smallTiles) || (id == SmallTiles && state_.smallTiles) || (id == GroupFolders && state_.groupFolders) ||
         (id == SortClips && clipGrid_.filtering()) || // A date filter hides clips: say so.
         (id == AssignHotkey && assigning_ && assigningShortcut_ == saveShortcut) ||
-        (id == AssignScreenshot && assigning_ && assigningShortcut_ == screenshotShortcut);
+        (id == AssignScreenshot && assigning_ && assigningShortcut_ == screenshotShortcut) ||
+        (id == WelcomeShortcut && assigning_ && assigningShortcut_ == saveShortcut) ||
+        (id == WelcomeAuto && welcomeAutomatic_) || (id == WelcomeManual && !welcomeAutomatic_);
     const bool disabled = (item.itemState & ODS_DISABLED) != 0;
     // Orange buttons: enable replay while it is off, then save replay (stop turns plain); and Settings' update button
     // while it acts on a newer version (not while checking, downloading or installing).
     const bool primary = ((id == StartReplay && recording_ == capture::RecorderState::Off) || id == SaveReplay ||
-                          (id == UpdateCheckNow && updateView().primary)) && !disabled;
+                          (id == UpdateCheckNow && updateView().primary) || id == WelcomeStart) && !disabled;
     COLORREF bg = nav ? sidebar : surface;
-    COLORREF fg = disabled ? muted : ink;
+    // A drop-down showing a value the chosen game sets itself has it in the accent colour.
+    COLORREF fg = disabled ? muted : resetOf(id) && !preset && scopeOwns(resetOf(id)) ? accent : ink;
     COLORREF stroke = nav ? sidebar : border;
     if (active) { bg = accentSurface; fg = accent; stroke = accentSurface; }
     if (primary) { bg = accent; fg = background; stroke = accent; }
-    if (hovered_ == id && !disabled && !primary && !active) { bg = raised; stroke = raised; }
-    if ((item.itemState & ODS_SELECTED) && !disabled) { bg = raised; fg = ink; }
     // Rounded corners must blend into the actual parent surface, independent of IDs.
     const auto* registered = entry(id);
     const auto backdrop = registered && registered->window == item.hwndItem ? registered->backdrop : ButtonBackdrop::Canvas;
-    const COLORREF behind = backdrop == ButtonBackdrop::Sidebar ? sidebar : backdrop == ButtonBackdrop::Card ? surface : background;
+    const COLORREF behind = backdrop == ButtonBackdrop::Sidebar ? sidebar : backdrop == ButtonBackdrop::Card ? surface :
+        backdrop == ButtonBackdrop::Raised ? raised : background;
+    // On the raised box a hovered or pressed button lightens to the border colour (raised would vanish into it).
+    const COLORREF lifted = backdrop == ButtonBackdrop::Raised ? border : raised;
+    if (hovered_ == id && !disabled && !primary && !active) { bg = lifted; stroke = lifted; }
+    if ((item.itemState & ODS_SELECTED) && !disabled) { bg = lifted; fg = ink; }
     fill(item.hDC, item.rcItem, behind);
     const bool focusShown = keyboardFocus_ && (item.itemState & ODS_FOCUS) != 0;
     const float scale = static_cast<float>(dpi_) / 96.f;
@@ -214,7 +232,9 @@ void App::drawButton(const DRAWITEMSTRUCT& item) {
         const int top = (item.rcItem.top + item.rcItem.bottom - trackHeight) / 2;
         const RECT track{item.rcItem.right - px(40), top, item.rcItem.right, top + trackHeight};
         const COLORREF onColour = disabled ? accentSurface : accent;
-        const COLORREF offColour = hovered_ == id && !disabled ? border : raised;
+        // Off, the track is a shade apart from what it sits on (on the raised box, the panel's colour).
+        const COLORREF offColour = hovered_ == id && !disabled ? (backdrop == ButtonBackdrop::Raised ? mix(border, ink, 0.12f) : border) :
+            backdrop == ButtonBackdrop::Raised ? surface : raised;
         const COLORREF fillColour = mix(offColour, onColour, t);
         roundRect(graphics, track, trackHeight / 2, fillColour, mix(border, onColour, t));
         const float knob = 16.f * scale, inset = 3.f * scale;
@@ -307,7 +327,7 @@ void App::drawButton(const DRAWITEMSTRUCT& item) {
         if (focusShown) focusOutline(graphics, item.rcItem, scale, 10.f);
         return;
     }
-    if (id == DesktopReset || id == MicrophoneReset) {
+    if (id == DesktopReset || id == MicrophoneReset || contains(videoResetIds, id)) {
         // Half faded while replay is on, like the device menu beside it.
         const auto fade = [](COLORREF a) {
             const auto half = [](int x, int y) { return static_cast<BYTE>((x + y) / 2); };
@@ -334,6 +354,19 @@ void App::drawButton(const DRAWITEMSTRUCT& item) {
         return;
     }
     roundRect(graphics, item.rcItem, px(7), bg, stroke);
+    if (id == RenameGame) {
+        // The library's rename pencil, lying diagonally with its tip at the bottom left, drawn on a 16-unit square.
+        Gdiplus::Pen pen(color(fg), 1.4f * scale);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+        const float cx = (item.rcItem.left + item.rcItem.right) / 2.f, cy = (item.rcItem.top + item.rcItem.bottom) / 2.f;
+        const auto at = [&](float x, float y) { return Gdiplus::PointF{cx + x * scale, cy + y * scale}; };
+        const Gdiplus::PointF body[] = {at(-5.5f, 5.5f), at(-1.8f, 4.3f), at(6.7f, -4.2f), at(4.2f, -6.7f), at(-4.3f, 1.8f)};
+        graphics.DrawPolygon(&pen, body, 5);
+        graphics.DrawLine(&pen, at(-4.3f, 1.8f), at(-1.8f, 4.3f));
+        graphics.DrawLine(&pen, at(2.1f, -4.6f), at(4.6f, -2.1f));
+        if (focusShown) focusOutline(graphics, item.rcItem, scale);
+        return;
+    }
     if (contains(libraryIconIds, id)) {
         // Drawn on a 20-unit square: 2×2 large tiles, 3×3 small tiles, a folder (folders by game), a folder
         // with an arrow out of it (open the clip folder in Explorer), or three shortening lines (sort).
@@ -344,8 +377,7 @@ void App::drawButton(const DRAWITEMSTRUCT& item) {
         Gdiplus::Pen pen(color(fg), 1.6f);
         pen.SetLineJoin(Gdiplus::LineJoinRound);
         if (id == GroupFolders) {
-            const Gdiplus::PointF folder[] = {{2.5f, 5.f}, {8.f, 5.f}, {10.f, 7.f}, {17.5f, 7.f}, {17.5f, 16.f}, {2.5f, 16.f}};
-            graphics.DrawPolygon(&pen, folder, 6);
+            folderOutline(graphics, pen, 0.f, 0.f, 1.f);
         } else if (id == SortClips) {
             pen.SetStartCap(Gdiplus::LineCapRound);
             pen.SetEndCap(Gdiplus::LineCapRound);
@@ -404,14 +436,36 @@ void App::drawButton(const DRAWITEMSTRUCT& item) {
     }
     if (nav) icon(item.hDC, id, px(15), px(13), px(20), active ? accent : muted);
     else if (replayButton) replayIcon(item.rcItem.left + px(11), (item.rcItem.top + item.rcItem.bottom - px(20)) / 2, px(20));
-    wchar_t title[128];
-    GetWindowTextW(item.hwndItem, title, 128);
+    // Sized to the text, so a long value (a microphone's name) is never cut before it is drawn.
+    std::wstring titleText(static_cast<size_t>(GetWindowTextLengthW(item.hwndItem)) + 1, L'\0');
+    GetWindowTextW(item.hwndItem, titleText.data(), static_cast<int>(titleText.size()));
+    const wchar_t* title = titleText.c_str();
     const bool dropdown = contains(dropdownIds, id);
-    // Dropdown text is "<setting> · <value>" for screen readers; the row already names the setting.
+    // Dropdown text is "<setting> · <value>" for screen readers; the row already names the setting. The welcome
+    // shortcut button works the same way; the folder button draws clipFolder_ itself.
+    const bool valueOnly = dropdown || id == WelcomeShortcut;
     const wchar_t* shown = title;
-    if (const auto split = dropdown ? wcsstr(title, L" · ") : nullptr) shown = split + 3;
-    // The two shortcut buttons are named for screen readers ("assign save shortcut"); the row already says which.
-    else if ((id == AssignHotkey || id == AssignScreenshot) && !wcsncmp(title, L"assign", 6)) shown = L"assign hotkey";
+    const bool shortcut = id == AssignHotkey || id == AssignScreenshot;
+    if (id == WelcomeAuto || id == WelcomeManual) shown = id == WelcomeAuto ? L"automatically" : L"manually"; // Named with their state.
+    else if (const auto split = valueOnly || shortcut ? wcsstr(title, L" · ") : nullptr) shown = split + 3;
+    if (id == WelcomeFolder) {
+        // A folder before the path, which shortens in its middle so the drive and the last folder stay readable.
+        Gdiplus::Pen pen(color(disabled ? muted : fg == ink ? muted : fg), 1.6f * scale);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+        folderOutline(graphics, pen, item.rcItem.left + 9.f * scale, (item.rcItem.top + item.rcItem.bottom) / 2.f - 10.f * scale, scale);
+        RECT path = item.rcItem;
+        path.left += px(36);
+        path.right -= px(10);
+        // From the folder itself, not the button text ("clip folder · <path>", named for screen readers).
+        std::wstring value = lower(clipFolder_.wstring());
+        const auto previous = SelectObject(item.hDC, fontOf(Font::Body));
+        SetBkMode(item.hDC, TRANSPARENT);
+        SetTextColor(item.hDC, fg);
+        DrawTextW(item.hDC, value.data(), static_cast<int>(value.size()), &path, DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_PATH_ELLIPSIS | DT_LEFT);
+        SelectObject(item.hDC, previous);
+        if (focusShown) focusOutline(graphics, item.rcItem, scale);
+        return;
+    }
     RECT text = item.rcItem;
     text.left += px(nav ? 49 : replayButton ? 36 : dropdown ? 12 : 9);
     text.right -= px(dropdown ? 30 : replayButton ? 2 : 9);
@@ -517,6 +571,37 @@ void App::paint(HDC dc, const RECT& dirty) {
     const int x = contentLeft();
     const int width = w - x - contentGap;
     // Pages have no header: each starts with its content.
+    if (welcome_) {
+        // The welcome screen: its title, a card of seven rows (each control sits at its row's right end, see
+        // placeControls), and one line under the card for assigning the shortcut or a problem with it.
+        const auto welcome = welcomeBox();
+        // A popup's panel: a soft shadow (rings fading out, a little lower than the panel), then the panel itself.
+        const RECT panel{px(welcome.panelX), px(welcome.panelTop), px(welcome.panelX + welcome.panelWidth), px(welcome.panelTop + welcome.panelHeight)};
+        // Everything below lies inside the shadow's outer ring: skip it when only the sidebar or footer is repainted.
+        if (!touches({panel.left - px(12), panel.top - px(6), panel.right + px(12), panel.bottom + px(18)})) return;
+        for (int ring = 12; ring >= 1; --ring) {
+            const RECT shade{panel.left - px(ring), panel.top - px(ring) + px(6), panel.right + px(ring), panel.bottom + px(ring) + px(6)};
+            const COLORREF tone = mix(background, RGB(0, 0, 0), 0.05f * static_cast<float>(13 - ring) / 12.f);
+            roundRect(dc, shade, px(16 + ring), tone, tone);
+        }
+        roundRect(dc, panel, px(16), surface, border);
+        label(dc, L"welcome to refarter.", welcome.x, welcome.top, welcome.width, 40, Font::Title, ink, DT_LEFT);
+        roundRect(dc, {px(welcome.x), px(welcome.cardTop), px(welcome.x + welcome.width), px(welcome.cardTop + welcomeRowCount * welcome.rowHeight)},
+            px(10), raised, border);
+        const wchar_t* names[welcomeRowCount] = {L"recording starts", L"replay length", L"save shortcut", L"clip folder",
+            L"start with windows", L"close to tray", L"check updates automatically"};
+        const int nameWidths[welcomeRowCount] = {welcome.width - 270, welcome.width - 180, welcome.width - 230, 100,
+            welcome.width - 90, welcome.width - 90, welcome.width - 90};
+        for (int row = 0; row < welcomeRowCount; ++row) {
+            const int y = welcome.cardTop + row * welcome.rowHeight;
+            if (row > 0) line(welcome.x + 16, y, welcome.width - 32);
+            label(dc, names[row], welcome.x + 20, y, std::max(0, nameWidths[row]), welcome.rowHeight, Font::Body, ink);
+        }
+        // The save shortcut's note, as Settings shows it.
+        const auto note = shortcutNote(saveShortcut);
+        if (!note.empty()) label(dc, note, welcome.x + 4, welcome.noteTop, welcome.width - 8, 20, Font::Small, shortcutAlert(saveShortcut) ? accent : muted);
+        return;
+    }
     if (playerOpen_) return; // The player fills the content area.
     if (state_.page == Page::Library) {
         label(dc, L"your clips.", x, pageTitleTop, width, pageTitleHeight, Font::Title, ink, DT_LEFT);
@@ -563,11 +648,8 @@ void App::paint(HDC dc, const RECT& dirty) {
                 if (touchesLogical(x, top, width, bottom - libraryCardBottom - top)) {
                     const bool searching = clipGrid_.searching();
                     label(dc, L"no clips match.", x + 24, middle + 4, width - 48, 40, Font::Title, ink, DT_CENTER);
-                    label(dc, searching ? L"every word must appear in a clip's name or game." :
-                        std::wstring(L"no clips were saved ") + clipPeriodNames[static_cast<int>(clipGrid_.period())] + L".",
-                        x + 24, middle + 50, width - 48, 28, Font::Body, muted, DT_CENTER);
                     label(dc, searching ? L"esc in the search field clears it." : L"the sort menu's \"from any time\" shows every clip.",
-                        x + 24, middle + 79, width - 48, 26, Font::Small, muted, DT_CENTER);
+                        x + 24, middle + 50, width - 48, 28, Font::Body, muted, DT_CENTER);
                 }
             } else if (touchesLogical(x, top, width, bottom - libraryCardBottom - top)) {
                 roundRect(dc, {px(center - 38), px(middle - 34), px(center + 28), px(middle + 15)}, px(8), background, border);
@@ -576,19 +658,30 @@ void App::paint(HDC dc, const RECT& dirty) {
                 label(dc, favourites ? L"no favourites. yet." : compressed ? L"nothing compressed. yet." : L"nothing clipped. yet.", x + 24, middle + 44, width - 48, 40, Font::Title, ink, DT_CENTER);
                 label(dc, favourites ? L"star a clip under all clips to keep it here." : compressed ? L"compress a clip from its ⋯ menu to keep a copy under 20 mb here." : L"choose a source and enable replay to save your first clip.",
                     x + 24, middle + 90, width - 48, 28, Font::Body, muted, DT_CENTER);
-                if (!favourites && !compressed) label(dc, L"clips in " + lower(clipFolder_.wstring()) + L" show up here.", x + 24, middle + 119, width - 48, 26, Font::Small, muted, DT_CENTER);
             }
         }
     } else {
         // Recording and Settings: titled cards of rows, scrolled as one page (from the cache layout() made).
         const int dpi = static_cast<int>(dpi_);
         const int scroll = scroll_[static_cast<int>(state_.page)];
-        label(dc, state_.page == Page::Recording ? L"ready for the next play." : L"make yourself at home.",
-            x, pageTitleTop - scroll, width, pageTitleHeight, Font::Title, ink, DT_LEFT);
+        // Recording's title stops before "use defaults" and "settings for" on its line (see placeControls).
+        const bool recordingPage = state_.page == Page::Recording;
+        const int titleWidth = !recordingPage ? width :
+            std::max(0, std::min(recordingMaxWidth, width) - titleControlsWidth(scopeEntry() != nullptr, renameShown()) - titleControlsGap);
+        label(dc, recordingPage ? L"ready for the next play." : L"make yourself at home.",
+            x, pageTitleTop - scroll, titleWidth, pageTitleHeight, Font::Title, ink, DT_LEFT);
         for (const auto& section : pages_[static_cast<size_t>(state_.page)]) {
             const int left = x + section.x, top = section.top - scroll;
             if (!touchesLogical(left, top, section.width, section.bottom - section.top)) continue;
             label(dc, section.title, left + 4, top, section.width - 8, 26, Font::Heading, ink);
+            const int noteGap = section.lockNoteWidth ? section.lockNoteWidth + 10 : 0;
+            if (!section.aside.empty()) {
+                label(dc, section.aside, left + 4 + section.titleWidth, top,
+                      std::max(0, section.width - 8 - section.titleWidth - noteGap), 26, Font::Heading, muted);
+            }
+            if (section.lockNoteWidth)
+                label(dc, section.shortLockNote ? L"locked" : lockedHeadingNote(),
+                      left + section.width - 4 - section.lockNoteWidth, top + 2, section.lockNoteWidth, 26, Font::Small, accent);
             box(left, top + headingHeight, section.width, section.bottom - section.top - headingHeight);
             for (size_t i = 0; i < section.rows.size(); ++i) {
                 const auto& row = section.rows[i];
@@ -601,6 +694,7 @@ void App::paint(HDC dc, const RECT& dirty) {
                 } else {
                     label(dc, row.name, left + 20, y + 9, row.textWidth, 22, Font::Body, name);
                     label(dc, row.note, left + 20, y + 31, row.textWidth, 20, Font::Small, row.alert ? accent : muted);
+                    if (!row.detail.empty()) label(dc, row.detail, left + 20, y + 49, row.textWidth, 20, Font::Small, muted);
                 }
             }
         }

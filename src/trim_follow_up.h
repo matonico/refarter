@@ -35,8 +35,8 @@ struct FollowUpResult {
 };
 
 // The trimmed clip a compression was started for. It decides, from the finished export, whether and what to
-// copy: the compressed file, or the trimmed clip itself when it already fits. A cancelled or failed export,
-// or one cancelled just as it ended, copies nothing.
+// copy: the compressed file, or the trimmed clip itself when it already fits (under its compressed name once the
+// job has renamed it). A cancelled or failed export, or one cancelled just as it ended, copies nothing.
 class TrimFollowUp {
 public:
     void arm(const std::filesystem::path& trimmed, const std::filesystem::path& source = {}, bool replace = false) {
@@ -65,7 +65,8 @@ public:
             plan.note = L"compression failed";
             plan.kind = player::ToastKind::Error;
         } else if (result.alreadyFits) {
-            plan = {AfterCompression::CopyFile, trimmed, {}};
+            // Renamed to the compressed name on the worker; the trim's own name only when that failed.
+            plan = {AfterCompression::CopyFile, result.path.empty() ? trimmed : result.path, {}};
         } else if (!result.path.empty()) {
             plan = {AfterCompression::CopyFile, result.path, {}};
         } else {

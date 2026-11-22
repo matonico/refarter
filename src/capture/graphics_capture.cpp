@@ -217,6 +217,7 @@ void GraphicsCapture::frameArrived(const wgc::Direct3D11CaptureFramePool& pool) 
                     if (usableStartupFrame(IsIconic(window_) != FALSE, {client.right, client.bottom},
                             {content.Width, content.Height}, {static_cast<int>(description.Width), static_cast<int>(description.Height)})) {
                         region_ = initialRegion_ = recordedRegion(content);
+                        initialSurfaceSize_ = {static_cast<int>(description.Width), static_cast<int>(description.Height)};
                         waitingForFrame_ = false;
                         SetEvent(startupReady_.get());
                     }

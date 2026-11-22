@@ -91,10 +91,10 @@ void App::invalidateFooter() {
 // activation would bring them.
 void App::resumeHeldDialogs() {
     if (closing_) return;
+    if (notesDue_) PostMessageW(window_, notesDue, 0, 0); // The notes come first, as at start (run).
     if (state_.updateCheck == UpdateChoice::Ask) PostMessageW(window_, updateQuestion, 0, 0);
     if (!queuedErrors_.empty()) PostMessageW(window_, errorDialogs, 0, 0);
     if (storageQuestionQueued_) PostMessageW(window_, storageQuestion, 0, 0);
-    if (notesDue_) PostMessageW(window_, notesDue, 0, 0);
 }
 
 // The opt-in question. It opens only where a dialog is welcome: Refarter's own window visible and in front, nothing

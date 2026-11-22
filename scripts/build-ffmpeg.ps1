@@ -36,7 +36,7 @@ $ffmpegOptions = @(
 )
 $dav1dOptions = @(
     '--buildtype=release', '--default-library=static', '-Db_vscrt=mt',
-    '-Dbitdepths=8', '-Denable_tools=false', '-Denable_tests=false', '-Denable_examples=false'
+    '-Dbitdepths=8,16', '-Denable_tools=false', '-Denable_tests=false', '-Denable_examples=false'
 )
 
 $patch = Join-Path $PSScriptRoot 'ffmpeg-mf-encoder-index.patch'

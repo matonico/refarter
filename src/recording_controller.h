@@ -35,26 +35,29 @@ struct RecordingEvent {
 
 // Event-driven command queue. Device activation, folder I/O and shutdown never
 // run on the window thread. The recorder is constructed only on first start.
+// The commands are virtual so a test can stand in a recorder that only records them and answers through the same
+// Notify (see App::makeRecorder_); Refarter always makes this one. close() stays as it is: with no worker it answers
+// Closed at once, which is all a stand-in needs.
 class RecordingController {
 public:
     using Notify = std::function<void(RecordingEvent)>;
     explicit RecordingController(Notify notify) : notify_(std::move(notify)) {}
-    ~RecordingController();
-    void start(RecordingTarget target, capture::VideoSettings video, capture::AudioSettings audio,
-               std::filesystem::path folder);
-    void stop();
+    virtual ~RecordingController();
+    virtual void start(RecordingTarget target, capture::VideoSettings video, capture::AudioSettings audio,
+                       std::filesystem::path folder);
+    virtual void stop();
     // Sleep: ends capture and keeps the buffered replay for saving (the Stopped state a closing game also leaves).
     // With nothing buffered it is a plain stop. Answered by a Stopped event with `sleeping` set.
-    void pause();
+    virtual void pause();
     // `requestedAt` is capture::captureClock() when the save was asked for: the clip ends there.
-    void save(std::filesystem::path folder, std::wstring name, std::int64_t requestedAt);
+    virtual void save(std::filesystem::path folder, std::wstring name, std::int64_t requestedAt);
     // The next picture of the running capture as "<folder>\screenshots\<name> <date time>.png". Answered by a
     // Screenshot event.
-    void screenshot(std::filesystem::path folder, std::wstring name);
-    void folder(std::filesystem::path path);
+    virtual void screenshot(std::filesystem::path folder, std::wstring name);
+    virtual void folder(std::filesystem::path path);
     // Checks which codecs the primary GPU records. Opens hardware encoders
     // briefly, so the window asks only while replay is off.
-    void probeCodecs();
+    virtual void probeCodecs();
     void close();
 private:
     void enqueue(std::function<void()> job);

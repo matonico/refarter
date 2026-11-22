@@ -27,7 +27,7 @@ enum class DiagnosticEvent {
     CompressionCancelled, CompressionError, CompressionStage, CompressionLibraries,
     CompressionTimeBase, CompressionFrameRate, CompressionSystemError,
     CompressionLumaSample, CompressionDecodedLuma, CompressionScaledLuma, EncoderTimeRepaired,
-    MeterHookFailed, Count
+    MeterHookFailed, GameSettingsUsed, TenBitFallback, DownscalerFallback, Count
 };
 
 class DiagnosticLog {

@@ -19,7 +19,8 @@ public:
     ~CompressionJob() { stop(); }
     // False: a job is running, the path is empty or the thread could not start.
     // `discardIntermediate` is only for a trim created by this app: remove it after publishing a distinct
-    // compressed result, never on failure/cancellation or when the trim already fits.
+    // compressed result, never on failure/cancellation. A trim that already fits is renamed to the compressed
+    // name instead (`ExportResult::path`; empty, with a `cleanupWarning`, when the rename failed).
     bool start(const std::filesystem::path& clip, bool discardIntermediate = false);
     // Shares the single export slot, progress, cancellation and shutdown with compression.
     bool startCombine(std::vector<std::filesystem::path> clips, const player::CombineStorage& storage);

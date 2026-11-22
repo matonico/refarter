@@ -1,5 +1,6 @@
 #include "compression_job.h"
 #include "temporary_clip.h"
+#include "clip_list.h"
 
 #include <windows.h>
 
@@ -26,6 +27,13 @@ bool CompressionJob::start(const std::filesystem::path& clip, bool discardInterm
     return launch(clip, [this, clip, discardIntermediate] {
         const auto identity = discardIntermediate ? temporaryClipIdentity(clip) : TemporaryClipIdentity{};
         auto result = player::compressClip(clip, progress_, cancel_);
+        // A trim that already fits is the result: it takes the compressed name, so the library tags it. A trim of a
+        // compressed copy already carries the prefix and keeps its name.
+        if (discardIntermediate && !cancel_.load() && !result.cancelled && result.error.empty() && result.alreadyFits &&
+            !isCompressedCopy(clip)) {
+            result.path = tagTemporaryClip(clip, identity);
+            if (result.path.empty()) result.cleanupWarning = L"the trim could not be named as compressed";
+        }
         if (discardIntermediate && !cancel_.load() && !result.cancelled && result.error.empty() &&
             !result.alreadyFits && !result.path.empty() && result.path != clip &&
             !discardExportIntermediate(clip, identity, result.path))

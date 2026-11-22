@@ -62,6 +62,14 @@ private:
     bool held_ = false;
 };
 
+// Whether one of Refarter's own windows (main window, tray flyout) is in front. By process, not
+// App::ownWindowForeground's owner chain: the tray flyout is not owned by the main window.
+inline bool ownProcessInFront() {
+    DWORD process = 0;
+    const HWND front = GetForegroundWindow();
+    return front && GetWindowThreadProcessId(front, &process) && process == GetCurrentProcessId();
+}
+
 // Raw Input and RegisterHotKey each report a press once, so most presses arrive twice. The first
 // report saves and its partner is dropped; either path alone still saves every press.
 class PressReports {

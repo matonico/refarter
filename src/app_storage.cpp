@@ -12,22 +12,25 @@ bool App::gameTrackOn() const {
     return target_.source.window && audio_.desktop.enabled();
 }
 
-std::uint64_t App::estimatedClipBytes(int seconds) const {
-    const auto rate = capture::bitrateFor(video_, encodedSize());
+std::uint64_t App::estimatedClipBytes(int seconds, const capture::VideoSettings* video, std::optional<capture::Size> size) const {
+    // By default what the next save records with: the running replay's settings (a game's own, perhaps).
+    const auto settings = video ? *video : recordingVideo();
+    const auto rate = capture::bitrateFor(settings, encodedSize(settings, size));
     // Discord gets its own track unless hidden or inseparable (only clips where it spoke).
     const bool discord = audio_.desktop.enabled() && !audio_.hideDiscord && !discordUnavailable_ && !discordSharesOutput_;
     const int sources = audio_.desktop.enabled() + audio_.microphone.enabled() + discord + gameTrackOn();
     const int tracks = sources >= 2 ? sources + 1 : sources; // Two or more: a mix first.
     const int audioKbps = tracks * 192 - (audio_.microphone.enabled() ? 96 : 0); // AAC 192 kb/s a track, the mono mic 96.
-    return capture::replayBytes(rate.averageKbps + audioKbps, seconds < 0 ? state_.replaySeconds : seconds);
+    return capture::replayBytes(rate.averageKbps + audioKbps, seconds < 0 ? settings.replaySeconds : seconds);
 }
 
 // A save writes what the buffer holds: shorter than the setting just after a start. The time since the buffer began
 // filling bounds it from above (it also counts a sleep pause, so the estimate errs on the large side).
 int App::bufferedClipSeconds() const {
-    if (recording_ == capture::RecorderState::Off || bufferingSince_ == std::chrono::steady_clock::time_point{}) return state_.replaySeconds;
+    const int length = recordingVideo().replaySeconds; // The running replay's length, which may be a game's own.
+    if (recording_ == capture::RecorderState::Off || bufferingSince_ == std::chrono::steady_clock::time_point{}) return length;
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - bufferingSince_).count();
-    return estimateSeconds(state_.replaySeconds, elapsed);
+    return estimateSeconds(length, elapsed);
 }
 
 StripState App::storageStrip() const {
@@ -48,14 +51,12 @@ void App::updateStorageInput() {
     const auto value = text[0] ? parseNumber(text, 0, static_cast<int>(maxStorageGb)) : std::optional<int>(0);
     if (value) state_.maxStorageGb = static_cast<unsigned>(*value); // Written to the file once the field is left.
     invalidateStrip();
-    refreshPages(); // The limit row's note depends on whether a limit is set.
 }
 
 void App::chooseStorageBehaviour() {
     PopupMenu styled;
     const auto menu = styled.root;
-    const wchar_t* items[] = {L"warn and save · save anyway and say so", L"refuse the save · keep the replay, save nothing",
-                              L"bin oldest clips · skips favourites and compressed copies"};
+    const wchar_t* items[] = {L"warn and save", L"refuse the save", L"bin oldest clips"};
     for (int i = 0; i < 3; ++i)
         styled.append(menu, i + 1, items[i], MFS_ENABLED | (static_cast<int>(state_.storageFull) == i ? MFS_CHECKED : 0));
     RECT rect{};
@@ -81,10 +82,8 @@ void App::askStorageQuestion(std::uint64_t used, std::uint64_t limit, std::uint6
     const auto text = (late ? L"the clip folder has passed its storage limit (" + formatUsage(used, limit) + L") · your last save went ahead"
                             : L"the clip folder is about to pass its storage limit (" + formatUsage(used + estimate, limit) + L")") +
         L". what should a save do when storage is full?\n\n"
-        L"warn and save: save anyway and say so.\n"
-        L"refuse: save nothing; the replay is kept.\n"
-        L"bin oldest: move the oldest clips, but never favourites or compressed copies, to the recycle bin (local drive with one only).\n\n"
-        L"you can change this later in settings.";
+        L"refuse keeps the replay. bin oldest skips favourites and compressed copies, and needs a local drive with a recycle bin. "
+        L"you can change this in settings.";
     const auto answer = resolveAnswer(choiceBox(window_, text.c_str(), L"refarter", {L"warn and save", L"refuse", L"bin oldest", L"not now"}));
     asking_ = false;
     state_.storageFull = answer.behaviour; // Not now acts as warn and is not remembered.

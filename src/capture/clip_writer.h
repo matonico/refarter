@@ -29,6 +29,7 @@ struct ClipFormat {
     std::size_t audioFrames = 0;
     std::function<void(std::size_t frames, std::vector<std::vector<std::int16_t>>& tracks)> audio;
     bool preserveCaptureTime = false; // Recorder enables this; direct probe callers retain their supplied durations.
+    bool tenBit = false; // The video was encoded 10-bit (HEVC Main10 or AV1 Main 10-bit).
 };
 
 // Writes already-encoded packets into an MP4 without re-encoding: the cost of

@@ -19,8 +19,8 @@ int main() {
         return r.averageMbps == average && r.peakMbps == peak && r.mbPerMinute == perMinute;
     };
     check(rate(Codec::H264, 20, 40, 150), "balanced 1080p60 h.264: 19.9 average, 39.8 peak, about 150 mb a minute");
-    check(rate(Codec::HEVC, 13, 26, 100), "hevc needs about a third less");
-    check(rate(Codec::AV1, 11, 22, 80), "av1 needs about half");
+    check(rate(Codec::HEVC, 18, 36, 130), "hevc gets about 10% less");
+    check(rate(Codec::AV1, 15, 30, 110), "av1 gets about 25% less");
     settings.codec = Codec::AV1;
     check(rate(Codec::H264, 20, 40, 150), "the codec asked for counts, not the saved one");
     settings.quality = capture::Quality::Custom;

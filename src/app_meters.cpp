@@ -211,7 +211,7 @@ void App::updateMeterTooltip() {
     if (!tooltips_) return;
     const bool shown = recording_ == capture::RecorderState::Buffering;
     for (UINT_PTR index = 0; index < 2; ++index) {
-        TOOLINFOW tool{sizeof(tool)};
+        TOOLINFOW tool{toolInfoSize};
         tool.hwnd = window_;
         tool.uId = meterToolId + index;
         if (shown && state_.sidebarCollapsed) {
@@ -223,14 +223,14 @@ void App::updateMeterTooltip() {
             const RECT icon = meterIconRect(static_cast<int>(index));
             tool.rect = {icon.left - px(2), icon.top - px(2), icon.right + px(2), icon.bottom + px(2)};
         }
-        if (!meterToolAdded_) {
-            tool.uFlags = TTF_SUBCLASS;
+        const unsigned bit = 1u << index;
+        if (!(meterToolsAdded_ & bit)) { // Each tool on its own: a refused one is tried again next time, never twice.
+            tool.uFlags = 0; // Not TTF_SUBCLASS: WM_MOUSEMOVE in the window procedure relays the main window's moves.
             tool.lpszText = LPSTR_TEXTCALLBACKW;
-            SendMessageW(tooltips_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+            if (SendMessageW(tooltips_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool))) meterToolsAdded_ |= bit;
         }
         SendMessageW(tooltips_, TTM_NEWTOOLRECTW, 0, reinterpret_cast<LPARAM>(&tool));
     }
-    meterToolAdded_ = true;
 }
 bool App::isMeterTool(UINT_PTR id) const { return id == meterToolId || id == meterToolId + 1; }
 

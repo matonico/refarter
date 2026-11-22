@@ -240,10 +240,11 @@ void App::receiveCompression() {
             else preview = plan.file;
         }
         clipGrid_.setTrimSource({});
-        // A trim that already fits is the result itself: it takes the original's name before it is copied.
+        // A trim that already fits was renamed "20mb_..." and replaces like a compressed copy. Only when that
+        // rename failed does it take the original's name before it is copied.
         std::wstring replacementWarning;
         bool finished = false;
-        if (replace && result->alreadyFits && !preview.empty()) {
+        if (replace && result->alreadyFits && result->path.empty() && !preview.empty()) {
             replacementWarning = player_.finishTrimCompression(preview, true, trimPlayerSession_, true, &preview);
             finished = true;
         }

@@ -210,10 +210,16 @@ void encodeFile(const std::filesystem::path& source, const std::filesystem::path
     const double duration = std::max(videoDuration, r.input->duration > 0 ? r.input->duration / static_cast<double>(AV_TIME_BASE) : 0);
     diagnosticLog().write(DiagnosticEvent::CompressionDuration, S_OK, milliseconds(duration));
     mark(ExportStage::Plan);
-    const auto plan = planExport(stream->codecpar->width, stream->codecpar->height, duration, audio >= 0, budget);
-    require(plan.has_value(), L"this clip is too long for a useful 20mb copy; trim it first");
+    // FFmpeg's guess (no stored average) reads jittery 60 fps as about 120: never drop pictures on a guess.
+    const bool storedRate = stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0;
+    const auto plan = planExport(stream->codecpar->width, stream->codecpar->height, duration, audio >= 0, budget,
+                                 storedRate ? sourceRate.num : std::min(sourceRate.num, maxExportFps));
+    // A retry's lower budget can fall below the floor although the first attempt was planned.
+    require(plan.has_value(), budget < firstBudget ? L"the hardware encoder could not meet 20mb; try trimming the clip first"
+                                                   : L"this clip is too long for a useful 20mb copy; trim it first");
     diagnosticLog().write(DiagnosticEvent::CompressionPlan, S_OK, plan->width, plan->height);
-    diagnosticLog().write(DiagnosticEvent::CompressionRate, S_OK, plan->bitrate, plan->thirtyFps);
+    diagnosticLog().write(DiagnosticEvent::CompressionRate, S_OK, plan->bitrate, plan->fps);
+    const bool reduceFps = plan->reduceFps; // Keep the first picture in each 1/60 s.
     mark(ExportStage::Decoder);
     require(openDecoder(r, stream, true) || openDecoder(r, stream, false), L"this video format cannot be decoded");
     mark(ExportStage::Encoder);
@@ -229,7 +235,7 @@ void encodeFile(const std::filesystem::path& source, const std::filesystem::path
         r.encoder->sample_aspect_ratio = stream->sample_aspect_ratio;
         r.encoder->pix_fmt = AV_PIX_FMT_NV12;
         r.encoder->time_base = stream->time_base; // Preserve the capture clock; never invent a rounded frame grid.
-        r.encoder->framerate = plan->thirtyFps ? AVRational{30, 1} : sourceRate;
+        r.encoder->framerate = reduceFps ? AVRational{plan->fps, 1} : sourceRate;
         r.encoder->bit_rate = plan->bitrate;
         r.encoder->gop_size = 120;
         r.encoder->profile = profile; // MF defaults to Baseline, which GPU decoders reject; players then fall back to software.
@@ -318,9 +324,11 @@ void encodeFile(const std::filesystem::path& source, const std::filesystem::path
             const auto pts = r.decoded->best_effort_timestamp;
             require(pts != AV_NOPTS_VALUE, L"this clip has missing video timestamps");
             const double seconds = pts * av_q2d(stream->time_base) - origin;
-            const auto bucket = static_cast<std::int64_t>(std::floor(std::max(0.0, seconds) * 30 + 1e-6));
-            if (plan->thirtyFps && bucket == lastBucket) { av_frame_unref(r.decoded); continue; }
-            lastBucket = bucket;
+            if (reduceFps) {
+                const auto bucket = static_cast<std::int64_t>(std::floor(std::max(0.0, seconds) * plan->fps + 1e-6));
+                if (bucket == lastBucket) { av_frame_unref(r.decoded); continue; }
+                lastBucket = bucket;
+            }
             AVFrame* picture = r.decoded;
             if (picture->format == AV_PIX_FMT_D3D11) {
                 exportStage = ExportStage::Download;
@@ -334,7 +342,7 @@ void encodeFile(const std::filesystem::path& source, const std::filesystem::path
             require(picture->width == stream->codecpar->width && picture->height == stream->codecpar->height,
                     L"the clip changes resolution; trim it before compression");
             r.scaler = sws_getCachedContext(r.scaler, picture->width, picture->height, static_cast<AVPixelFormat>(picture->format),
-                plan->width, plan->height, AV_PIX_FMT_NV12, SWS_BILINEAR, nullptr, nullptr, nullptr);
+                plan->width, plan->height, AV_PIX_FMT_NV12, SWS_LANCZOS, nullptr, nullptr, nullptr); // Sharper than bilinear at the same size.
             require(r.scaler != nullptr, L"could not resize this clip");
             const int colour = stream->codecpar->color_space == AVCOL_SPC_BT709 ? SWS_CS_ITU709 : SWS_CS_DEFAULT;
             const int full = stream->codecpar->color_range == AVCOL_RANGE_JPEG;
@@ -353,7 +361,7 @@ void encodeFile(const std::filesystem::path& source, const std::filesystem::path
             r.scaled->pts = pts - static_cast<std::int64_t>(std::llround(origin / av_q2d(stream->time_base)));
             require(lastPts == AV_NOPTS_VALUE || r.scaled->pts > lastPts, L"this clip has non-increasing video timestamps");
             lastPts = r.scaled->pts;
-            r.scaled->duration = plan->thirtyFps ? av_rescale_q(1, AVRational{1, 30}, stream->time_base) : r.decoded->duration;
+            r.scaled->duration = reduceFps ? av_rescale_q(1, AVRational{1, plan->fps}, stream->time_base) : r.decoded->duration;
             if (r.scaled->duration <= 0) r.scaled->duration = av_rescale_q(1, av_inv_q(r.encoder->framerate), stream->time_base);
             r.scaled->color_range = r.encoder->color_range; r.scaled->colorspace = r.encoder->colorspace;
             r.scaled->color_primaries = r.encoder->color_primaries; r.scaled->color_trc = r.encoder->color_trc;
@@ -438,7 +446,7 @@ ExportResult compressClip(const std::filesystem::path& source, std::atomic<float
         windowsRequire(reservation.handle != INVALID_HANDLE_VALUE, L"could not create an export in this folder");
         CloseHandle(reservation.handle); reservation.handle = INVALID_HANDLE_VALUE;
         temporary.path = candidate;
-        double budget = 18'800'000;
+        double budget = firstBudget;
         for (int attempt = 0; attempt < 3; ++attempt) {
             diagnosticLog().write(DiagnosticEvent::CompressionAttempt, S_OK, attempt + 1, static_cast<unsigned>(budget));
             progress.store(0);
@@ -466,7 +474,9 @@ ExportResult compressClip(const std::filesystem::path& source, std::atomic<float
                 }
                 throw std::wstring(L"too many compressed copies already exist");
             }
-            budget *= static_cast<double>(exportLimit) / static_cast<double>(size) * 0.90;
+            // The overshoot mostly repeats for the same clip, but rises a few points at a lower rate
+            // (measured 4-9%), so leave 7% for that change.
+            budget *= static_cast<double>(exportLimit) / static_cast<double>(size) * 0.93;
         }
         throw std::wstring(L"the hardware encoder could not meet 20mb; try trimming the clip first");
     } catch (const std::wstring& message) { result.error = message; }

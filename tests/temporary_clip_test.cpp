@@ -1,6 +1,8 @@
 #include "temporary_clip.h"
 #include <fstream>
 #include <iostream>
+#include <string>
+#include <thread>
 
 int main() {
     using namespace refarter;
@@ -41,6 +43,29 @@ int main() {
     check(!std::filesystem::exists(input) && std::filesystem::exists(output) && std::filesystem::exists(moved), "only the intended intermediate removed");
     check(!temporaryClipIdentity(root).valid, "directories are not intermediates");
     check(!discardExportIntermediate(moved, {}, output), "missing identity never deletes");
+
+    // A trim that already fits takes the compressed name, never over an existing file.
+    const auto small = root / L"small trim.mp4";
+    write(small, "small");
+    write(root / L"20mb_small trim.mp4", "taken");
+    auto smallIdentity = temporaryClipIdentity(small);
+    write(small, "small, changed");
+    check(tagTemporaryClip(small, smallIdentity).empty() && std::filesystem::exists(small), "a changed trim is not renamed");
+    check(tagTemporaryClip(small, {}).empty(), "missing identity never renames");
+    smallIdentity = temporaryClipIdentity(small);
+    const HANDLE reader = CreateFileW(small.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    check(tagTemporaryClip(small, smallIdentity, 2).empty() && std::filesystem::exists(small), "a trim held open throughout is not renamed");
+    // A reader that lets go while the rename is retried (the library's scan, a virus scanner) does not stop it.
+    std::thread release([reader] { Sleep(150); if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader); });
+    const auto tagged = tagTemporaryClip(small, smallIdentity);
+    release.join();
+    check(tagged == root / L"20mb_small trim (2).mp4", "a taken compressed name moves to the next number");
+    check(!std::filesystem::exists(small) && std::filesystem::exists(tagged), "the trim itself was renamed");
+    std::ifstream kept(root / L"20mb_small trim.mp4");
+    std::string text;
+    kept >> text;
+    check(text == "taken", "the existing compressed copy is untouched");
+    kept.close();
     std::filesystem::remove_all(root);
     return failures ? 1 : 0;
 }

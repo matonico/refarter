@@ -1,8 +1,10 @@
 // App: settings and shortcuts. Loading and saving refarter.ini, the start-with-Windows switch, and the save shortcut.
 #include "app_internal.h"
 #include "config.h"
+#include "game_settings.h"
 #include "local_file.h"
 #include "message_box.h"
+#include "source_names.h"
 #include "startup.h"
 #include "text.h"
 #include "window_target.h"
@@ -36,6 +38,7 @@ void App::loadSettings() {
     state_.storageFullChosen = saved.storageFullChosen;
     state_.closeToTray = saved.closeToTray;
     state_.startMinimised = saved.startMinimised;
+    state_.signInReplay = saved.signInReplay;
     state_.sidebarCollapsed = saved.sidebarCollapsed;
     state_.updateCheck = saved.updateCheck;
     state_.lastUpdateCheck = saved.lastUpdateCheck;
@@ -53,6 +56,14 @@ void App::loadSettings() {
     // An update opens its notes once (showNotes records them as seen); a fresh install or a step back records the
     // version straight away, so the next start is not taken for an update. A build without notes does neither.
     seenVersion_ = saved.seenVersion;
+    // A fresh install (or deleted settings) starts with the welcome screen. Only when the template was really written:
+    // an unwritable folder would otherwise bring it back on every start. Until it is answered (start, skip or Esc) it
+    // stays pending (welcome_pending), so closing the window or quitting brings it back on the next start.
+    std::error_code noFile;
+    welcome_ = (config_.created() && std::filesystem::exists(configPath(), noFile)) || saved.welcomePending;
+    welcomeSeconds_ = state_.replaySeconds;
+    welcomeTray_ = state_.closeToTray;
+    welcomeUpdates_ = state_.updateCheck != UpdateChoice::Off; // On unless a restored pending screen already said off.
     if (!embeddedNotes().empty()) {
         notesDue_ = notes::showOnStart(seenVersion_, L"" REFARTER_VERSION_FULL_STRING, config_.created());
         if (!notesDue_ && seenVersion_ != L"" REFARTER_VERSION_FULL_STRING) {
@@ -66,6 +77,7 @@ void App::loadSettings() {
     }
     state_.compressCopyAfterTrim = saved.compressCopyAfterTrim;
     state_.gameColours = saved.gameColours;
+    state_.shortGameNames = saved.shortGameNames;
     player_.setCompressCopyDefault(saved.compressCopyAfterTrim);
     configureDiagnostics(saved.diagnosticLogging);
     playerVolume_ = saved.playerVolume;
@@ -74,6 +86,12 @@ void App::loadSettings() {
     // An unreadable list is reported in its menu and never overwritten.
     if (auto list = readAutoCapture(autoCapturePath())) autoCapture_ = std::move(*list);
     else autoCaptureReadable_ = false;
+    // Likewise per-game settings: unreadable or foreign, they are off for the session and the file is left alone.
+    if (auto games = readGameSettings(gameSettingsPath())) gameSettings_ = std::move(*games);
+    else gameSettingsReadable_ = false;
+    // Names the user gave games: unreadable, games keep their usual names and the file is left alone.
+    if (auto names = readGameNames(gameNamesPath())) gameNames_ = std::move(*names);
+    else gameNamesReadable_ = false;
     chimes_.prepare(saved.chimePercent);
     // A folder that has gone missing is created, or reported, when replay starts.
     clipFolder_ = saved.clipFolder.empty() ? capture::defaultClipFolder() : capture::normalisedFolder(saved.clipFolder); // No trailing separator: clips are matched to this folder by path.
@@ -97,48 +115,54 @@ bool App::configureDiagnostics(bool enabled) {
     return true;
 }
 
-bool App::toggleStartWithWindows() {
-    // Read on this explicit action; do not recreate an externally removed entry.
-    refreshStartup();
-    if (startupReadFailed_) {
-        messageBox(window_, L"windows startup settings could not be read. nothing was changed.", L"refarter", MB_OK | MB_ICONERROR);
+bool App::toggleStartWithWindows() { return applyStartupChoice(std::nullopt); }
+
+const wchar_t* App::startupRegistryKey() const { return startupKeyOverride_.empty() ? startupKey : startupKeyOverride_.c_str(); }
+
+bool App::applyStartupChoice(std::optional<bool> desired) {
+    // One fresh snapshot drives ownership, the requested value and rollback. Welcome applies a value; it must never
+    // invert an entry that changed since the screen opened. Settings remains an explicit toggle of the current entry.
+    const auto previous = readStartup(startupRegistryKey());
+    readStartupState(previous);
+    const auto fail = [&](const wchar_t* text) {
+        refreshControls(); refreshPages();
+        messageBox(window_, text, L"refarter", MB_OK | MB_ICONERROR);
         return false;
-    }
-    const bool enable = !state_.startWithWindows;
-    const auto path = executablePath();
-    const auto entry = startupCommand(path);
-    const auto previous = readStartup();
-    if (previous.error != ERROR_SUCCESS) return false;
+    };
+    if (startupReadFailed_) return fail(L"windows startup settings could not be read. nothing was changed.");
+    if (desired == false && startupOtherCopy_) return true; // This copy already does not start: nothing to change.
+    if (desired.has_value() && startupOtherCopy_) return fail(L"another copy of refarter starts with windows");
+    const bool enable = desired.value_or(!state_.startWithWindows);
+    const auto entry = startupCommand(executablePath());
     const auto previousPreference = config_.get(L"window", L"start_with_windows", L"off");
-    if (enable && !entry) {
-        messageBox(window_, L"this app path is too long for windows startup. move or install refarter in a shorter path.", L"refarter", MB_OK | MB_ICONERROR);
-        return false;
-    }
-    if (writeStartup(enable ? entry : std::nullopt) != ERROR_SUCCESS) {
-        messageBox(window_, L"windows could not update startup. your startup setting was not changed.", L"refarter", MB_OK | MB_ICONERROR);
-        return false;
-    }
-    // Keep the Windows entry and INI in step; roll back registration on write failure.
+    if (enable && !entry)
+        return fail(L"this app path is too long for windows startup. move or install refarter in a shorter path.");
+    const bool changed = enable != state_.startWithWindows;
+    if (changed && writeStartup(enable ? entry : std::nullopt, startupRegistryKey()) != ERROR_SUCCESS)
+        return fail(L"windows could not update startup. your startup setting was not changed.");
+    // Keep registration and preference in step. An already-satisfied choice never rewrites or rolls back the entry.
     if (!config_.set(L"window", L"start_with_windows", enable ? L"on" : L"off")) {
-        const auto rollback = writeStartup(previous.command.empty() ? std::nullopt : std::optional(previous.command));
+        const auto rollback = changed ? writeStartup(previous.command.empty() ? std::nullopt : std::optional(previous.command),
+                                                      startupRegistryKey()) : ERROR_SUCCESS;
         config_.set(L"window", L"start_with_windows", previousPreference);
         refreshStartup();
-        refreshControls();
-        messageBox(window_, rollback == ERROR_SUCCESS ?
-            L"your preference could not be saved. the startup change was undone." :
-            L"your preference could not be saved or startup restored. check windows startup apps.", L"refarter", MB_OK | MB_ICONERROR);
-        return false;
+        return fail(!changed ? L"your preference could not be saved. startup was not changed." :
+            rollback == ERROR_SUCCESS ? L"your preference could not be saved. the startup change was undone." :
+            L"your preference could not be saved or startup restored. check windows startup apps.");
     }
     refreshStartup();
     return true;
 }
 
-void App::refreshStartup() {
-    const auto registration = readStartup();
+void App::refreshStartup() { readStartupState(readStartup(startupRegistryKey())); }
+
+void App::readStartupState(const StartupRegistration& registration) {
     startupReadFailed_ = registration.error != ERROR_SUCCESS;
     state_.startWithWindows = !registration.command.empty();
     const auto current = startupCommand(executablePath());
     startupOtherCopy_ = state_.startWithWindows && (!current || _wcsicmp(current->c_str(), registration.command.c_str()) != 0);
+    // The welcome switch follows every read until the user flips it, and describes this copy only.
+    if (!welcomeStartupChosen_) welcomeStartup_ = state_.startWithWindows && !startupOtherCopy_;
 }
 
 UserSettings App::settings() const {
@@ -162,6 +186,7 @@ UserSettings App::settings() const {
     s.closeToTray = state_.closeToTray;
     s.startWithWindows = state_.startWithWindows;
     s.startMinimised = state_.startMinimised;
+    s.signInReplay = state_.signInReplay;
     s.sidebarCollapsed = state_.sidebarCollapsed;
     s.diagnosticLogging = state_.diagnosticLogging;
     s.updateCheck = state_.updateCheck;
@@ -169,8 +194,10 @@ UserSettings App::settings() const {
     s.availableUpdateTag = updateTag_;
     s.availableUpdateUrl = updateUrl_;
     s.seenVersion = seenVersion_;
+    s.welcomePending = welcome_; // Not answered yet (start, skip or Esc): it comes back on the next start.
     s.compressCopyAfterTrim = state_.compressCopyAfterTrim;
     s.gameColours = state_.gameColours;
+    s.shortGameNames = state_.shortGameNames;
     s.chimePercent = chimes_.percent();
     s.playerVolume = playerVolume_;
     s.autoCapture = autoCaptureOn_;
@@ -189,7 +216,8 @@ void App::saveSettings() {
 }
 
 bool App::registerHotkey(int shortcut, Hotkey hotkey) {
-    hotkeyRegistered_[shortcut] = RegisterHotKey(window_, shortcut + 1, hotkey.modifiers | MOD_NOREPEAT, hotkey.key) != FALSE;
+    // A watched-only key has nothing to register, so another app cannot hold it.
+    hotkeyRegistered_[shortcut] = watchedOnly(hotkey) || RegisterHotKey(window_, shortcut + 1, hotkey.modifiers | MOD_NOREPEAT, hotkey.key) != FALSE;
     return hotkeyRegistered_[shortcut];
 }
 
@@ -222,14 +250,14 @@ std::wstring App::describe(Hotkey hotkey) const {
 
 void App::startAssigning(int shortcut) {
     // Release the current shortcut so pressing it again reaches the window as keys. The other one stays registered.
-    if (hotkeyRegistered_[shortcut]) UnregisterHotKey(window_, shortcut + 1);
+    if (hotkeyRegistered_[shortcut]) UnregisterHotKey(window_, shortcut + 1); // Fails harmlessly for a watched-only key.
     hotkeyRegistered_[shortcut] = false;
     assigning_ = true;
     assigningShortcut_ = shortcut;
     rawHotkey_.configure(window_, {}, false);
     hotkeyNotes_[shortcut].clear();
     heldModifiers_ = currentModifiers();
-    SetFocus(control(shortcut == saveShortcut ? AssignHotkey : AssignScreenshot));
+    SetFocus(control(shortcut == saveShortcut ? (welcome_ ? WelcomeShortcut : AssignHotkey) : AssignScreenshot));
     refreshAssigning();
 }
 
@@ -247,6 +275,7 @@ void App::refreshAssigning() {
     refreshPages();    // The row's note, rebuilt from the state; the window repaints.
     InvalidateRect(control(AssignHotkey), nullptr, FALSE);
     InvalidateRect(control(AssignScreenshot), nullptr, FALSE);
+    InvalidateRect(control(WelcomeShortcut), nullptr, FALSE);
 }
 
 // A modifier went down or up while assigning: show what is held so far.

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(Refarter VERSION 1.2.0 LANGUAGES CXX)
+project(Refarter VERSION 1.3.0 LANGUAGES CXX)
 
 if(NOT WIN32)
   message(FATAL_ERROR "Refarter currently targets Windows only.")
@@ -97,6 +97,7 @@ add_library(refarter_capture STATIC
   src/capture/clip_writer.cpp
   src/capture/codec_probe.cpp
   src/capture/discord_audio.cpp
+  src/capture/downscaler.cpp
   src/capture/frame_converter.cpp
   src/capture/gpu.cpp
   src/capture/graphics_capture.cpp
@@ -107,6 +108,38 @@ add_library(refarter_capture STATIC
   src/capture/video_encoder.cpp)
 refarter_defaults(refarter_capture)
 target_include_directories(refarter_capture PUBLIC src)
+# The downscaler's shaders, compiled by fxc into byte arrays in generated/shaders, so nothing compiles at run time.
+# Visual Studio runs fxc through its shader properties, which other generators (Ninja, NMake) ignore; those run it
+# as a custom command, finding fxc on PATH (a developer prompt) or in the Windows SDK.
+set(shader_dir ${CMAKE_CURRENT_BINARY_DIR}/generated/shaders)
+if(NOT CMAKE_GENERATOR MATCHES "Visual Studio")
+  cmake_host_system_information(RESULT kits_root QUERY WINDOWS_REGISTRY
+    "HKLM/SOFTWARE/Microsoft/Windows Kits/Installed Roots" VALUE KitsRoot10)
+  file(GLOB fxc_dirs LIST_DIRECTORIES true "${kits_root}bin/10.*/x64")
+  list(SORT fxc_dirs COMPARE NATURAL ORDER DESCENDING) # The newest SDK first.
+  find_program(REFARTER_FXC fxc REQUIRED HINTS "$ENV{WindowsSdkVerBinPath}x64" ${fxc_dirs})
+endif()
+foreach(shader scale_vs:Vertex:vs:scaleVertexShader scale_ps:Pixel:ps:scalePixelShader)
+  string(REPLACE ":" ";" shader "${shader}")
+  list(GET shader 0 name)
+  list(GET shader 1 type)
+  list(GET shader 2 profile)
+  list(GET shader 3 variable)
+  set(source ${CMAKE_CURRENT_SOURCE_DIR}/src/capture/shaders/${name}.hlsl)
+  set(header ${shader_dir}/${name}.h)
+  if(CMAKE_GENERATOR MATCHES "Visual Studio")
+    target_sources(refarter_capture PRIVATE ${source})
+    set_source_files_properties(${source} PROPERTIES VS_SHADER_TYPE ${type} VS_SHADER_MODEL 4.0 VS_SHADER_ENTRYPOINT main
+      VS_SHADER_OUTPUT_HEADER_FILE ${header} VS_SHADER_VARIABLE_NAME ${variable} VS_SHADER_FLAGS "/O3")
+  else()
+    add_custom_command(OUTPUT ${header}
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
+      COMMAND ${REFARTER_FXC} /nologo /T ${profile}_4_0 /E main /O3 /Vn ${variable} /Fh ${header} ${source}
+      DEPENDS ${source} VERBATIM)
+    target_sources(refarter_capture PRIVATE ${header})
+  endif()
+endforeach()
+target_include_directories(refarter_capture PRIVATE ${shader_dir})
 target_link_libraries(refarter_capture PUBLIC refarter_diagnostics d3d11 dxgi dwmapi mfplat mfuuid mfreadwrite wmcodecdspuuid windowsapp shell32 ole32 avrt mmdevapi windowscodecs PRIVATE rnnoise)
 
 # In-app player and trimming: a minimal static FFmpeg (MP4, H.264/HEVC/AV1/AAC,
@@ -140,15 +173,21 @@ refarter_defaults(clip_combine_check)
 target_link_libraries(clip_combine_check PRIVATE refarter_player psapi)
 
 enable_language(RC)
-add_executable(Refarter WIN32 src/main.cpp src/app.cpp src/app_layout.cpp src/app_paint.cpp src/app_controls.cpp src/app_menus.cpp src/app_settings.cpp src/app_storage.cpp src/app_library.cpp src/app_meters.cpp src/app_updates.cpp src/notes_view.cpp src/update_client.cpp src/update_download.cpp src/https_get.cpp src/auto_session.cpp src/chime.cpp src/tray_icon.cpp src/compression_job.cpp src/recording_controller.cpp
-  src/clip_grid.cpp src/clip_library.cpp src/clip_sources.cpp src/game_icons.cpp src/favourites.cpp src/config.cpp src/startup.cpp src/jump_list.cpp src/auto_capture.cpp src/auto_capture_card.cpp src/tray_flyout.cpp src/value_bubble.cpp
-  src/popup_menu.cpp src/message_box.cpp src/window_target.cpp src/app_lifecycle.cpp src/leftover_files.cpp src/crash_dumps.cpp src/resources.rc)
-refarter_defaults(Refarter)
-target_sources(Refarter PRIVATE src/combine_dialog.cpp src/combine_job.cpp)
+# The app without its entry point and resources, compiled once: Refarter links these objects, and so does the test
+# that drives the real App against hidden controls (app_game_settings_test).
+add_library(refarter_app OBJECT src/app.cpp src/app_layout.cpp src/app_paint.cpp src/app_controls.cpp src/app_menus.cpp src/app_settings.cpp src/app_storage.cpp src/app_library.cpp src/app_meters.cpp src/app_updates.cpp src/notes_view.cpp src/update_client.cpp src/update_download.cpp src/https_get.cpp src/auto_session.cpp src/chime.cpp src/tray_icon.cpp src/compression_job.cpp src/recording_controller.cpp
+  src/clip_grid.cpp src/clip_library.cpp src/clip_sources.cpp src/game_icons.cpp src/favourites.cpp src/config.cpp src/startup.cpp src/jump_list.cpp src/auto_capture.cpp src/auto_capture_card.cpp src/game_settings.cpp src/game_names.cpp src/tray_flyout.cpp src/value_bubble.cpp
+  src/popup_menu.cpp src/message_box.cpp src/window_target.cpp src/app_lifecycle.cpp src/leftover_files.cpp src/crash_dumps.cpp
+  src/combine_dialog.cpp src/combine_job.cpp)
+refarter_defaults(refarter_app)
 # assets: icon, save chime and failed-save sound; config: the refarter.ini template embedded for first launch;
 # generated: version.h and the release notes.
+target_include_directories(refarter_app PUBLIC src assets config ${CMAKE_CURRENT_BINARY_DIR}/generated)
+target_link_libraries(refarter_app PUBLIC gdiplus dwmapi comctl32 ole32 msimg32 propsys winmm uxtheme windowscodecs advapi32 winhttp bcrypt refarter_capture refarter_player)
+add_executable(Refarter WIN32 src/main.cpp src/resources.rc)
+refarter_defaults(Refarter)
 target_include_directories(Refarter PRIVATE assets config ${CMAKE_CURRENT_BINARY_DIR}/generated)
-target_link_libraries(Refarter PRIVATE gdiplus dwmapi comctl32 ole32 msimg32 propsys winmm uxtheme windowscodecs advapi32 winhttp bcrypt refarter_capture refarter_player)
+target_link_libraries(Refarter PRIVATE refarter_app)
 # The shipped exe names its PDB without the build machine's path.
 if(MSVC)
   target_link_options(Refarter PRIVATE $<$<CONFIG:Release>:/PDBALTPATH:$<TARGET_PDB_FILE_NAME:Refarter>>)
@@ -160,12 +199,13 @@ target_link_libraries(refarter-record PRIVATE refarter_capture pdh psapi windows
 
 include(CTest)
 if(BUILD_TESTING)
-  foreach(test replay_duration capture_logic clip_list clip_selection hotkey config settings chime timing_trace source_names startup favourites auto_capture auto_session auto_session_wiring accent_colour clip_preview player_timeline player_zoom export_plan power_resume leftover_files save_errors startup_retry diagnostic_log compression_diagnostics trim_follow_up storage_limit audio_device_state player_view value_bubble volume_input temporary_clip trim_cancel long_path update_check update_download release_notes mp4_tracks track_workers meter_rules clip_writer codec_choice)
+  foreach(test replay_duration capture_logic clip_list clip_selection hotkey config settings chime timing_trace source_names startup favourites auto_capture game_settings game_names auto_session auto_session_wiring accent_colour clip_preview player_timeline player_zoom export_plan power_resume leftover_files save_errors startup_retry diagnostic_log compression_diagnostics trim_follow_up storage_limit audio_device_state player_view value_bubble volume_input temporary_clip trim_cancel long_path update_check update_download release_notes mp4_tracks track_workers meter_rules clip_writer codec_choice processor_step)
     add_executable(${test}_test tests/${test}_test.cpp)
     refarter_defaults(${test}_test)
     target_include_directories(${test}_test PRIVATE src)
     add_test(NAME ${test} COMMAND ${test}_test)
   endforeach()
+  target_link_libraries(processor_step_test PRIVATE windowsapp)
   target_sources(leftover_files_test PRIVATE src/leftover_files.cpp)
   target_sources(config_test PRIVATE src/config.cpp) # Config::loadFrom/set on temporary files.
   # The real downloader with httpsGet scripted by the test itself, so every answer and failure path runs offline.
@@ -177,6 +217,19 @@ if(BUILD_TESTING)
   target_link_libraries(progress_dialog_test PRIVATE user32 gdi32 comctl32 gdiplus dwmapi ole32 oleacc)
   add_test(NAME progress_dialog COMMAND progress_dialog_test)
   set_tests_properties(progress_dialog PROPERTIES TIMEOUT 15)
+  # The real App, its window and controls created hidden, with its files in a temporary folder and a stand-in recorder:
+  # the per-game settings page, start and quit paths (see the test's header).
+  add_executable(app_game_settings_test tests/app_game_settings_test.cpp)
+  refarter_defaults(app_game_settings_test)
+  target_link_libraries(app_game_settings_test PRIVATE refarter_app)
+  add_test(NAME app_game_settings COMMAND app_game_settings_test)
+  set_tests_properties(app_game_settings PROPERTIES TIMEOUT 60)
+  # The same, for sign-in replay: launches, sources, the single retry and what cancels it.
+  add_executable(app_sign_in_replay_test tests/app_sign_in_replay_test.cpp)
+  refarter_defaults(app_sign_in_replay_test)
+  target_link_libraries(app_sign_in_replay_test PRIVATE refarter_app)
+  add_test(NAME app_sign_in_replay COMMAND app_sign_in_replay_test)
+  set_tests_properties(app_sign_in_replay PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77) # 77: no display monitor.
   target_compile_definitions(chime_test PRIVATE REFARTER_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")
   target_compile_definitions(settings_test PRIVATE REFARTER_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/config")
   # Crashes copies of itself: each must leave one minidump.
@@ -217,6 +270,10 @@ if(BUILD_TESTING)
   target_link_libraries(favourites_test PRIVATE shell32 ole32 windowscodecs windowsapp)
   target_sources(auto_capture_test PRIVATE src/auto_capture.cpp)
   target_link_libraries(auto_capture_test PRIVATE shell32 ole32)
+  target_sources(game_settings_test PRIVATE src/game_settings.cpp)
+  target_link_libraries(game_settings_test PRIVATE shell32 ole32)
+  target_sources(game_names_test PRIVATE src/game_names.cpp)
+  target_link_libraries(game_names_test PRIVATE shell32 ole32)
   target_sources(auto_session_test PRIVATE src/auto_capture.cpp)
   target_link_libraries(auto_session_test PRIVATE shell32 ole32)
   # The real AutoSession against a stand-in App: starts, stops, sleep and process exit.

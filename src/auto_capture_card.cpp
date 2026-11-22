@@ -18,7 +18,7 @@ constexpr int cardWidth = 360, cardHeight = 116, margin = 16;
 void AutoCaptureCard::show(HINSTANCE instance, HMONITOR display, std::wstring label, Answered answered) {
     hide();
     if (!registerWindowClass(className, proc, 0)) return;
-    label_ = std::move(label);
+    label_ = std::move(label); // Already cut by the caller (AutoSession::showCard); "add" stores the whole name.
     answered_ = std::move(answered);
     hovered_ = 0;
     // Bottom-right of the game's display, over borderless games; it is never

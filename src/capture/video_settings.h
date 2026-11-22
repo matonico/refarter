@@ -12,6 +12,10 @@ enum class Resolution { Native, P2160, P1440, P1080, P720 };
 // H.264 plays everywhere. HEVC and AV1 need a GPU that encodes them, which is
 // checked before they can be chosen (see codec_probe.h).
 enum class Codec { H264, HEVC, AV1 };
+// HEVC and AV1 record 10-bit (P010, HEVC Main10, AV1 Main) where the GPU takes it: at the same bitrate,
+// 3-25% fewer bits for equal quality, better worst frames and less banding (issue 179). Whatever refuses
+// 10-bit falls back to 8-bit. No consumer GPU encodes 10-bit H.264.
+inline bool prefersTenBit(Codec codec) { return codec != Codec::H264; }
 // Presets size a variable bitrate to the encoded picture; Custom is a constant
 // bitrate the user picks.
 enum class Quality { Small, Balanced, High, Custom };
@@ -47,6 +51,8 @@ inline constexpr int maxFps = 60;
 inline constexpr int minBitrateMbps = 2;
 // H.264 High level 5.2 allows up to 300 Mb/s; stay below it.
 inline constexpr int maxBitrateMbps = 250;
+// Presets peak at twice their average, so the H.264 preset average stops at half the limit.
+inline constexpr int maxPresetAverageMbps = maxBitrateMbps / 2;
 inline constexpr int minReplaySeconds = 5;
 inline constexpr int maxReplaySeconds = 3600;
 // Hardware H.264 encoders commonly stop at 4096 pixels per side.
@@ -87,9 +93,10 @@ inline Size outputSize(Resolution r, Size source) {
 // replay clips at CQP 23 (1080p60: median 22.6 Mb/s, 90th percentile 39.7 Mb/s
 // across 136 clips): 19.9 Mb/s average, 39.8 Mb/s peak.
 inline constexpr double presetBitsPerPixel[] = {0.09, 0.16, 0.28};
-// Bitrate at equal picture quality relative to H.264; common estimates for
-// hardware encoders, not measured here.
-inline constexpr double codecEfficiency[] = {1.0, 0.65, 0.55};
+// Bitrate relative to H.264. Measured at equal VMAF on NVIDIA's encoders (issue 179):
+// HEVC about 1.0, AV1 about 0.87. Set lower on purpose: smaller files, a little
+// softer than H.264. AMD and Intel not measured.
+inline constexpr double codecEfficiency[] = {1.0, 0.9, 0.75};
 
 inline Bitrate bitrateFor(const VideoSettings& s, Size output) {
     if (s.quality == Quality::Custom) {
@@ -98,9 +105,10 @@ inline Bitrate bitrateFor(const VideoSettings& s, Size output) {
     }
     // Fewer frames change more between frames, so bits fall slower than fps.
     const double frames = 60.0 * std::pow(s.fps / 60.0, 0.75);
-    const double bits = presetBitsPerPixel[static_cast<int>(s.quality)] * codecEfficiency[static_cast<int>(s.codec)] *
-        output.width * output.height * frames;
-    const int average = std::clamp(static_cast<int>(bits / 1000), minBitrateMbps * 1000, maxBitrateMbps * 500);
+    // Cap the H.264 rate before the codec factor, so each codec keeps its saving at every size.
+    const double h264Kbps = std::min(presetBitsPerPixel[static_cast<int>(s.quality)] * output.width * output.height * frames / 1000,
+                                     maxPresetAverageMbps * 1000.0);
+    const int average = std::max(static_cast<int>(h264Kbps * codecEfficiency[static_cast<int>(s.codec)]), minBitrateMbps * 1000);
     return {average, average * 2, false};
 }
 

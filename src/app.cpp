@@ -14,6 +14,7 @@
 #include "startup.h"
 #include "jump_list.h"
 #include "local_file.h"
+#include "path_list.h"
 #include "window_target.h"
 #include "diagnostic_log.h"
 
@@ -74,6 +75,10 @@ void App::restoreWindow() {
     }
     ShowWindow(window_, firstStartupOpen || IsIconic(window_) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(window_);
+    if (welcome_ && firstStartupOpen) {
+        // A hidden start never focused it. Start waits while a folder check runs: then skip, so Enter still acts.
+        SetFocus(control(IsWindowEnabled(control(WelcomeStart)) ? WelcomeStart : WelcomeSkip));
+    }
     if (notesDue_) PostMessageW(window_, notesDue, 0, 0); // The first time the window shows after an update, from a hidden sign-in start too.
     if (state_.updateCheck == UpdateChoice::Ask) PostMessageW(window_, updateQuestion, 0, 0); // Asked now if this brought Refarter to the front.
     if (!queuedErrors_.empty()) PostMessageW(window_, errorDialogs, 0, 0); // Likewise the errors that waited for it.
@@ -82,6 +87,10 @@ void App::restoreWindow() {
 
 void App::quit() {
     if (closing_) return;
+    // A value typed for a game and not yet left, as saveSettings keeps all games' one. A failed save is not waited on
+    // (the window must not freeze): the status says so as Refarter closes, and the file keeps its old values. Quitting
+    // is never refused.
+    const bool unsaved = !commitScopeFields();
     saveSettings();
     closing_ = true;
     syncMeters(); // Closing: the timer and any meter-only capture end.
@@ -98,7 +107,7 @@ void App::quit() {
     }
     auto_.unwatchGameExit();
     rawHotkey_.configure(window_, {}, false);
-    setStatus(L"finishing pending saves and closing…");
+    setStatus(std::wstring(L"finishing pending saves and closing…") + (unsaved ? L" · game settings could not be saved" : L""));
     assigning_ = false;
     for (int shortcut = 0; shortcut < shortcutCount; ++shortcut) {
         if (hotkeyRegistered_[shortcut]) UnregisterHotKey(window_, shortcut + 1);
@@ -120,20 +129,28 @@ bool App::toggled(int id) const {
     case CloseToTray: return state_.closeToTray;
     case StartWithWindows: return state_.startWithWindows;
     case StartMinimised: return state_.startMinimised;
+    case SignInReplay: return state_.signInReplay;
     case DiagnosticLogging: return state_.diagnosticLogging;
     case CompressCopyAfterTrim: return state_.compressCopyAfterTrim;
     case GameColours: return state_.gameColours;
+    case ShortGameNames: return state_.shortGameNames;
     case AskBeforeBinning: return state_.askBeforeBinning;
+    case AutoCaptureStart: return autoCaptureOn_;
+    case AutoCaptureOffers: return autoCapturePrompt_;
     case UpdateCheckSwitch: return state_.updateCheck == UpdateChoice::On; // "ask" counts as off until answered.
+    case WelcomeUpdates: return welcomeUpdates_;
+    case WelcomeStartup: return welcomeStartup_;
+    case WelcomeTray: return welcomeTray_;
     default: return false;
     }
 }
 
 void App::navigate(Page page) {
+    if (welcome_) return; // The jump list or tray must not move focus off the welcome screen to a disabled button.
     if (page != Page::Library && playerOpen_) closePlayer(); // Leaving the library stops playback.
     // Move focus before hiding page controls so keyboard traversal remains usable.
     state_.page = page;
-    SetFocus(control(page == Page::Library ? Library : page == Page::Recording ? Recording : Settings));
+    if (IsWindowVisible(window_)) SetFocus(control(page == Page::Library ? Library : page == Page::Recording ? Recording : Settings));
     if (page == Page::Recording) { probeCodecs(); checkDiscordOutput(); } // Codec and Discord rows live there.
     if (page == Page::Library) clipGrid_.scan(clipFolder_); // Picks up clips added or deleted elsewhere.
     layout(); // Repaints the whole window and its children.
@@ -158,10 +175,17 @@ void App::command(int id) {
         placeControls(); // The chosen tab is taller; the empty-state text follows the view.
         redrawn = true;
         break;
-    case ThirtySeconds: state_.replaySeconds = 30; break;
-    case OneMinute: state_.replaySeconds = 60; break;
-    case ThreeMinutes: state_.replaySeconds = 180; break;
-    case FiveMinutes: state_.replaySeconds = 300; break;
+    // The replay length of the scope the page edits: all games, or the chosen game.
+    case ThirtySeconds: setScopeValue(ReplayReset, 30); break;
+    case OneMinute: setScopeValue(ReplayReset, 60); break;
+    case ThreeMinutes: setScopeValue(ReplayReset, 180); break;
+    case FiveMinutes: setScopeValue(ReplayReset, 300); break;
+    case SettingsFor: chooseSettingsFor(); break;
+    case UseDefaults: useDefaults(); break;
+    case RenameGame: renameGame(settingsFor_, knownGameName(settingsFor_, settingsForLabel_)); break;
+    case ReplayReset: case ResolutionReset: case FrameRateReset: case QualityReset: case BitrateReset: case CodecReset:
+        clearScopeValue(id);
+        break;
     case LargeTiles: case SmallTiles:
         state_.smallTiles = id == SmallTiles;
         clipGrid_.setStyle(dpi_, fontOf(Font::Body), fontOf(Font::Small), state_.smallTiles); // Repaints the tiles.
@@ -186,10 +210,16 @@ void App::command(int id) {
         break;
     case StartWithWindows:
         if (!toggleStartWithWindows()) return;
+        if (!state_.startWithWindows) cancelSignInReplay();
         break;
     case StartMinimised:
         if (!state_.startWithWindows || startupReadFailed_) return;
         state_.startMinimised = !state_.startMinimised;
+        break;
+    case SignInReplay:
+        if (!state_.startWithWindows || startupReadFailed_) return;
+        state_.signInReplay = !state_.signInReplay;
+        if (!state_.signInReplay) cancelSignInReplay(); // A retry still waiting must not start replay.
         break;
     case DiagnosticLogging:
         if (!configureDiagnostics(!state_.diagnosticLogging)) {
@@ -218,9 +248,18 @@ void App::command(int id) {
         state_.gameColours = !state_.gameColours;
         clipGrid_.setGameColours(state_.gameColours);
         break;
+    case ShortGameNames: state_.shortGameNames = !state_.shortGameNames; break; // Names are worked out as they are shown.
     case AskBeforeBinning:
         state_.askBeforeBinning = !state_.askBeforeBinning;
         clipGrid_.setAskBeforeBinning(state_.askBeforeBinning);
+        break;
+    case AutoCaptureStart:
+        autoCaptureOn_ = !autoCaptureOn_;
+        auto_.updateHook();
+        break;
+    case AutoCaptureOffers:
+        autoCapturePrompt_ = !autoCapturePrompt_;
+        auto_.updateHook();
         break;
     case UpdateCheckSwitch:
         state_.updateCheck = state_.updateCheck == UpdateChoice::On ? UpdateChoice::Off : UpdateChoice::On;
@@ -253,16 +292,28 @@ void App::command(int id) {
         break;
     case QualityPreset: chooseQuality(); break;
     case VideoCodec: chooseCodec(); break;
-    case ChooseFolder: chooseFolder(); break;
+    case ChooseFolder: case WelcomeFolder: chooseFolder(); break;
+    case WelcomeAuto: case WelcomeManual:
+        welcomeAutomatic_ = id == WelcomeAuto;
+        refreshControls(); // Their names carry the choice for screen readers.
+        InvalidateRect(control(WelcomeAuto), nullptr, FALSE);
+        InvalidateRect(control(WelcomeManual), nullptr, FALSE);
+        return;
+    case WelcomeShortcut: if (!assigning_) startAssigning(saveShortcut); break;
+    case WelcomeUpdates: welcomeUpdates_ = !welcomeUpdates_; break;
+    case WelcomeStartup:
+        if (startupReadFailed_ || startupOtherCopy_) return; // Disabled then (refreshControls).
+        welcomeStartup_ = !welcomeStartup_;
+        welcomeStartupChosen_ = true;
+        break;
+    case WelcomeTray: welcomeTray_ = !welcomeTray_; break;
+    case WelcomeLength: chooseWelcomeLength(); return; // Kept in memory until start, like the switches.
+    case WelcomeSkip: case WelcomeStart: finishWelcome(id == WelcomeStart); return;
     case OpenFolder:
         if (!clipFolder_.empty())
             shellOpen(clipFolder_.c_str(), L"the folder is not available yet. choose a folder in settings or start replay first.", MB_ICONINFORMATION);
         break;
     default: return;
-    }
-    if (id >= ThirtySeconds && id <= FiveMinutes) {
-        state_.replayInputValid = true;
-        setTextIfChanged(control(CustomSeconds), std::to_wstring(state_.replaySeconds));
     }
     if (contains(toggleIds, id)) {
         // A switch: slide it now; the ini write and the other controls follow once it has painted.
@@ -279,15 +330,99 @@ void App::command(int id) {
     refreshPages();
 }
 
-void App::afterToggleChanged(int) {
+// Start or skip (Esc too). Start applies the choices; skip leaves auto-capture as it is and the update choice unmade,
+// so the opt-in question still comes. The folder and shortcut were applied when chosen. Either way the screen is gone.
+void App::finishWelcome(bool start) {
+    if (!welcome_ || closing_) return;
+    if (assigning_) finishAssigning(std::nullopt);
+    welcome_ = false;
+    bool trayRefused = false, startupChange = false;
+    if (start) {
+        state_.updateCheck = welcomeUpdates_ ? UpdateChoice::On : UpdateChoice::Off;
+        // Automatically: listed games start replay and new fullscreen games are offered. Set here, so an unreadable
+        // list or a save under way (useAutoCapture declines then) still keeps the choice.
+        autoCaptureOn_ = autoCapturePrompt_ = welcomeAutomatic_;
+        state_.replaySeconds = welcomeSeconds_; // All games: a fresh install has no game of its own yet.
+        syncField(CustomSeconds);
+        // As the Settings switch: without a tray icon, closing would leave no way back, so it stays off.
+        if (welcomeTray_ != state_.closeToTray) {
+            if (welcomeTray_ && !addTrayIcon()) trayRefused = true; // Said once the screen is gone (below).
+            else {
+                state_.closeToTray = welcomeTray_;
+                if (!state_.closeToTray && !startupTray_) removeTrayIcon();
+            }
+        }
+        // Only a switch the user flipped touches the Run entry (another copy's entry, or one read after the screen
+        // opened, is left alone). Changed once the screen is gone (below): a refusal opens a dialog.
+        startupChange = welcomeStartupChosen_; // Ownership and current state are re-read when applying the choice.
+    }
+    if (start && welcomeAutomatic_ && canUseAutoCapture()) {
+        useAutoCapture(); // Also saves (the update choice too), refreshes, updates the hook and looks at the window in front.
+    } else {
+        auto_.updateHook(); // Auto-capture waited for the welcome screen (autoContext).
+        PostMessageW(window_, AutoSession::foregroundCheck, 0, 0);
+        // "Automatically" was kept above but could not take over (replay, a save or sleep, or the list is
+        // unreadable): say so rather than "ready", which would claim the remembered source was let go.
+        if (start && welcomeAutomatic_)
+            setStatus(!autoCaptureReadable_ ? L"auto-capture is on · its game list could not be read" :
+                      recording_ != capture::RecorderState::Off ? L"auto-capture is on · choose use auto-capture once replay is idle" :
+                                                                  L"auto-capture is on · choose use auto-capture once refarter is idle");
+        saveSettings(); // Only what changed: the update choice, or the auto-capture switches.
+        refreshControls();
+    }
+    navigate(start && !welcomeAutomatic_ ? Page::Recording : Page::Library); // Lays out and repaints everything.
+    if (trayRefused) // As the Settings switch says it; a status would be replaced by the auto-capture one.
+        messageBox(window_, L"windows could not create the tray icon. refarter will stay open.", L"refarter", MB_OK | MB_ICONERROR);
+    if (closing_) return; // Quit from the tray while that box was open: nothing more to apply.
+    if (startupChange && applyStartupChoice(welcomeStartup_)) refreshControls(); // Writes the Run entry and the ini; says why it could not.
+    scheduleUpdateCheck(startupUpdateDelay);
+    resumeHeldDialogs(); // The opt-in question after a skip, and anything else that waited.
+}
+
+void App::afterToggleChanged(int id) {
     if (closing_) return;
+    // Kept in memory until start: only their names change.
+    if (id == WelcomeUpdates || id == WelcomeStartup || id == WelcomeTray) { refreshControls(); return; }
     saveSettings();
     refreshControls();
     refreshPages(); // The noise gate adds or removes rows; discord and the startup note change text in place.
 }
 
+namespace {
+// A monitor's size; null: the main screen. Without an answer, 1080p.
+capture::Size monitorSize(HMONITOR monitor) {
+    MONITORINFO info{sizeof(info)};
+    if (GetMonitorInfoW(monitor ? monitor : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &info))
+        return {info.rcMonitor.right - info.rcMonitor.left, info.rcMonitor.bottom - info.rcMonitor.top};
+    return {1920, 1080};
+}
+constexpr ULONGLONG measureReuseMs = 250; // One refresh asks for the size several times; the window is measured once.
+} // namespace
+
 capture::Size App::sourceSize() const {
+    // Typing in a number field refreshes the page on each key: the game's window is measured once per refresh rather
+    // than for each estimate, so a busy game is asked as little as possible.
+    const HWND window = target_.source.window;
+    const auto now = GetTickCount64();
+    if (window && window == measuredWindow_ && now - measuredAt_ < measureReuseMs) return measuredSize_;
+    measuredSize_ = measureSource();
+    measuredWindow_ = window;
+    measuredAt_ = now;
+    return measuredSize_;
+}
+
+capture::Size App::measureSource() const {
     if (const HWND window = target_.source.window) {
+        // A game's size is kept for this session, so its own settings' estimates describe it after the source changes.
+        // Only a new game or size is written, so the many estimate redraws cost a comparison, not a map insert.
+        const auto seen = [&](capture::Size size) {
+            if (!target_.path.empty() && (size != sizedGameSize_ || !samePath(target_.path, sizedGamePath_))) {
+                sizedGamePath_ = target_.path;
+                sizedGameSize_ = size;
+                gameSizes_[lower(target_.path)] = size;
+            }
+            return size;
+        };
         RECT client{};
         if (!IsIconic(window) && GetClientRect(window, &client) && client.right >= 2 && client.bottom >= 2) {
             // Its frame is kept for when it is minimised: measured, so DPI and custom frames do not matter.
@@ -296,7 +431,7 @@ capture::Size App::sourceSize() const {
                 sizedWindow_ = window;
                 sizedFrame_ = {(outer.right - outer.left) - client.right, (outer.bottom - outer.top) - client.bottom};
             }
-            return {client.right, client.bottom};
+            return seen({client.right, client.bottom});
         }
         // A minimised window has no client area: the size it restores to, less its frame (measured when last seen, or
         // else estimated). One that restores maximised, or whose size cannot be read, falls back to its monitor.
@@ -314,18 +449,22 @@ capture::Size App::sourceSize() const {
             const RECT& normal = placement.rcNormalPosition;
             const int width = (normal.right - normal.left) - frame.width;
             const int height = (normal.bottom - normal.top) - frame.height;
-            if (width >= 2 && height >= 2) return {width, height};
+            if (width >= 2 && height >= 2) return seen({width, height});
         }
     }
-    MONITORINFO info{sizeof(info)};
-    const auto monitor = target_.source.window ? MonitorFromWindow(target_.source.window, MONITOR_DEFAULTTOPRIMARY) :
-        target_.source.monitor ? target_.source.monitor : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
-    if (GetMonitorInfoW(monitor, &info)) return {info.rcMonitor.right - info.rcMonitor.left, info.rcMonitor.bottom - info.rcMonitor.top};
-    return {1920, 1080};
+    return monitorSize(target_.source.window ? MonitorFromWindow(target_.source.window, MONITOR_DEFAULTTOPRIMARY) : target_.source.monitor);
 }
 
-capture::Size App::encodedSize() const {
-    return capture::outputSize(video_.resolution, sourceSize());
+capture::Size App::encodedSize(const capture::VideoSettings& video, std::optional<capture::Size> size) const {
+    return capture::outputSize(video.resolution, size ? *size : sourceSize());
+}
+
+App::ScopeSize App::scopeSize() const {
+    // All games or the source's own game: the source. Another game: its size as last seen this session, else the
+    // main screen's (most games run fullscreen), so the page's estimates describe the game being edited.
+    if (!gameScope() || scopeIsSource()) return {sourceSize(), false};
+    if (const auto found = gameSizes_.find(lower(settingsFor_)); found != gameSizes_.end()) return {found->second, false};
+    return {monitorSize(nullptr), true};
 }
 
 void App::probeCodecs() {
@@ -354,11 +493,25 @@ void App::checkDiscordOutput() {
     discordSharesOutput_ = audio_.desktop.mode == capture::AudioDevice::Mode::Fixed && capture::discordPlaysOn(audio_.desktop.id);
 }
 
-bool App::startReplay() {
+bool App::startReplay(bool userStart) {
+    if (userStart) cancelSignInReplay(); // The user took over: the sign-in start's retry must not start a replay later.
     if (busy_ || closing_ || endingSession_ || recording_ != capture::RecorderState::Off) return false;
     revalidateMonitor(); // The displays may have changed since the choice (wake, hotplug): never start on a stale handle.
-    if ((!target_.source.window && !target_.source.monitor) || !state_.replayInputValid ||
-        (!bitrateValid_ && video_.quality == capture::Quality::Custom) ||
+    // A start the user asked for counts as leaving a game's number field, as saveSettings below does for all games. If
+    // the source's own values could not be saved, nothing starts: recording the old ones while the page shows the new
+    // would be a silent swap. The typed values stay, and the status says why. An automatic start (auto-capture, a
+    // restart after sleep) never stores half-typed text: it records what is stored, and the typing goes on.
+    // Another game's value that could not be saved does not stop this start, but the status still says so.
+    bool unsaved = false;
+    if (userStart && !commitScopeFields()) {
+        if (scopeIsSource()) return false;
+        unsaved = true;
+    }
+    // Every start (manual, auto-capture, restart) comes here: a game window with its own values records with them.
+    bool own = false;
+    std::optional<capture::Codec> refused;
+    const auto video = sourceVideo(&own, &refused);
+    if ((!target_.source.window && !target_.source.monitor) || !fieldsReady(video) ||
         (audio_.microphone.enabled() && audio_.micFilters.noiseGate && !gateInputValid())) return false;
     video_.replaySeconds = state_.replaySeconds;
     saveSettings(); // Number fields are written when left; starting a replay counts as leaving them.
@@ -366,15 +519,348 @@ bool App::startReplay() {
     closeMeterCaptures(); // Hand the devices over: the recorder opens its own and feeds the same meters.
     audio_.desktopMeter = &desktopMeter_;
     audio_.microphoneMeter = &microphoneMeter_;
+    session_ = video;
+    sessionOwn_ = own;
+    // Never a silent swap: the started status says the game's codec was replaced.
+    startNote_ = refused ? std::wstring(capture::codecName(*refused)) + L" failed this pc's check · recording h.264" : std::wstring{};
+    if (unsaved) startNote_ += std::wstring(startNote_.empty() ? L"" : L" · ") + L"game settings could not be saved";
+    // Only that a game's own values were used (and whether its codec fell back): no path or name, like the rest of the log.
+    if (own) diagnosticLog().write(DiagnosticEvent::GameSettingsUsed, S_OK, refused ? 1u : 0u);
     // A minimised game is waited for (up to ten seconds) until it is restored.
-    setStatus(target_.source.window && IsIconic(target_.source.window) ?
-        L"return to your game · waiting for capture…" : L"starting replay…");
-    recorder_->start(target_, video_, audio_, clipFolder_);
+    setStatus(std::wstring(target_.source.window && IsIconic(target_.source.window) ?
+        L"return to your game · waiting for capture…" : L"starting replay…") + (unsaved ? L" · game settings could not be saved" : L""));
+    recorder_->start(target_, video, audio_, clipFolder_);
     return true;
+}
+
+const GameVideo* App::gameOwn(const std::wstring& path) const {
+    if (!gameSettingsReadable_ || path.empty()) return nullptr;
+    const auto* entry = gameSettings_.find(path);
+    return entry ? &entry->video : nullptr;
+}
+
+const GameSettingsEntry* App::scopeEntry() const {
+    return gameScope() ? gameSettings_.find(settingsFor_) : nullptr;
+}
+
+capture::VideoSettings App::scopeVideo() const {
+    const auto* entry = scopeEntry();
+    auto video = resolveVideo(video_, state_.replaySeconds, entry ? &entry->video : nullptr);
+    // What is being typed for the game shows at once, as all games' values do; commitScopeFields clears these before
+    // it compares, so a stored value is still only what the game sets.
+    if (typedSeconds_) video.replaySeconds = *typedSeconds_;
+    if (typedBitrate_) video.bitrateMbps = *typedBitrate_;
+    return video;
+}
+
+capture::VideoSettings App::sourceVideo(bool* own, std::optional<capture::Codec>* refused) const {
+    // A monitor records with the all-games values; so does a game without its own (see startVideo).
+    const auto start = startVideo(video_, state_.replaySeconds, target_.source.window ? gameOwn(target_.path) : nullptr, codecs_);
+    if (own) *own = start.own;
+    if (refused) *refused = start.refused;
+    return start.video;
+}
+
+capture::VideoSettings App::scopeRecordVideo(std::optional<capture::Codec>* refused) const {
+    auto video = scopeVideo();
+    // Only a game's own codec falls back here; all games' choice is changed by the codec check itself.
+    const auto fallback = refusedCodec(scopeEntry() != nullptr, video.codec, codecs_);
+    if (refused) *refused = fallback;
+    if (fallback) video.codec = capture::Codec::H264;
+    return video;
+}
+
+capture::VideoSettings App::recordingVideo() const {
+    return recording_ != capture::RecorderState::Off ? session_ : sourceVideo();
+}
+
+namespace {
+// The value a reset arrow names: videoResetIds is in GameValue's order.
+GameValue valueOf(int reset) {
+    const auto found = std::find(std::begin(videoResetIds), std::end(videoResetIds), reset);
+    return static_cast<GameValue>(found - std::begin(videoResetIds));
+}
+} // namespace
+
+bool App::scopeOwns(int reset) const {
+    const auto* entry = scopeEntry();
+    return entry && contains(videoResetIds, reset) && ownValue(entry->video, valueOf(reset)).has_value();
+}
+
+bool App::scopeIsSource() const {
+    return gameScope() && target_.source.window && samePath(settingsFor_, target_.path);
+}
+
+bool App::fieldsReady(const capture::VideoSettings& video) const {
+    // The number fields stop a start only while they edit what it records with (see fieldsAllowStart). The bitrate
+    // field is hidden unless the page's scope records at custom quality, and a hidden field can never block a start.
+    const bool allGames = !gameScope();
+    const auto* sourceOwn = target_.source.window ? gameOwn(target_.path) : nullptr;
+    const bool bitrateValid = bitrateValid_ || scopeVideo().quality != capture::Quality::Custom;
+    return fieldsAllowStart(allGames || scopeIsSource(), allGames, sourceOwn, video.quality, state_.replayInputValid, bitrateValid);
+}
+
+bool App::commitScopeFields() {
+    // A game's typed length and bitrate are stored once the field is left (or replay starts), as all games' are
+    // written to refarter.ini then: typing 40 never stores 4 on the way. Both go in one write, so it keeps both or
+    // neither; on failure they stay typed and the status says so.
+    if (!gameScope() || (!typedSeconds_ && !typedBitrate_)) {
+        typedSeconds_.reset();
+        typedBitrate_.reset();
+        return true;
+    }
+    const auto* entry = scopeEntry();
+    const GameVideo current = entry ? entry->video : GameVideo{};
+    const auto allGames = resolveVideo(video_, state_.replaySeconds, nullptr);
+    auto own = current;
+    if (typedSeconds_) own = chooseValue(own, GameValue::ReplaySeconds, *typedSeconds_, allGames);
+    if (typedBitrate_) own = chooseValue(own, GameValue::Bitrate, *typedBitrate_, allGames);
+    if (own != current && !storeScope(std::move(own))) return false;
+    typedSeconds_.reset();
+    typedBitrate_.reset();
+    return true; // The caller refreshes the page once (leaving a field, a scope change, a start).
+}
+
+void App::setScopeValue(int reset, int value) {
+    if (!gameScope()) {
+        // All games: as before, in the settings written to refarter.ini by the caller.
+        // The length lives in state_ (the presets and the custom field), the rest in video_.
+        if (reset == ReplayReset) state_.replaySeconds = value;
+        else setVideoValue(video_, valueOf(reset), value);
+        if (reset == ReplayReset) syncField(CustomSeconds); // A preset: the custom field shows the new length.
+        if (reset == QualityReset && video_.quality != capture::Quality::Custom) {
+            // A quality off custom hides the bitrate row: its text and validity go back to the stored rate, and games
+            // that inherited custom quality drop their own bitrate (it belongs to custom quality, see chooseValue).
+            syncField(Bitrate);
+            auto list = gameSettings_;
+            if (gameSettingsReadable_ && list.dropUnusedBitrates(resolveVideo(video_, state_.replaySeconds, nullptr))) {
+                if (writeGameSettings(gameSettingsPath(), list)) gameSettings_ = std::move(list);
+                else setStatus(L"game settings could not be saved");
+            }
+        }
+        return;
+    }
+    // All games' value clears the game's own one rather than saving a copy (see chooseValue). A failed write: what was
+    // typed stays (the status says why).
+    const auto* entry = scopeEntry();
+    const GameVideo current = entry ? entry->video : GameVideo{};
+    auto own = chooseValue(current, valueOf(reset), value, resolveVideo(video_, state_.replaySeconds, nullptr));
+    if (own == current) {
+        // No change: a preset still puts its length in the field, but the quality already chosen keeps a typed
+        // bitrate (custom again must not undo 70 typed but not yet saved).
+        if (reset == ReplayReset) syncField(CustomSeconds);
+        return;
+    }
+    if (storeScope(std::move(own))) syncFieldsFor(reset);
+}
+
+void App::syncFieldsFor(int reset) {
+    // Only the number field the change touched: a quality change can drop or hide the game's bitrate.
+    if (reset == ReplayReset) syncField(CustomSeconds);
+    else if (reset == BitrateReset || reset == QualityReset) syncField(Bitrate);
+}
+
+void App::clearScopeValue(int reset) {
+    const auto* entry = scopeEntry();
+    if (!entry) return;
+    // Clearing the game's quality applies the same bitrate rule as choosing one (see clearValue).
+    // Not saved: the arrow stays, and so does the focus, so the press can be tried again.
+    if (!storeScope(clearValue(entry->video, valueOf(reset), resolveVideo(video_, state_.replaySeconds, nullptr)))) return;
+    syncFieldsFor(reset);
+    // The arrow hides with the value it cleared: keyboard focus stays on the row.
+    if (GetFocus() == control(reset)) SetFocus(control(controlOfReset(reset)));
+}
+
+bool App::storeScope(GameVideo video) {
+    if (!gameScope()) return false;
+    auto list = gameSettings_;
+    // A game already in the file keeps its stored name: names are display only and never rewritten.
+    const auto* stored = list.find(settingsFor_);
+    list.set(settingsFor_, stored ? stored->label : settingsForLabel_, std::move(video)); // All values empty: the game is removed.
+    // The values change only once they are safely on disk, as the auto-capture list does.
+    if (!writeGameSettings(gameSettingsPath(), list)) {
+        setStatus(L"game settings could not be saved");
+        return false;
+    }
+    gameSettings_ = std::move(list);
+    return true;
+}
+
+void App::useDefaults() {
+    // No values at all removes the game (see GameSettingsList::set).
+    if (!scopeEntry() || !storeScope({})) return;
+    syncScopeFields();
+    // The scope stays on the game, now following all games; the button hides.
+    if (GetFocus() == control(UseDefaults)) SetFocus(control(SettingsFor));
+}
+
+bool App::setScope(std::wstring path, std::wstring label) {
+    // A value typed for the previous game is kept before the page moves on; if it cannot be saved, the page stays on
+    // that game with the value still typed (the status says why).
+    if (!commitScopeFields()) return false;
+    settingsFor_ = std::move(path);
+    settingsForLabel_ = oneLineLabel(std::move(label)); // A window title may hold a tab or line break.
+    syncScopeFields();
+    return true;
+}
+
+std::wstring App::knownGameName(const std::wstring& path, std::wstring fallback) const {
+    if (path.empty()) return fallback;
+    if (const auto* game = autoCapture_.find(path)) return game->label;
+    if (const auto* entry = gameSettings_.find(path)) return entry->label;
+    return fallback;
+}
+
+std::wstring App::storedGameName(const RecordingTarget& window) const {
+    return knownGameName(window.path, friendlySourceName(window.title, window.name));
+}
+
+std::wstring App::displayGameName(const std::wstring& path, const std::wstring& stored) const {
+    // A name the user gave is never turned into a short name; like every name, it is lower case and cut where shown
+    // (shownName: menus, the footer and the tray stop at 48 characters, the field allows maxCustomGameName).
+    if (const auto* custom = path.empty() ? nullptr : gameNames_.find(path)) return lower(custom->name);
+    return automaticGameName(path, stored);
+}
+
+std::wstring App::automaticGameName(const std::wstring& path, const std::wstring& stored) const {
+    return state_.shortGameNames ? gameName(stored, path) : lower(stored);
+}
+
+void App::renameGame(std::wstring path, std::wstring stored) {
+    if (closing_ || dialogOpen() || !canRename(path)) return; // Another dialog (or this one) is open: it waits.
+    const auto* custom = gameNames_.find(path);
+    // Cut as it would be kept, so the field never holds more than can be saved.
+    std::wstring name = custom ? custom->name : customGameName(automaticGameName(path, stored));
+    // Only the title: the field and its buttons say what happens. Clearing the field brings back the usual name.
+    std::optional<std::wstring> typed;
+    {
+        // The dialog pumps the App's messages: a queued error or question waits until it closes (dialogOpen), then opens.
+        renamingGame_ = true;
+        struct Done { App& app; ~Done() { app.renamingGame_ = false; app.resumeHeldDialogs(); } } done{*this};
+        if (answerName_) typed = answerName_(name);
+        else if (nameBox(window_, L"", L"rename game", L"save", name, static_cast<int>(maxCustomGameName))) typed = std::move(name);
+    }
+    if (!typed || closing_) return;
+    // The usual name typed back (or saved unchanged) is no custom name: it keeps following "short game names".
+    // Compared as cut, as the field offered it: a usual name over 80 characters is offered cut.
+    if (lower(customGameName(*typed)) == customGameName(automaticGameName(path, stored))) typed->clear();
+    setGameName(path, std::move(*typed));
+}
+
+bool App::setGameName(const std::wstring& path, std::wstring name) {
+    if (!canRename(path)) return false;
+    name = customGameName(std::move(name)); // Empty: the game's own name is used again.
+    const auto* current = gameNames_.find(path);
+    if (current ? current->name == name : name.empty()) return true;
+    auto names = gameNames_;
+    names.set(path, std::move(name));
+    const bool saved = writeGameNames(gameNamesPath(), names);
+    if (saved) gameNames_ = std::move(names);
+    else setStatus(L"game names could not be saved · the name was not changed");
+    // Names are worked out as they are shown: the page, the footer and the tray tip only need drawing again.
+    refreshControls();
+    refreshPages();
+    updateTrayTip();
+    InvalidateRect(window_, nullptr, FALSE);
+    return saved;
+}
+
+std::wstring App::shownSourceName(const RecordingTarget& source) const {
+    // A monitor's label is short and its end ("· primary") matters: it is shown whole, as before.
+    if (!source.source.window) return lower(source.displayName.empty() ? source.name : source.displayName);
+    auto name = displayGameName(source.path, storedGameName(source));
+    auto suffix = pickerSuffix(source.displayName, source.name);
+    // A label saved before short names may already end with the suffix, or with its executable part.
+    if (name.ends_with(suffix)) suffix.clear();
+    else if (const auto next = suffix.find(L" · ", 3); next != std::wstring::npos && name.ends_with(std::wstring_view(suffix).substr(0, next)))
+        suffix.erase(0, next);
+    if (suffix.size() > 24) {
+        // "· window N" is what tells the windows apart: a long executable name gives way first.
+        const auto window = suffix.rfind(L" · window ");
+        const auto ordinal = window == std::wstring::npos ? std::wstring{} : suffix.substr(window);
+        suffix = shownName(std::wstring_view(suffix).substr(0, suffix.size() - ordinal.size()), 24 - std::min<std::size_t>(ordinal.size(), 16)) + ordinal;
+    }
+    // The suffix is what tells the windows apart, so the name gives way: 48 characters in all.
+    return shownName(name, suffix.empty() ? 48 : 48 - suffix.size()) + suffix;
+}
+
+void App::syncField(int id) {
+    if (!control(id)) return;
+    const bool length = id == CustomSeconds;
+    (length ? typedSeconds_ : typedBitrate_).reset(); // The field now shows the stored value: nothing typed is waiting.
+    const auto shown = scopeVideo();
+    // Setting the text raises EN_CHANGE; syncingFields_ keeps that from counting as an edit.
+    syncingFields_ = true;
+    setTextIfChanged(control(id), std::to_wstring(length ? shown.replaySeconds : shown.bitrateMbps));
+    syncingFields_ = false;
+    (length ? state_.replayInputValid : bitrateValid_) = true;
+}
+
+void App::syncScopeFields() {
+    syncField(CustomSeconds);
+    syncField(Bitrate);
+}
+
+void App::followSource() {
+    const std::wstring source = target_.source.window ? target_.path : std::wstring{};
+    // Only a change of source moves the page: choosing the same game again keeps the scope the user picked since (an
+    // automatic start never moves the page, so scopeSource_ is the source the user last chose).
+    if (samePath(source, scopeSource_)) return;
+    // A new source with its own values opens on them; anything else (a monitor too) on all games. Only once the page has
+    // moved is the source remembered: if a typed value could not be saved, the next source change tries again.
+    const auto* entry = source.empty() || !gameSettingsReadable_ ? nullptr : gameSettings_.find(source);
+    if (!setScope(entry ? entry->path : std::wstring{}, entry ? entry->label : std::wstring{})) return;
+    scopeSource_ = source;
+    if (!control(StartReplay)) return;
+    refreshControls();
+    refreshPages();
+}
+
+void App::cancelSignInReplay() {
+    signInPending_ = false;
+    KillTimer(window_, signInReplayTimer);
+    // The retry is used up, but a sign-in start already in flight stays one: its failure is still a status, not a dialog.
+    signInRetried_ = true;
+}
+
+// Sign-in replay: only the remembered whole monitor (a game starts through auto-capture instead). Never a dialog, as
+// the window is usually hidden: a failure is a status, and one retry covers displays and drivers still settling.
+void App::startSignInReplay() {
+    // KillTimer leaves already-queued WM_TIMER messages behind. Only a still-pending request may start anything.
+    if (!std::exchange(signInPending_, false)) return;
+    if (welcome_) { cancelSignInReplay(); return; } // No unattended recording before onboarding is answered.
+    KillTimer(window_, signInReplayTimer);
+    if (closing_ || endingSession_ || !state_.signInReplay || !state_.startWithWindows) return; // Switched off meanwhile.
+    // The user or auto-capture got there first, or the source is no longer the remembered monitor: nothing to say.
+    if (recording_ != capture::RecorderState::Off || sourceMonitor_.empty() || target_.source.window) return;
+    if (asleep_ || busy_) {
+        signInReplayFailed({}); // May pass, as a monitor not yet ready does.
+    } else {
+        signInReplay_ = true; // Only until this start's Started event: another start is never taken for it.
+        // On success the Started event says how it went (see signInReplayFailed).
+        if (!startReplay(false)) {
+            signInReplay_ = false;
+            // startReplay looked for the monitor again. Only one not yet connected is worth a retry; invalid settings would fail again.
+            if (!target_.source.monitor) signInReplayFailed(L"the monitor from last time is not connected");
+            else setStatus(L"replay could not start at sign-in · check the replay settings");
+        }
+    }
+    refreshControls(); // "starting…" or the status, even with the window open.
+    refreshPages();
+}
+
+// A sign-in start failed for a reason that may pass (monitor not ready, capture refused): one retry, then a status.
+void App::signInReplayFailed(const std::wstring& reason) {
+    signInReplay_ = false;
+    const bool retry = !std::exchange(signInRetried_, true);
+    signInPending_ = retry && SetTimer(window_, signInReplayTimer, signInRetryMs, nullptr) != 0;
+    setStatus((reason.empty() ? std::wstring(L"replay could not start at sign-in") : reason) +
+                (signInPending_ ? L" · trying again shortly" : L" · enable replay"));
 }
 
 void App::stopReplay() {
     if (busy_ || closing_ || recording_ == capture::RecorderState::Off) return;
+    cancelSignInReplay();
     auto_.onManualStop(target_, recording_ == capture::RecorderState::Buffering);
     busy_ = true;
     setStatus(L"stopping replay…");
@@ -382,13 +868,19 @@ void App::stopReplay() {
 }
 
 AutoSession::Context App::autoContext() const {
-    return {closing_ || endingSession_, busy_ || asleep_, recording_, &target_, autoCaptureOn_, autoCapturePrompt_, autoCaptureReadable_, &autoCapture_};
+    // Nothing starts or is offered until the welcome screen is answered, including after a hidden sign-in start that
+    // has not shown it yet or a close to the tray: the user has not chosen how recording should start. Opening the
+    // window (or any tray command) shows the screen again.
+    const bool waiting = welcome_;
+    return {closing_ || endingSession_, busy_ || asleep_, recording_, &target_, autoCaptureOn_ && !waiting, autoCapturePrompt_ && !waiting,
+            autoCaptureReadable_, &autoCapture_};
 }
 
 bool App::startAutoReplay(RecordingTarget target) {
     auto previous = std::move(target_);
     target_ = std::move(target);
-    if (startReplay()) return true;
+    // An automatic start leaves the page alone: the user may be typing in it, and the page locks while replay runs.
+    if (startReplay(false)) return true;
     target_ = std::move(previous);
     return false;
 }
@@ -406,6 +898,8 @@ AutoSession::Host App::autoHost() {
     host.stop = [this] { busy_ = true; recorder_->stop(); };
     host.status = [this](std::wstring text) { setStatus(std::move(text)); };
     host.add = [this](const std::wstring& path, const std::wstring& label) { setAutoCaptured(path, label, true); };
+    host.name = [this](const RecordingTarget& target) { return storedGameName(target); };
+    host.shown = [this](const std::wstring& path, const std::wstring& stored) { return shownName(displayGameName(path, stored)); };
     host.decline = [this](const std::wstring& path) { declineGame(path); };
     host.refresh = [this] { refreshControls(); InvalidateRect(window_, nullptr, FALSE); };
     host.hideFlyout = [this] { trayFlyout_.hide(); };
@@ -440,7 +934,8 @@ void App::useAutoCapture() {
     // Recheck after a menu closes: an automatic start or shutdown may have happened inside it.
     if (!canUseAutoCapture()) return;
     target_ = {};
-    sourceMonitor_.clear();
+    setSourceMonitor({});
+    followSource();
     autoCaptureOn_ = true;
     saveSettings(); // Forget the remembered monitor too, including after relaunch.
     auto_.updateHook();
@@ -458,12 +953,23 @@ void App::trayCommand(TrayCommand command) {
     switch (command) {
     case TrayCommand::Open: restoreWindow(); return;
     case TrayCommand::Quit: quit(); return;
+    default:
+        if (welcome_) { restoreWindow(); return; } // Nothing else runs until the welcome screen is answered: it opens instead.
+        break;
+    }
+    switch (command) {
     case TrayCommand::UseAutoCapture: useAutoCapture(); return;
     case TrayCommand::AutoCapture: {
         if (!detected) return;
         const bool listed = autoCapture_.find(auto_.detected().path) != nullptr;
-        setAutoCaptured(auto_.detected().path, auto_.detected().displayName, !listed);
-        if (!listed) auto_.tryAutoCapture(auto_.detected()); // Added while it runs: start now, as if it came to the front.
+        auto target = auto_.detected();
+        // A game with own settings keeps that name; another gets its short name.
+        setAutoCaptured(target.path, storedGameName(target), !listed);
+        if (!listed) {
+            // Added while it runs: start now, as if it came to the front, under its name on the list (if it was saved).
+            target.displayName = knownGameName(target.path, target.displayName);
+            auto_.tryAutoCapture(std::move(target));
+        }
         break;
     }
     case TrayCommand::Action:
@@ -471,7 +977,8 @@ void App::trayCommand(TrayCommand command) {
         else {
             if (!target_.source.window && !target_.source.monitor && detected) {
                 target_ = auto_.detected();
-                sourceMonitor_.clear();
+                setSourceMonitor({});
+                followSource();
             }
             if (!startReplay()) report(L"replay could not start. check the source and replay settings in refarter.", MB_ICONINFORMATION);
         }
@@ -485,8 +992,9 @@ void App::trayCommand(TrayCommand command) {
 App::SessionLine App::sessionLine() const {
     using State = SessionLine::State;
     SessionLine line;
-    const auto& label = target_.displayName.empty() ? target_.name : target_.displayName;
-    line.source = lower(label);
+    line.source = shownSourceName(target_);
+    // The footer and the tray say when the replay records with a game's own values.
+    if (sessionOwn_ && recording_ != capture::RecorderState::Off && !line.source.empty()) line.source += L" · own settings";
     line.automatic = auto_.active();
     // The footer's wording; the tray tip and flyout build on it.
     if (closing_) line.state = State::Closing, line.status = L"closing…";
@@ -663,6 +1171,8 @@ void App::receiveEvents() {
                 saveSettings();
                 changed = true;
             }
+            // The chosen game's own codec may be refused now: its codec row and estimate say so (see scopeRecordVideo).
+            if (std::optional<capture::Codec> refused; gameScope() && (scopeRecordVideo(&refused), refused)) changed = true;
             continue; // Shown in the codec menu; no status line.
         case RecordingEvent::Kind::Screenshot:
             // A status, never a dialog: the shortcut is usually pressed over a game.
@@ -678,8 +1188,13 @@ void App::receiveEvents() {
         changed = true;
         // An auto-capture failure must never put a dialog over the game: status only. So is a failed restart after sleep.
         const bool sleepStart = sleepRestart_ && event.kind == RecordingEvent::Kind::Started;
-        const bool quiet = (automatic && automatic->quiet) || sleepStart;
+        // Likewise the sign-in start: the window is usually hidden, and a dialog would wait for the first opening.
+        const bool signInStart = signInReplay_ && event.kind == RecordingEvent::Kind::Started;
+        const bool quiet = (automatic && automatic->quiet) || sleepStart || signInStart;
         setStatus(automatic ? std::move(automatic->status) : lower(event.message));
+        // A game's codec that fell back to h.264 says so once the replay is on, after the wording below is chosen (a
+        // restart after sleep replaces the status).
+        const auto note = event.kind == RecordingEvent::Kind::Started ? std::exchange(startNote_, {}) : std::wstring{};
         if (event.sleeping && asleep_) {
             sleep_.kept = event.state == capture::RecorderState::Stopped;
             setStatus(sleep_.kept ? L"paused for sleep · replay kept" : L"replay paused for sleep");
@@ -688,6 +1203,13 @@ void App::receiveEvents() {
             sleepRestart_ = false;
             setStatus(event.success ? L"restarted after sleep" : L"restart failed · enable replay");
         }
+        if (signInStart) {
+            if (event.success) signInReplay_ = false;
+            else signInReplayFailed(status_); // The recorder's reason, as a status: the hidden window shows no dialog.
+        } else if (event.kind == RecordingEvent::Kind::Started) {
+            cancelSignInReplay(); // Another start (auto-capture) came first: once it ends, the retry must not start the monitor.
+        }
+        if (event.success && !note.empty()) setStatus(status_ + L" · " + note);
         if (!event.success && !closing_ && !quiet) errors.emplace_back(status_, sounded);
     }
     if (pendingSuspend_) { applyPendingSuspend(); changed = true; } // A suspend that came while the recorder was busy.
@@ -723,13 +1245,14 @@ bool App::queueMessage(const std::wstring& text, UINT icon) {
 }
 
 // Refarter's window came to the front: the error messages that arrived meanwhile, now where a dialog is welcome.
+// Over the welcome screen too (modalOpen, not dialogOpen): a clip folder it chose may be refused.
 void App::showQueuedErrors() {
-    if (queuedErrors_.empty() || showingErrors_ || dialogOpen() || quietDialogs() || !ownWindowForeground()) return;
+    if (queuedErrors_.empty() || showingErrors_ || modalOpen() || quietDialogs() || !ownWindowForeground()) return;
     showingErrors_ = true;
     // One bounded batch. Nested messages append to the same queue without opening another dialog.
     const auto count = queuedErrors_.size();
     for (std::size_t i = 0; i < count && !queuedErrors_.empty(); ++i) {
-        if (dialogOpen() || quietDialogs() || !ownWindowForeground()) break;
+        if (modalOpen() || quietDialogs() || !ownWindowForeground()) break;
         auto [error, icon] = std::move(queuedErrors_.front());
         queuedErrors_.erase(queuedErrors_.begin());
         messageBox(window_, error.c_str(), L"refarter", MB_OK | icon);
@@ -737,8 +1260,8 @@ void App::showQueuedErrors() {
     showingErrors_ = false;
     // A dialog's nested loop may have consumed the notification for newly arrived errors.
     // Focus loss leaves the unshown tail for activation; another question resumes it on dismissal.
-    if (!dialogOpen() && !quietDialogs() && ownWindowForeground()) {
-        if (!queuedErrors_.empty()) PostMessageW(window_, errorDialogs, 0, 0);
+    if (!modalOpen() && !quietDialogs() && ownWindowForeground()) {
+        if (!queuedErrors_.empty()) PostMessageW(window_, errorDialogs, 0, 0); // The questions check dialogOpen themselves.
         if (storageQuestionQueued_) PostMessageW(window_, storageQuestion, 0, 0);
         if (state_.updateCheck == UpdateChoice::Ask) PostMessageW(window_, updateQuestion, 0, 0);
     }
@@ -789,7 +1312,7 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             const bool off = recording_ == capture::RecorderState::Off;
             const bool chosen = target_.source.window || target_.source.monitor;
             const auto& source = chosen ? target_ : auto_.detected();
-            const auto sourceName = lower(source.displayName.empty() ? source.name : source.displayName);
+            const auto sourceName = shownSourceName(source);
             auto line = sessionLine();
             if (!chosen) line.source.clear();
             TrayFlyoutModel model;
@@ -829,8 +1352,14 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             // An icon button's tooltip is its current text. Sidebar buttons show their
             // text while expanded, so only the collapsed sidebar needs tooltips.
             auto* info = reinterpret_cast<NMTTDISPINFOW*>(lParam);
-            if (isMeterTool(header->idFrom)) {
+            // Meter and locked-row ids are small numbers; a button's tool is its handle, which could collide with them.
+            const bool isHandle = (info->uFlags & TTF_IDISHWND) != 0;
+            if (!isHandle && isMeterTool(header->idFrom)) {
                 wcsncpy_s(info->szText, meterToolText(header->idFrom), _TRUNCATE);
+                return 0;
+            }
+            if (!isHandle && isLockedTool(header->idFrom)) {
+                wcsncpy_s(info->szText, lockedToolText(), _TRUNCATE);
                 return 0;
             }
             const auto button = reinterpret_cast<HWND>(header->idFrom);
@@ -843,6 +1372,8 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 wcsncpy_s(info->szText, tip.c_str(), _TRUNCATE);
             } else if (id == DesktopReset || id == MicrophoneReset) {
                 wcsncpy_s(info->szText, L"reset to 100% and system default", _TRUNCATE);
+            } else if (contains(videoResetIds, id)) {
+                wcsncpy_s(info->szText, L"use the all-games value", _TRUNCATE);
             } else if (contains(libraryIconIds, id) || id == SidebarToggle || state_.sidebarCollapsed) {
                 GetWindowTextW(button, info->szText, static_cast<int>(std::size(info->szText)));
             }
@@ -873,6 +1404,28 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case WM_MOUSEMOVE: case WM_MOUSELEAVE: {
         const POINT at{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
+        // The tooltip sees the main window's moves only from here (its meter tools are not TTF_SUBCLASS): a disabled
+        // button (a locked reset) gets no mouse messages, they come here, so a move over one is relayed as its own.
+        // Only direct children are found, which every button is. Leaving the window pops the tip.
+        if (tooltips_) {
+            if (message == WM_MOUSELEAVE) {
+                SendMessageW(tooltips_, TTM_POP, 0, 0);
+            } else {
+                const HWND under = ChildWindowFromPointEx(window_, at, CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT);
+                MSG relay{window_, message, wParam, lParam, static_cast<DWORD>(GetMessageTime())};
+                relay.pt = at;
+                ClientToScreen(window_, &relay.pt);
+                if (under && under != window_ && !IsWindowEnabled(under) && !lockedTooltipAt(at)) {
+                    POINT local = at;
+                    MapWindowPoints(window_, under, &local, 1);
+                    relay.hwnd = under;
+                    relay.lParam = MAKELPARAM(local.x, local.y);
+                }
+                SendMessageW(tooltips_, TTM_RELAYEVENT, 0, reinterpret_cast<LPARAM>(&relay));
+                TRACKMOUSEEVENT leave{sizeof leave, TME_LEAVE, window_, 0};
+                TrackMouseEvent(&leave);
+            }
+        }
         // Above the footer (and on leaving the window) nothing is hot: clear the flags once and measure nothing.
         RECT client{};
         GetClientRect(window_, &client);
@@ -888,10 +1441,11 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         const RECT status = footerStatusBounds();
         const RECT update = footerUpdateBounds();
         const RECT version = footerVersionBounds();
-        const bool hot = PtInRect(&status, at);
-        const bool updateOver = !IsRectEmpty(&update) && PtInRect(&update, at) &&
+        // The welcome screen holds everything else back, the footer's links too.
+        const bool hot = !welcome_ && PtInRect(&status, at);
+        const bool updateOver = !welcome_ && !IsRectEmpty(&update) && PtInRect(&update, at) &&
             updateClick() != UpdateView::Click::Nothing; // Progress is not a link.
-        const bool versionOver = PtInRect(&version, at);
+        const bool versionOver = !welcome_ && PtInRect(&version, at);
         TRACKMOUSEEVENT track{sizeof track, TME_LEAVE, window_, 0}; // Only in the footer is there a flag to clear on leaving.
         TrackMouseEvent(&track);
         if (hot != footerHot_) { footerHot_ = hot; InvalidateRect(window_, &status, FALSE); }
@@ -903,6 +1457,7 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (LOWORD(lParam) == HTCLIENT && (footerHot_ || updateHot_ || versionHot_)) { SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE; }
         break;
     case WM_LBUTTONUP: {
+        if (welcome_) return 0; // The footer's links wait for the welcome screen.
         POINT point{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
         const RECT status = footerStatusBounds();
         const RECT update = footerUpdateBounds();
@@ -947,19 +1502,20 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (runsElevated())
             for (const UINT handOver : {restoreMessage_, quitMessage_, commandMessage_, tray_.taskbarCreatedMessage()})
                 if (handOver) ChangeWindowMessageFilterEx(window_, handOver, MSGFLT_ALLOW, nullptr);
-        refreshStartup();
+        refreshStartup(); // Also sets the welcome screen's start with windows switch.
         if (state_.closeToTray) addTrayIcon();
         createControls();
         createFonts();
         // Library is the first page: list the folder (no decoding) on the library worker.
         if (!startupLaunch_ || state_.maxStorageGb) clipGrid_.scan(clipFolder_); // A limit needs the size even when the window stays hidden.
-        recorder_ = std::make_unique<RecordingController>([this](RecordingEvent event) {
+        RecordingController::Notify notify = [this](RecordingEvent event) {
             {
                 std::lock_guard lock(eventsMutex_);
                 events_.push_back(std::move(event));
             }
             PostMessageW(window_, recordingEvent, 0, 0);
-        });
+        };
+        recorder_ = makeRecorder_ ? makeRecorder_(std::move(notify)) : std::make_unique<RecordingController>(std::move(notify));
         startLeftoverCleanup(); // Settings are loaded, so the clip folder is known.
         scheduleUpdateCheck(startupUpdateDelay); // Opt-in and at most daily; one worker that sleeps first. No timer.
         hotkeys_[saveShortcut] = parseHotkey(config_.get(L"shortcuts", L"save_replay")).value_or(defaultHotkey);
@@ -1051,11 +1607,26 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         else if (LOWORD(wParam) >= GateOpen && LOWORD(wParam) <= GateRelease && HIWORD(wParam) == EN_CHANGE) updateGateInput();
         else if (HIWORD(wParam) == BN_CLICKED) command(LOWORD(wParam));
         return 0;
-    case WM_INPUT:
+    case WM_INPUT: {
+        // A watched-only key ("=", "r") works in Refarter too, except where Refarter uses the key itself: the
+        // player ("=" zooms), an open popup menu (first-letter pick; it holds the mouse capture), a text field
+        // (search, rename, number fields) and the clip grid's letters (F favourites).
+        const auto typesHere = [&](UINT key) {
+            if (!ownProcessInFront()) return false;
+            if (GetCapture()) return true;
+            const HWND focus = GetFocus();
+            // The tray flyout is not owned by the main window and has no such keys.
+            if (playerOpen_ && GetAncestor(GetForegroundWindow(), GA_ROOTOWNER) == window_) return true;
+            if (focus == control(Clips) && key >= 'A' && key <= 'Z') return true;
+            wchar_t kind[16]{};
+            return focus && GetClassNameW(focus, kind, static_cast<int>(std::size(kind))) && _wcsicmp(kind, L"Edit") == 0;
+        };
         if (const int shortcut = rawHotkey_.input(reinterpret_cast<HRAWINPUT>(lParam));
-            shortcut >= 0 && pressReports_[shortcut].accept(true, GetTickCount64())) shortcutPressed(shortcut);
+            shortcut >= 0 && !(watchedOnly(hotkeys_[shortcut]) && typesHere(hotkeys_[shortcut].key)) &&
+            pressReports_[shortcut].accept(true, GetTickCount64())) shortcutPressed(shortcut);
         // Foreground raw input requires DefWindowProc cleanup.
         return DefWindowProcW(window_, message, wParam, lParam);
+    }
     case WM_INPUT_DEVICE_CHANGE:
         if (rawHotkey_.active()) rawHotkey_.prime(); // Avoid a stuck press after unplug/reconnect.
         return 0;
@@ -1080,6 +1651,7 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case storageQuestion: askQueuedStorageQuestion(); return 0;
     case updateChecked: updateCheckDone(); return 0;
     case notesDue: showNotesIfDue(); return 0;
+    case signInReplayDue: startSignInReplay(); return 0;
     case updateQuestion: askUpdateQuestion(); return 0;
     case updateDownloaded: downloadDone(); return 0;
     case updateSetupEnded: setupEnded(); return 0;
@@ -1106,6 +1678,7 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (wParam == bubbleTimer && !bubbleDrag_) hideSliderBubble();
         if (wParam == gateBubbleTimer) hideGateBubble();
         if (wParam == resumeTimer) { KillTimer(window_, resumeTimer); resumeDue_ = true; finishResume(); }
+        if (wParam == signInReplayTimer) startSignInReplay();
         return 0;
     case WM_SHOWWINDOW:
         DefWindowProcW(window_, message, wParam, lParam);
@@ -1139,7 +1712,8 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             SetBkColor(dc, surface);
             return reinterpret_cast<LRESULT>(surfaceBrush_);
         }
-        SetTextColor(dc, ink);
+        // A value the chosen game sets itself is in the accent colour, as on its drop-down rows.
+        SetTextColor(dc, resetOf(field) && scopeOwns(resetOf(field)) ? accent : ink);
         SetBkColor(dc, background);
         return reinterpret_cast<LRESULT>(editBrush_);
     }
@@ -1223,7 +1797,7 @@ App::~App() {
     diagnosticLog().finish();
 }
 
-int App::run(HINSTANCE instance, int showCommand, bool startup) {
+bool App::create(HINSTANCE instance, bool startup) {
     startupLaunch_ = startup;
     INITCOMMONCONTROLSEX common{sizeof(common), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES};
     InitCommonControlsEx(&common);
@@ -1234,7 +1808,7 @@ int App::run(HINSTANCE instance, int showCommand, bool startup) {
     wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_REFARTER));
     wc.hIconSm = wc.hIcon;
     wc.lpszClassName = L"RefarterDesktopShell";
-    if (!RegisterClassExW(&wc)) return 1;
+    if (!RegisterClassExW(&wc)) return false;
     dpi_ = GetDpiForSystem();
     RECT bounds{0, 0, px(initialClientWidth), px(initialClientHeight)};
     AdjustWindowRectExForDpi(&bounds, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi_);
@@ -1243,9 +1817,24 @@ int App::run(HINSTANCE instance, int showCommand, bool startup) {
         bounds.right - bounds.left, bounds.bottom - bounds.top, nullptr, nullptr, instance, this);
     if (!window_) {
         MessageBoxW(nullptr, L"the window could not be created.", L"refarter", MB_ICONERROR);
-        return 1;
+        return false;
     }
+    // Handled from the message loop, once run() has shown the window or tray icon; ordinary launches never start
+    // replay. Posted here rather than in run() so that tests/app_sign_in_replay_test.cpp drives the real launch. On a
+    // visible --startup launch it now comes before notesDue and updateQuestion, which is harmless: the sign-in start
+    // only reports through the status, never a dialog, and either dialog's modal loop would have dispatched it while open anyway.
+    if (startup && state_.signInReplay) {
+        signInPending_ = PostMessageW(window_, signInReplayDue, 0, 0) != FALSE;
+    }
+    return true;
+}
+
+int App::run(HINSTANCE instance, int showCommand, bool startup) {
+    if (!create(instance, startup)) return 1;
     startupTray_ = startup && state_.startMinimised && addTrayIcon();
+    // An unanswered welcome screen stays pending: write that now, so a crash or a kill before the next save does not
+    // lose it.
+    if (welcome_) saveSettings();
     if (!startupTray_) {
         // Failed tray creation must never leave an inaccessible hidden process.
         ShowWindow(window_, startup ? SW_SHOW : showCommand);
@@ -1253,7 +1842,7 @@ int App::run(HINSTANCE instance, int showCommand, bool startup) {
         // The taskbar's save replay, screenshot and open library, once per start, after the window is up; a hidden
         // sign-in start leaves this shell work for the first time its window opens (restoreWindow).
         registerJumpList(executablePath());
-        SetFocus(control(Library));
+        SetFocus(control(!welcome_ ? Library : IsWindowEnabled(control(WelcomeStart)) ? WelcomeStart : WelcomeSkip));
         if (notesDue_) PostMessageW(window_, notesDue, 0, 0); // Before the opt-in question: the notes come first.
         PostMessageW(window_, updateQuestion, 0, 0);
         if (!clipGrid_.scanned()) clipGrid_.scan(clipFolder_);
@@ -1300,6 +1889,11 @@ int App::run(HINSTANCE instance, int showCommand, bool startup) {
             const bool pressElsewhere = isMousePress(message.message) && message.hwnd != field && (message.hwnd == window_ || IsChild(window_, message.hwnd));
             if (leaveKey || pressElsewhere) SetFocus(window_);
             if (leaveKey) continue;
+        }
+        // A repeat is ignored: holding Esc to cancel assigning the shortcut must not skip the screen too.
+        if (welcome_ && message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE && !(message.lParam & (1 << 30))) {
+            finishWelcome(false); // Esc skips the welcome screen.
+            continue;
         }
         if (message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE && !inPlayer) {
             // Esc clears a selection first, then leaves an open folder.

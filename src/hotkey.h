@@ -11,7 +11,7 @@
 
 namespace refarter {
 
-// Global save shortcut as RegisterHotKey takes it: MOD_* flags and a virtual key.
+// A global shortcut as RegisterHotKey takes it: MOD_* flags and a virtual key.
 struct Hotkey {
     UINT modifiers = MOD_CONTROL | MOD_SHIFT;
     UINT key = VK_F10;
@@ -22,6 +22,24 @@ inline constexpr Hotkey defaultScreenshotHotkey{MOD_CONTROL | MOD_SHIFT, VK_F11}
 inline constexpr UINT hotkeyModifiers = MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN;
 
 enum class HotkeyProblem { None, Invalid, ModifierOnly, NeedsModifier, Reserved };
+
+// RegisterHotKey swallows its keys everywhere, so an ordinary key without ctrl, alt or win ("=", "r",
+// "shift + 5") is never registered: Raw Input alone watches it and the key still reaches the app in front.
+inline constexpr bool watchedOnly(Hotkey hotkey) {
+    const bool standalone = (hotkey.key >= VK_F1 && hotkey.key <= VK_F24) || hotkey.key == VK_PAUSE || hotkey.key == VK_SCROLL;
+    return !standalone && !(hotkey.modifiers & (MOD_CONTROL | MOD_ALT | MOD_WIN));
+}
+
+// Keys that move focus, edit or confirm: as a watched-only shortcut every Enter or arrow would save.
+inline constexpr bool isNavigationKey(UINT key) {
+    switch (key) {
+    case VK_RETURN: case VK_TAB: case VK_SPACE: case VK_ESCAPE: case VK_BACK: case VK_DELETE: case VK_INSERT:
+    case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN: case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT: case VK_APPS:
+        return true;
+    default:
+        return false;
+    }
+}
 
 inline constexpr bool isModifierKey(UINT key) {
     switch (key) {
@@ -38,11 +56,11 @@ inline constexpr bool isModifierKey(UINT key) {
 inline constexpr HotkeyProblem checkHotkey(Hotkey hotkey) {
     if ((hotkey.modifiers & ~hotkeyModifiers) || hotkey.key < 0x08 || hotkey.key > 0xFE) return HotkeyProblem::Invalid;
     if (isModifierKey(hotkey.key)) return HotkeyProblem::ModifierOnly;
+    // An IME's stand-in codes: Raw Input reports the real key, so these would never match.
+    if (hotkey.key == VK_PROCESSKEY || hotkey.key == VK_PACKET) return HotkeyProblem::Invalid;
     // RegisterHotKey reserves F12 for debuggers; Alt+F4 must keep closing windows.
     if (hotkey.key == VK_F12 || (hotkey.key == VK_F4 && (hotkey.modifiers & MOD_ALT))) return HotkeyProblem::Reserved;
-    // A global hotkey swallows its keys everywhere, so ordinary keys need ctrl, alt or win.
-    const bool standalone = (hotkey.key >= VK_F1 && hotkey.key <= VK_F24) || hotkey.key == VK_PAUSE || hotkey.key == VK_SCROLL;
-    if (!standalone && !(hotkey.modifiers & (MOD_CONTROL | MOD_ALT | MOD_WIN))) return HotkeyProblem::NeedsModifier;
+    if (watchedOnly(hotkey) && isNavigationKey(hotkey.key)) return HotkeyProblem::NeedsModifier;
     return HotkeyProblem::None;
 }
 

@@ -36,24 +36,26 @@ Layout computeLayout(float w, float h, const View& view, const ClipInfo& status)
     l.scale = s;
     const auto d = [s](float value) { return value * s; };
     l.card = {0, 0, w, h};
-    // The trim bar is one row, right to left: save, replace, cancel, the "compress & copy" slot, the mute button with the
-    // volume rail, then the audio sources (the icon switches a fixed width, the pill of a plain multi-track file 110 px)
-    // up to the time. The sources decide what the trim keeps, so they never give way: shorten the compress label, then
-    // move its box to its own row; only below the window's minimum width drop the rail, then the mute button.
+    // The trim bar is one row, right to left: save, replace, cancel, the "compress & copy" slot, the volume rail, the mute
+    // button, the speed pill, then the audio sources (the icon switches a fixed width, the pill of a plain multi-track file
+    // 110 px) up to the time. The sources decide what the trim keeps, so they never give way: narrow the rail to 40 px,
+    // shorten the compress label (the rail stays at 40 px), drop the rail, then move the compress box to its own row
+    // (which leaves the whole rail again, only below the window's minimum width); then drop the speed, then the mute button.
     // The budget counts the same widths and gaps as the placement further down, so the two cannot disagree.
     const float margin = view.fullscreen ? d(28) : d(12);
-    const float button = d(34), volumeRail = d(80), muteAndRail = button + d(4) + volumeRail;
+    const float button = d(34), volumeRail = d(80), railGap = d(4), minimumRail = d(40);
+    const float speedWidth = d(50), speedSlot = speedWidth + d(10); // "0.25×" at most, and the gap after it.
     const float fixedRight = d(72.f + 8 + 72 + 8 + 84 + 10), timeRight = margin + d(38.f + 14 + 132 + 8);
     const int sourceCount = status.toggles ? std::min<int>(static_cast<int>(status.tracks.size()), maxSources) : 0;
     const float groupWidth = sourceCount > 0 ? d(sourceGroupWidth(sourceCount)) : 0;
     const bool pill = !status.toggles && status.tracks.size() > 1;
     const float pillWidth = d(110); // While trimming; playback lets the pill grow to 180 px.
     const float sourcesWidth = sourceCount > 0 ? groupWidth : pill ? pillWidth : 0;
-    // What the slot may take: the width less the sources, the mute button with its rail and the 10 px gaps either side of them
-    // (the gap before the time is in timeRight).
-    const float roomFor = (w - margin) - fixedRight - timeRight - sourcesWidth - (muteAndRail + d(10)) - d(10);
+    // What the slot and the rail with its gap may share: the width less the sources, the speed pill with its gap, the mute
+    // button and the 10 px gaps after it and after the slot (the gap before the time is in timeRight).
+    const float roomFor = (w - margin) - fixedRight - timeRight - sourcesWidth - speedSlot - (button + d(10)) - d(10);
     const bool ownRow = view.editing && roomFor < d(104);
-    l.compressShort = view.editing && roomFor < d(142);
+    l.compressShort = view.editing && roomFor < d(142) + railGap + minimumRail;
     const float controlsHeight = d(52), barHeight = view.editing ? d(ownRow ? 102.f : 70.f) : d(26);
     const float backSize = d(34);
     if (!view.fullscreen) {
@@ -99,12 +101,12 @@ Layout computeLayout(float w, float h, const View& view, const ClipInfo& status)
         x -= button + d(4);
         l.trim = {x - button, cy - button / 2, x, cy + button / 2};
         x -= button + d(14);
-        l.volume = {x - d(80), cy - d(10), x, cy + d(10)};
-        x -= d(80) + d(4);
+        l.volume = {x - volumeRail, cy - d(10), x, cy + d(10)};
+        x -= volumeRail + railGap;
         l.mute = {x - button, cy - button / 2, x, cy + button / 2};
         x -= button + d(10);
-        l.speed = {x - d(50), cy - d(15), x, cy + d(15)}; // "0.25×" at most.
-        x -= d(50) + d(10);
+        l.speed = {x - speedWidth, cy - d(15), x, cy + d(15)};
+        x -= speedSlot;
     } else {
         l.save = {x - d(72), cy - d(17), x, cy + d(17)};
         x -= d(72) + d(8);
@@ -119,17 +121,26 @@ Layout computeLayout(float w, float h, const View& view, const ClipInfo& status)
             l.compress = {x - slot, cy - d(17), x, cy + d(17)};
             x -= slot + d(10);
         }
-        // Volume, hidden (no width, never inverted) when it does not fit: the sources keep their room, the rail goes
-        // first, then the mute button.
+        // Speed, mute and volume, each hidden (no width, never inverted) when it does not fit: the sources keep their
+        // room; the rail narrows to 40 px and then goes first, then the speed, then the mute button. Once the label is
+        // short the rail keeps 40 px rather than taking the 38 px the label gave up, so it never widens as the window
+        // narrows; on its own row the compress box leaves the whole rail.
         const float room = x - (l.time.right + d(8)) - sourcesWidth;
         if (room >= button + d(10)) {
-            if (room >= muteAndRail + d(10)) {
-                l.volume = {x - volumeRail, cy - d(10), x, cy + d(10)};
-                l.mute = {l.volume.left - d(4) - button, cy - button / 2, l.volume.left - d(4), cy + button / 2};
+            const bool speed = room >= button + d(10) + speedSlot;
+            const float widest = l.compressShort && !ownRow ? minimumRail : volumeRail;
+            const float rail = speed ? std::min(widest, room - (button + d(10)) - speedSlot - railGap) : 0;
+            if (rail >= minimumRail) {
+                l.volume = {x - rail, cy - d(10), x, cy + d(10)};
+                l.mute = {l.volume.left - railGap - button, cy - button / 2, l.volume.left - railGap, cy + button / 2};
             } else {
                 l.mute = {x - button, cy - button / 2, x, cy + button / 2};
             }
             x = l.mute.left - d(10);
+            if (speed) {
+                l.speed = {x - speedWidth, cy - d(15), x, cy + d(15)};
+                x -= speedSlot;
+            }
         }
     }
     // Sources to keep while trimming, to play otherwise: icon switches, or the pill of a plain multi-track file.

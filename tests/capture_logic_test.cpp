@@ -209,11 +209,32 @@ int main() {
     VideoSettings balanced;
     check((bitrateFor(balanced, {1920, 1080}) == Bitrate{19'906, 39'812, false}), "balanced 1080p60 h.264");
     balanced.codec = Codec::HEVC;
-    check(bitrateFor(balanced, {1920, 1080}).averageKbps == 12'939, "hevc needs less");
+    check(bitrateFor(balanced, {1920, 1080}).averageKbps == 17'915, "hevc needs less");
     balanced.codec = Codec::H264;
     balanced.fps = 30;
     check(bitrateFor(balanced, {1920, 1080}).averageKbps == 11'836, "30 fps needs more than half");
     check(bitrateFor(balanced, {64, 64}).averageKbps == minBitrateMbps * 1000, "tiny windows clamp to minimum");
+    VideoSettings high;
+    high.quality = Quality::High;
+    check((bitrateFor(high, {3840, 2160}) == Bitrate{maxPresetAverageMbps * 1000, maxBitrateMbps * 1000, false}),
+          "4k60 high h.264 hits the cap");
+    for (const auto quality : {Quality::Small, Quality::Balanced, Quality::High})
+        for (const Size size : {Size{1280, 720}, Size{1920, 1080}, Size{2560, 1440}, Size{3840, 2160}, Size{4096, 2304}, Size{4096, 4096}}) {
+            VideoSettings s;
+            s.quality = quality;
+            const auto h264 = bitrateFor(s, size);
+            s.codec = Codec::HEVC;
+            const auto hevc = bitrateFor(s, size);
+            s.codec = Codec::AV1;
+            const auto av1 = bitrateFor(s, size);
+            const auto where = " (quality " + std::to_string(static_cast<int>(quality)) + ", " +
+                std::to_string(size.width) + "x" + std::to_string(size.height) + ")";
+            check(av1.averageKbps < hevc.averageKbps && hevc.averageKbps < h264.averageKbps,
+                  ("av1 < hevc < h.264" + where).c_str());
+            check(h264.peakKbps <= maxBitrateMbps * 1000 && hevc.peakKbps <= maxBitrateMbps * 1000 &&
+                      av1.peakKbps <= maxBitrateMbps * 1000,
+                  ("every codec's peak within the limit" + where).c_str());
+        }
     VideoSettings custom;
     custom.quality = Quality::Custom;
     custom.bitrateMbps = 40;

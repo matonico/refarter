@@ -3,6 +3,23 @@
 
 using namespace refarter;
 
+namespace refarter {
+// The offer steps onForeground and the card take, without a foreground hook or a click.
+struct AutoSessionTestAccess {
+    static void offer(AutoSession& session, RecordingTarget target) { session.offer(std::move(target)); }
+    // What onForeground does when plan.reshowCard is set: the card had hidden and another app came to the front.
+    static void reshowOver(AutoSession& session, const RecordingTarget& front) {
+        session.card_.hide();
+        session.offers_.markReshown();
+        session.showCard(front);
+    }
+    static void answer(AutoSession& session, OfferAnswer answer) {
+        session.card_.hide();
+        session.answerOffer(answer);
+    }
+};
+} // namespace refarter
+
 namespace {
 // A manual-reset event stands in for a game process: unsignalled while it runs, signalled once it has exited.
 std::shared_ptr<void> fakeProcess() {
@@ -17,6 +34,9 @@ struct Rig {
     RecordingTarget target;
     capture::RecorderState recording = capture::RecorderState::Off;
     int stops = 0;
+    bool prompt = false;
+    std::wstring shownFor, added, declined; // The path the card was named from, and what "add" or "not this one" acted on.
+    bool startWorks = true;
     std::wstring status;
     AutoSession session;
 
@@ -34,14 +54,17 @@ struct Rig {
             ctx.recording = recording;
             ctx.source = &target;
             ctx.autoOn = ctx.readable = true;
+            ctx.prompt = prompt;
             ctx.list = &list;
             return ctx;
         };
-        host.start = [](RecordingTarget) { return true; };
+        host.start = [this](RecordingTarget) { return startWorks; };
         host.stop = [this] { ++stops; };
         host.status = [this](std::wstring text) { status = std::move(text); };
-        host.add = [](const std::wstring&, const std::wstring&) {};
-        host.decline = [](const std::wstring&) {};
+        host.add = [this](const std::wstring& path, const std::wstring&) { added = path; };
+        host.name = [](const RecordingTarget& game) { return game.name; };
+        host.shown = [this](const std::wstring& path, const std::wstring& stored) { shownFor = path; return shownName(lower(stored)); };
+        host.decline = [this](const std::wstring& path) { declined = path; };
         host.refresh = [] {};
         host.hideFlyout = [] {};
         session.attach(window, std::move(host));
@@ -154,6 +177,35 @@ int main() {
         rig.recording = capture::RecorderState::Stopped;
         exitProcess(rig.target.process);
         check(!rig.session.clearExitedGameReplay() && rig.stops == 0, "an ended session no longer owns exit cleanup");
+    }
+
+    // Independent tester: a long game name in status text is lower case and cut to 48 characters.
+    {
+        Rig rig;
+        rig.startWorks = false;
+        auto target = rig.target;
+        target.displayName = L"A Very Long Game Title That Goes On And On Past Forty Eight Characters";
+        rig.session.tryAutoCapture(target);
+        check(rig.status == L"auto-capture could not start a very long game title that goes on and on past…"
+                           L" · check the replay settings",
+              "a long game name in the status is lower case and cut");
+    }
+
+    // #169 review: a card re-shown while another app is in front still names, adds and declines the offered game.
+    for (const auto answer : {OfferAnswer::Add, OfferAnswer::Decline}) {
+        Rig rig;
+        rig.prompt = true;
+        RecordingTarget x, y;
+        x.path = L"C:\\Games\\x.exe"; x.name = L"x.exe"; x.pid = 200; x.source.window = rig.window;
+        y.path = L"C:\\Games\\y.exe"; y.name = L"y.exe"; y.pid = 300; y.source.window = rig.window;
+        AutoSessionTestAccess::offer(rig.session, x);
+        check(rig.shownFor == x.path, "the offer card is named from the offered game");
+        rig.shownFor.clear();
+        AutoSessionTestAccess::reshowOver(rig.session, y);
+        check(rig.shownFor == x.path, "a re-shown card is named from the offered game, not the app in front");
+        AutoSessionTestAccess::answer(rig.session, answer);
+        check((answer == OfferAnswer::Add ? rig.added : rig.declined) == x.path, "the answer acts on the offered game");
+        check(rig.added != y.path && rig.declined != y.path, "the app in front is left alone");
     }
 
     return failures ? 1 : 0;

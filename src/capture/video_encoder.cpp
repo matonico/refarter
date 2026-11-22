@@ -2,12 +2,14 @@
 #include "annexb.h"
 #include "environment.h"
 #include "diagnostic_log.h"
+#include "gpu.h"
 
 #include <mferror.h>
 #include <strmif.h>
 #include <initguid.h>
 #include <codecapi.h>
 #include <algorithm>
+#include <optional>
 
 namespace refarter::capture {
 
@@ -48,18 +50,21 @@ void setVideoFormat(IMFMediaType* type, const EncoderConfig& config) {
     type->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
 }
 
-bool sameAdapter(IMFActivate* activate, LUID adapter) {
+// Whether the encoder runs on `adapter`; nothing when Media Foundation does not say.
+std::optional<bool> onAdapter(IMFActivate* activate, LUID adapter) {
     LUID luid{};
     UINT32 size = 0;
     if (SUCCEEDED(activate->GetBlob(MFT_ENUM_ADAPTER_LUID, reinterpret_cast<UINT8*>(&luid), sizeof(luid), &size)) && size == sizeof(luid)) {
-        return luid.LowPart == adapter.LowPart && luid.HighPart == adapter.HighPart;
+        return sameLuid(luid, adapter);
     }
     UINT64 packed = 0;
     if (SUCCEEDED(activate->GetUINT64(MFT_ENUM_ADAPTER_LUID, &packed))) {
         return packed == ((static_cast<UINT64>(static_cast<UINT32>(adapter.HighPart)) << 32) | adapter.LowPart);
     }
-    return false;
+    return std::nullopt;
 }
+
+bool sameAdapter(IMFActivate* activate, LUID adapter) { return onAdapter(activate, adapter).value_or(false); }
 
 // The codec data a media type carries, when it has any; `header` is left as it was otherwise.
 void readSequenceHeader(IMFMediaType* type, std::vector<std::uint8_t>& header) {
@@ -83,11 +88,12 @@ const GUID& mediaSubtype(Codec codec) {
     return codec == Codec::AV1 ? MFVideoFormat_AV1 : codec == Codec::HEVC ? MFVideoFormat_HEVC : MFVideoFormat_H264;
 }
 
-UINT32 mediaProfile(Codec codec) {
-    // eAVEncAV1VProfile_Main_420_8; spelled out because older SDKs lack the enum.
-    constexpr UINT32 av1Main8 = 1;
-    return codec == Codec::AV1 ? av1Main8 :
-        codec == Codec::HEVC ? eAVEncH265VProfile_Main_420_8 : eAVEncH264VProfile_High;
+UINT32 mediaProfile(Codec codec, bool tenBit) {
+    // eAVEncAV1VProfile_Main_420_8 and _10; spelled out because older SDKs lack the enum.
+    constexpr UINT32 av1Main8 = 1, av1Main10 = 2;
+    if (codec == Codec::AV1) return tenBit ? av1Main10 : av1Main8;
+    if (codec == Codec::HEVC) return tenBit ? eAVEncH265VProfile_Main_420_10 : eAVEncH265VProfile_Main_420_8;
+    return eAVEncH264VProfile_High;
 }
 
 struct VideoEncoder::EventCallback : winrt::implements<EventCallback, IMFAsyncCallback> {
@@ -117,7 +123,8 @@ VideoEncoder::VideoEncoder(ID3D11Device* device, LUID adapter, const EncoderConf
     winrt::check_hresult(MFCreateDXGIDeviceManager(&token, deviceManager_.put()));
     winrt::check_hresult(deviceManager_->ResetDevice(device, token));
 
-    MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, MFVideoFormat_NV12};
+    const GUID& inputSubtype = config.tenBit ? MFVideoFormat_P010 : MFVideoFormat_NV12;
+    MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, inputSubtype};
     MFT_REGISTER_TYPE_INFO output{MFMediaType_Video, mediaSubtype(config.codec)};
     IMFActivate** found = nullptr;
     UINT32 count = 0;
@@ -128,6 +135,9 @@ VideoEncoder::VideoEncoder(ID3D11Device* device, LUID adapter, const EncoderConf
     CoTaskMemFree(found);
     // Prefer the encoder on the capture GPU; others would force a cross-adapter copy.
     std::stable_partition(candidates.begin(), candidates.end(), [&](const auto& a) { return sameAdapter(a.get(), adapter); });
+    // 10-bit never on another GPU: 8-bit on the capture GPU beats a cross-adapter copy. An encoder that does not
+    // say which GPU it runs on is kept, as for 8-bit.
+    if (config.tenBit) std::erase_if(candidates, [&](const auto& a) { return onAdapter(a.get(), adapter) == false; });
 
     HRESULT lastError = MF_E_TOPO_CODEC_NOT_FOUND;
     for (auto& candidate : candidates) {
@@ -189,7 +199,7 @@ VideoEncoder::VideoEncoder(ID3D11Device* device, LUID adapter, const EncoderConf
         winrt::check_hresult(outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
         winrt::check_hresult(outputType->SetGUID(MF_MT_SUBTYPE, mediaSubtype(config.codec)));
         winrt::check_hresult(outputType->SetUINT32(MF_MT_AVG_BITRATE, average));
-        winrt::check_hresult(outputType->SetUINT32(MF_MT_MPEG2_PROFILE, mediaProfile(config.codec)));
+        winrt::check_hresult(outputType->SetUINT32(MF_MT_MPEG2_PROFILE, mediaProfile(config.codec, config.tenBit)));
         setVideoFormat(outputType.get(), config);
         checkType(transform_->SetOutputType(0, outputType.get(), 0), L"encoder output type");
 
@@ -198,7 +208,7 @@ VideoEncoder::VideoEncoder(ID3D11Device* device, LUID adapter, const EncoderConf
             winrt::com_ptr<IMFMediaType> candidate;
             if (FAILED(transform_->GetInputAvailableType(0, i, candidate.put()))) break;
             GUID subtype{};
-            if (SUCCEEDED(candidate->GetGUID(MF_MT_SUBTYPE, &subtype)) && subtype == MFVideoFormat_NV12) {
+            if (SUCCEEDED(candidate->GetGUID(MF_MT_SUBTYPE, &subtype)) && subtype == inputSubtype) {
                 inputType = candidate;
                 break;
             }
@@ -206,7 +216,7 @@ VideoEncoder::VideoEncoder(ID3D11Device* device, LUID adapter, const EncoderConf
         if (!inputType) {
             winrt::check_hresult(MFCreateMediaType(inputType.put()));
             winrt::check_hresult(inputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
-            winrt::check_hresult(inputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12));
+            winrt::check_hresult(inputType->SetGUID(MF_MT_SUBTYPE, inputSubtype));
         }
         setVideoFormat(inputType.get(), config);
         checkType(transform_->SetInputType(0, inputType.get(), 0), L"encoder input type");

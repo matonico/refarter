@@ -43,10 +43,13 @@ int main() {
     check(plan.action == AfterCompression::CopyFile && plan.file == small && plan.note.empty(), "copies the compressed file");
     check(!follow.pending(), "finished disarms");
 
-    // Already under the limit: the trimmed clip itself is copied.
+    // Already under the limit: the trimmed clip itself is copied, under the compressed name the job gave it.
+    follow.arm(trimmed);
+    plan = follow.finish(trimmed, exported(L"d:\\clips\\20mb_game trim.mp4", L"", false, true));
+    check(plan.action == AfterCompression::CopyFile && plan.file == small, "already fits copies the renamed trim");
     follow.arm(trimmed);
     plan = follow.finish(trimmed, exported(L"", L"", false, true));
-    check(plan.action == AfterCompression::CopyFile && plan.file == trimmed, "already fits copies the trimmed clip");
+    check(plan.action == AfterCompression::CopyFile && plan.file == trimmed, "a failed rename copies the trim by its own name");
 
     // Replace uses a separate trim until compression succeeds; the original is not the export input.
     follow.arm(trimmed, original, true);

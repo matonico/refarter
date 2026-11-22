@@ -35,6 +35,9 @@ public:
         std::function<void()> stop;                    // Marks the recorder busy and stops it.
         std::function<void(std::wstring)> status;
         std::function<void(const std::wstring&, const std::wstring&)> add; // Puts a game on the list.
+        std::function<std::wstring(const RecordingTarget&)> name; // A game's stored name (App::storedGameName).
+        // A stored name as shown, short and cut (App::displayGameName, shownName).
+        std::function<std::wstring(const std::wstring& path, const std::wstring& stored)> shown;
         std::function<void(const std::wstring&)> decline;                  // "Not this one", remembered.
         std::function<void()> refresh;                 // Controls and window after the detected game changed.
         std::function<void()> hideFlyout;              // The tray flyout, when the hook goes away.
@@ -71,11 +74,13 @@ public:
     void unwatchGameExit();
 
 private:
+    friend struct AutoSessionTestAccess; // The wiring test drives an offer and its re-shown card.
     static void CALLBACK foregroundChanged(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD);
     static void CALLBACK sizeChanged(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD);
     void watchSize(HWND window, DWORD pid);
     void offer(RecordingTarget target);
-    void showCard(const RecordingTarget& target, const std::wstring& label);
+    // Shows the pending offer's card on `where`'s monitor; the name comes from the offer alone.
+    void showCard(const RecordingTarget& where);
     void answerOffer(AutoCaptureCard::Answer answer);
     bool watchGameExit();
     void suppress(const RecordingTarget& target);

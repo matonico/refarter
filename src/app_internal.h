@@ -4,12 +4,20 @@
 
 #include "app.h"
 
+#include <commctrl.h>
+
 #include <algorithm>
+#include <cstddef>
 
 namespace refarter {
 namespace internal {
 using namespace theme;
 using namespace ui;
+
+// Refarter has no common-controls v6 manifest, so its tooltips are version 5, which refuses (TTM_ADDTOOLW returns
+// FALSE) a TOOLINFOW of sizeof(TOOLINFOW): that size includes lpReserved, known only to version 6.
+// TTTOOLINFOW_V2_SIZE in a form every compiler accepts as a constant: everything before lpReserved.
+constexpr UINT toolInfoSize = offsetof(TOOLINFOW, lpReserved);
 
 // Sidebar widths and the gap before page content, in logical pixels.
 constexpr int expandedSidebar = 196, collapsedSidebar = 64, contentGap = 24;
@@ -26,6 +34,7 @@ constexpr UINT notesDue = WM_APP + 13;      // Show this version's release notes
 constexpr UINT updateDownloaded = WM_APP + 14; // The installer download ended (UpdateDownload::take; see app_updates.cpp).
 constexpr UINT updateProgress = WM_APP + 15;   // The installer download reached another whole percent (wParam; lParam: UpdateDownload::current).
 constexpr UINT updateSetupEnded = WM_APP + 16; // The update's setup process ended while Refarter still runs (see App::setupEnded).
+constexpr UINT signInReplayDue = WM_APP + 17;  // A sign-in launch with "start replay" on: start it now (see App::startSignInReplay).
 constexpr wchar_t updatingNote[] = L"refarter is updating · nothing new is saved"; // Setup is about to close Refarter (installing()).
 // The right end of the footer reserves this much (logical px) for the version text; an "update available" text adds its own width.
 constexpr int footerVersionReserve = 220;
@@ -72,6 +81,9 @@ template <size_t N> bool contains(const int (&ids)[N], int id) { return std::fin
 // Geometry of the Recording and Settings pages, in logical pixels.
 constexpr int pageTop = 24;       // Margin kept above and below when scrolling to a control.
 constexpr int headingHeight = 32; // Section title above its card.
+// Every page starts with its title; the library's filter row and the other pages' cards follow it.
+constexpr int pageTitleTop = 20, pageTitleHeight = 40;
+constexpr int recordingMaxWidth = 1040; // Recording: two cards side by side, audio across both.
 // Space a row control takes at the end of its row: its size, the gap
 // before it (number fields: their frame and caption) and the gap after it.
 struct Slot { int width, height, lead, trail; };
@@ -83,6 +95,11 @@ inline Slot rowSlot(int id) {
     case DesktopAudio: case Microphone: return {260, 34, 0, 0};
     // Reset buttons sit 8 after the device menu.
     case DesktopReset: case MicrophoneReset: return {34, 34, 8, 0};
+    // A game's reset arrows sit 8 before the value they reset.
+    case ReplayReset: case ResolutionReset: case FrameRateReset: case QualityReset: case BitrateReset: case CodecReset: return {34, 34, 0, 8};
+    case SettingsFor: return {260, 34, 0, 0}; // As wide as the device menus.
+    case UseDefaults: return {120, 34, 0, 8};
+    case RenameGame: return {34, 34, 8, 0}; // The pencil, 8 after "settings for".
     case Resolution: case FrameRate: case QualityPreset: case VideoCodec: return {150, 34, 0, 0};
     case AutoCaptureSource: return {150, 34, 0, 0};
     case DesktopVolume: case MicrophoneVolume: return {150, 24, meterBoxWidth + meterSliderGap, 12}; // The lead holds the meter.
@@ -95,7 +112,8 @@ inline Slot rowSlot(int id) {
     case StorageBehaviour: return {200, 34, 0, 0};
     case GateOpen: case GateClose: return {40, 23, 60, 28};
     case GateAttack: case GateHold: case GateRelease: return {40, 23, 60, 30};
-    case Suppression: case Gate: case RecordDiscord: case CloseToTray: case StartWithWindows: case StartMinimised: case DiagnosticLogging: case CompressCopyAfterTrim: case AskBeforeBinning: case UpdateCheckSwitch: case GameColours: return {40, 22, 0, 0};
+    case Suppression: case Gate: case RecordDiscord: case CloseToTray: case StartWithWindows: case StartMinimised: case SignInReplay: case DiagnosticLogging: case CompressCopyAfterTrim: case AskBeforeBinning: case UpdateCheckSwitch: case ShortGameNames: case GameColours: case AutoCaptureStart: case AutoCaptureOffers: return {40, 22, 0, 0};
+    case AssignHotkey: case AssignScreenshot: return {170, 34, 0, 0}; // Fits "ctrl + shift + f10".
     case ShowNotes: return {100, 34, 0, 8};       // "changelog", left of the update button.
     case UpdateCheckNow: return {160, 34, 0, 16}; // Left of the switch, 16 px away.
     case ThirtySeconds: case OneMinute: case ThreeMinutes: case FiveMinutes: return {54, 34, 4, 0};
@@ -103,6 +121,15 @@ inline Slot rowSlot(int id) {
     default: return {140, 34, 0, 0};
     }
 }
+// Recording's title line ends at the cards' right edge with "use defaults" (only while the chosen game has its own
+// values) and the "settings for" menu; the title stops titleControlsGap before them.
+constexpr int titleControlsGap = 16;
+inline int titleControlsWidth(bool useDefaults, bool rename) {
+    const auto defaults = rowSlot(UseDefaults), pencil = rowSlot(RenameGame);
+    return rowSlot(SettingsFor).width + (useDefaults ? defaults.lead + defaults.width + defaults.trail : 0) +
+           (rename ? pencil.lead + pencil.width + pencil.trail : 0);
+}
+inline int titleControlsTop() { return pageTitleTop + (pageTitleHeight - rowSlot(SettingsFor).height) / 2; } // Centred on the title.
 // The unit shown inside a number field's frame, after the value, and the room it takes.
 struct Unit { const wchar_t* text; int width; };
 inline Unit fieldUnit(int id) {
@@ -115,12 +142,42 @@ inline Unit fieldUnit(int id) {
     default: return {L"", 0};
     }
 }
+// The welcome screen's card: seven rows, at most this wide, centred in the content area. Rows are 52 px when the
+// window allows (the 680 px minimum does) and shrink to 36 (the buttons are 34) on a screen shorter than that; the panel
+// then also moves up into the top margin, so start stays above the footer.
+constexpr int welcomeRowHeight = 52, welcomeMinRowHeight = 36, welcomeRowCount = 7, welcomeMaxWidth = 480;
+// A Recording page control showing a value a game can set, and the reset arrow after it (0 for other controls).
+constexpr int resetOf(int id) {
+    switch (id) {
+    case ThirtySeconds: case OneMinute: case ThreeMinutes: case FiveMinutes: case CustomSeconds: return ReplayReset;
+    case Resolution: return ResolutionReset;
+    case FrameRate: return FrameRateReset;
+    case QualityPreset: return QualityReset;
+    case Bitrate: return BitrateReset;
+    case VideoCodec: return CodecReset;
+    default: return 0;
+    }
+}
+// The control a reset arrow belongs to, where focus goes when the arrow hides.
+constexpr int controlOfReset(int reset) {
+    switch (reset) {
+    case ReplayReset: return CustomSeconds;
+    case ResolutionReset: return Resolution;
+    case FrameRateReset: return FrameRate;
+    case QualityReset: return QualityPreset;
+    case BitrateReset: return Bitrate;
+    case CodecReset: return VideoCodec;
+    default: return 0;
+    }
+}
 constexpr UINT_PTR exportTimer = 2; // Exists only while a compression job is running.
 constexpr UINT_PTR switchTimer = 3; // Exists only while a switch animates.
 constexpr UINT_PTR meterTimer = 4;  // Exists only while a level meter is on screen.
 constexpr UINT_PTR resumeTimer = 5; // One shot after a resume from sleep, while devices settle.
 constexpr UINT_PTR bubbleTimer = 6; // One shot: hides the slider value bubble after the last key.
 constexpr UINT_PTR gateBubbleTimer = 7; // One shot: hides the gate's error bubble a few seconds after it appears.
+constexpr UINT_PTR signInReplayTimer = 8; // One shot: the sign-in replay's single retry, while displays and drivers settle.
+constexpr UINT signInRetryMs = 15'000;
 // The global shortcuts register under their index + 1 (see saveShortcut and screenshotShortcut in app.h).
 static_assert(RawHotkey::count == shortcutCount, "Raw Input must track every global shortcut");
 

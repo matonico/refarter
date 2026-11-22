@@ -4,6 +4,7 @@
 #include "compression_job.h"
 #include "player/clip_export.h"
 #include "player/export_luma.h"
+#include "player/export_plan.h"
 #include <array>
 #include <fstream>
 #include <iostream>
@@ -72,10 +73,23 @@ int main() {
             while (!(result = job.poll()) && GetTickCount64() < deadline) Sleep(1);
             return result;
         };
+        check(job.start(small, false), "a library clip that fits starts");
+        const auto kept = wait();
+        check(kept && kept->alreadyFits && kept->path.empty() && std::filesystem::exists(small),
+            "a library clip that already fits is never renamed");
         check(job.start(small, true), "owned small trim starts");
         const auto skipped = wait();
-        check(skipped && skipped->alreadyFits && std::filesystem::exists(small),
-            "already-fit trim remains the final result, never cleaned up");
+        const auto tagged = player::exportPath(small);
+        check(skipped && skipped->alreadyFits && skipped->path == tagged && skipped->cleanupWarning.empty() &&
+              !std::filesystem::exists(small) && std::filesystem::exists(tagged),
+            "already-fit trim is the final result, renamed as compressed, never cleaned up");
+        const auto compressedTrim = root / L"20mb_private-source-do-not-log trim.mp4";
+        { std::ofstream(compressedTrim) << "small trim of a compressed copy"; }
+        check(job.start(compressedTrim, true), "owned trim of a compressed copy starts");
+        const auto prefixed = wait();
+        check(prefixed && prefixed->alreadyFits && prefixed->path.empty() && prefixed->cleanupWarning.empty() &&
+              std::filesystem::exists(compressedTrim) && !std::filesystem::exists(player::exportPath(compressedTrim)),
+            "a trim of a compressed copy keeps its single prefix");
         check(job.start(invalid, true), "owned invalid trim starts");
         const auto failed = wait();
         check(failed && !failed->error.empty() && std::filesystem::exists(invalid),

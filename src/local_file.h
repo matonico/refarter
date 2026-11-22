@@ -12,8 +12,16 @@
 // Files kept under %LOCALAPPDATA%\Refarter, and the safe way to read and replace the UTF-16 ones.
 namespace refarter {
 
+// Tests only: a folder that stands in for %LOCALAPPDATA%\Refarter, so they never touch the user's own files. Empty
+// (always, in Refarter itself): the real folder is used.
+inline std::filesystem::path& localAppDataOverride() {
+    static std::filesystem::path folder;
+    return folder;
+}
+
 // %LOCALAPPDATA%\Refarter\<name>; empty when the folder cannot be found.
 inline std::filesystem::path localAppDataFile(const wchar_t* name) {
+    if (!localAppDataOverride().empty()) return localAppDataOverride() / name;
     PWSTR local = nullptr;
     std::filesystem::path path;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &local)))

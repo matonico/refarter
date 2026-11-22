@@ -11,6 +11,7 @@
 #include <commctrl.h>
 #include <uxtheme.h>
 #include <algorithm>
+#include <cassert>
 
 namespace refarter {
 namespace {
@@ -22,25 +23,29 @@ std::wstring deviceText(const wchar_t* source, const capture::AudioDevice& devic
 } // namespace
 
 void App::updateReplayInput() {
-    // EDIT can notify while CreateWindowEx is still returning, before registration.
-    if (!control(CustomSeconds)) return;
+    // EDIT can notify while CreateWindowEx is still returning, before registration; syncScopeFields sets it itself.
+    if (!control(CustomSeconds) || syncingFields_) return;
     wchar_t text[16]{};
     GetWindowTextW(control(CustomSeconds), text, static_cast<int>(std::size(text)));
     const auto seconds = parseReplaySeconds(text);
     state_.replayInputValid = seconds.has_value();
-    if (seconds) state_.replaySeconds = *seconds; // Written to the file once the field is left (see saveSettings).
+    // Kept once the field is left: all games in refarter.ini (see saveSettings), a game in its file (commitScopeFields).
+    // A game's invalid text drops what was typed, so leaving it keeps the stored length, not "6" on the way from 60.
+    if (gameScope()) typedSeconds_ = seconds;
+    else if (seconds) state_.replaySeconds = *seconds;
     for (int id = ThirtySeconds; id <= FiveMinutes; ++id) InvalidateRect(control(id), nullptr, FALSE);
     refreshControls();
     refreshPages(); // The length row's note and the video estimate follow.
 }
 
 void App::updateBitrateInput() {
-    if (!control(Bitrate)) return;
+    if (!control(Bitrate) || syncingFields_) return;
     wchar_t text[8]{};
     GetWindowTextW(control(Bitrate), text, static_cast<int>(std::size(text)));
     const auto value = parseNumber(text, capture::minBitrateMbps, capture::maxBitrateMbps);
     bitrateValid_ = value.has_value();
-    if (value) video_.bitrateMbps = *value;
+    if (gameScope()) typedBitrate_ = value; // Stored when the field is left, like the length; invalid text drops it.
+    else if (value) video_.bitrateMbps = *value;
     refreshControls();
     refreshPages();
 }
@@ -119,6 +124,10 @@ void App::createControls() {
         SetWindowSubclass(edit, editProc, 1, reinterpret_cast<DWORD_PTR>(this));
     };
     // Recording and Settings controls are created in row order so Tab follows each page down.
+    // Recording · settings for, on the title line over the page background (left to right: use defaults, then the drop-down)
+    addButton(UseDefaults, L"use defaults", Page::Recording);
+    addButton(SettingsFor, L"settings for · all games", Page::Recording);
+    addButton(RenameGame, L"rename this game", Page::Recording); // Its text is the tooltip and the accessible name.
     // Recording · replay
     addButton(SelectProcess, L"choose source", Page::Recording, ButtonBackdrop::Card);
     addButton(AutoCaptureSource, L"auto-capture", Page::Recording, ButtonBackdrop::Card);
@@ -126,12 +135,19 @@ void App::createControls() {
     addButton(OneMinute, L"1 min", Page::Recording, ButtonBackdrop::Card);
     addButton(ThreeMinutes, L"3 min", Page::Recording, ButtonBackdrop::Card);
     addButton(FiveMinutes, L"5 min", Page::Recording, ButtonBackdrop::Card);
+    // Each reset arrow comes just before its control, shown only while the chosen game sets that value.
+    addButton(ReplayReset, L"reset replay length to all games", Page::Recording, ButtonBackdrop::Card);
     numberField(CustomSeconds, state_.replaySeconds, 4, Page::Recording);
     // Recording · video
+    addButton(ResolutionReset, L"reset resolution to all games", Page::Recording, ButtonBackdrop::Card);
     addButton(Resolution, L"resolution · native", Page::Recording, ButtonBackdrop::Card);
+    addButton(FrameRateReset, L"reset frame rate to all games", Page::Recording, ButtonBackdrop::Card);
     addButton(FrameRate, L"frame rate · 60 fps", Page::Recording, ButtonBackdrop::Card);
+    addButton(QualityReset, L"reset quality to all games", Page::Recording, ButtonBackdrop::Card);
     addButton(QualityPreset, L"quality · balanced", Page::Recording, ButtonBackdrop::Card);
+    addButton(BitrateReset, L"reset bitrate to all games", Page::Recording, ButtonBackdrop::Card);
     numberField(Bitrate, video_.bitrateMbps, 3, Page::Recording);
+    addButton(CodecReset, L"reset codec to all games", Page::Recording, ButtonBackdrop::Card);
     addButton(VideoCodec, L"codec · h.264", Page::Recording, ButtonBackdrop::Card);
     // Recording · audio (the gate fields follow the gate switch, below)
     volume(DesktopVolume, DesktopVolumeLabel, L"desktop recording volume", audio_.levels.desktopPercent, 200, Page::Recording);
@@ -145,9 +161,9 @@ void App::createControls() {
     addButton(Gate, L"noise gate · off", Page::Recording, ButtonBackdrop::Card);
     // Settings · saving, storage, trimming, sound, app
     addButton(ChooseFolder, L"choose folder", Page::Settings, ButtonBackdrop::Card);
-    // The button text is the accessible name, so each says which shortcut it assigns; the paint shows "assign hotkey".
-    addButton(AssignHotkey, L"assign save shortcut", Page::Settings, ButtonBackdrop::Card);
-    addButton(AssignScreenshot, L"assign screenshot shortcut", Page::Settings, ButtonBackdrop::Card);
+    // "<shortcut> · <keys>" for screen readers; the paint shows only the keys (refreshControls sets them).
+    addButton(AssignHotkey, L"save shortcut", Page::Settings, ButtonBackdrop::Card);
+    addButton(AssignScreenshot, L"screenshot shortcut", Page::Settings, ButtonBackdrop::Card);
     addButton(AskBeforeBinning, L"ask before binning · on", Page::Settings, ButtonBackdrop::Card);
     numberField(StorageLimitField, static_cast<int>(state_.maxStorageGb), 5, Page::Settings);
     if (!state_.maxStorageGb) SetWindowTextW(control(StorageLimitField), L""); // Empty: no limit.
@@ -155,9 +171,13 @@ void App::createControls() {
     addButton(CompressCopyAfterTrim, L"compress & copy after trim · off", Page::Settings, ButtonBackdrop::Card);
     addButton(GameColours, L"game colours · on", Page::Settings, ButtonBackdrop::Card);
     volume(ChimeVolume, ChimeVolumeLabel, L"save chime volume", chimes_.percent(), 100, Page::Settings);
+    addButton(AutoCaptureStart, L"start listed games automatically · on", Page::Settings, ButtonBackdrop::Card);
+    addButton(AutoCaptureOffers, L"offer new fullscreen games · on", Page::Settings, ButtonBackdrop::Card);
     addButton(CloseToTray, L"close to tray · off", Page::Settings, ButtonBackdrop::Card);
     addButton(StartWithWindows, L"start with windows · off", Page::Settings, ButtonBackdrop::Card);
     addButton(StartMinimised, L"start minimised · on", Page::Settings, ButtonBackdrop::Card);
+    addButton(SignInReplay, L"start replay · off", Page::Settings, ButtonBackdrop::Card);
+    addButton(ShortGameNames, L"short game names · on", Page::Settings, ButtonBackdrop::Card);
     addButton(DiagnosticLogging, L"diagnostic logging · off", Page::Settings, ButtonBackdrop::Card);
     addButton(ShowNotes, L"changelog", Page::Settings, ButtonBackdrop::Card); // First in the updates row, so first in tab order.
     addButton(UpdateCheckNow, L"check for updates", Page::Settings, ButtonBackdrop::Card);
@@ -186,6 +206,18 @@ void App::createControls() {
     clipGrid_.setGameColours(state_.gameColours);
     shareListedGames(); // Loaded with the settings, before the grid existed.
     if (auto view = player_.create(window_, Player, playerCallbacks())) controls_[Player - firstId] = {view, Page::Library};
+    // The welcome screen (shown only while welcome_). Texts are "<row> · <value>" for screen readers; the button shows the value.
+    // The two "recording starts" buttons show a fixed word and are named with their state (refreshControls).
+    addButton(WelcomeAuto, L"recording starts automatically", Page::Library, ButtonBackdrop::Raised);
+    addButton(WelcomeManual, L"recording starts manually", Page::Library, ButtonBackdrop::Raised);
+    addButton(WelcomeLength, L"replay length", Page::Library, ButtonBackdrop::Raised);
+    addButton(WelcomeShortcut, L"save shortcut", Page::Library, ButtonBackdrop::Raised);
+    addButton(WelcomeFolder, L"clip folder", Page::Library, ButtonBackdrop::Raised);
+    addButton(WelcomeStartup, L"start with windows · off", Page::Library, ButtonBackdrop::Raised);
+    addButton(WelcomeTray, L"close to tray · off", Page::Library, ButtonBackdrop::Raised);
+    addButton(WelcomeUpdates, L"check updates automatically · on", Page::Library, ButtonBackdrop::Raised);
+    addButton(WelcomeSkip, L"skip", Page::Library, ButtonBackdrop::Card); // On the panel.
+    addButton(WelcomeStart, L"start", Page::Library, ButtonBackdrop::Card);
     for (const int slider : sliderIds) updateVolumeLabel(slider);
     // Fields show only their value ("180", "100%"); the row's name is what a screen reader should say.
     nameControls({{control(ClipSearch), L"search clips"}, {control(CustomSeconds), L"custom replay length"},
@@ -194,11 +226,22 @@ void App::createControls() {
         {control(GateOpen), L"noise gate open level"}, {control(GateClose), L"noise gate close level"},
         {control(GateAttack), L"noise gate attack"}, {control(GateHold), L"noise gate hold"},
         {control(GateRelease), L"noise gate release"}});
-    // Collapsed sidebar buttons show icons only; a tooltip gives each its name.
-    tooltips_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+    // A tooltip names the icon-only buttons (collapsed sidebar, library view and folder, resets, also while locked)
+    // and the level meters.
+    // No fade or slide: they draw through WM_PRINT, which would show the system's black frame for a moment.
+    tooltips_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+        WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP | TTS_NOFADE | TTS_NOANIMATE,
         CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, window_, nullptr, GetModuleHandleW(nullptr), nullptr);
-    for (const int id : {SidebarToggle, Library, Recording, Settings, SaveReplay, StartReplay, SortClips, GroupFolders, LargeTiles, SmallTiles, OpenFolder, DesktopReset, MicrophoneReset}) {
-        TOOLINFOW tool{sizeof(tool)};
+    SendMessageW(tooltips_, TTM_SETTIPBKCOLOR, raised, 0);
+    SendMessageW(tooltips_, TTM_SETTIPTEXTCOLOR, ink, 0);
+    // Like the value bubble: small rounded corners and a border-coloured outline drawn by Windows 11. The tooltip's own
+    // frame then takes the surface colour; where DWM cannot round (Windows 10) it is painted in the border colour.
+    const bool rounded = theme::roundWindowCorners(tooltips_, 3); // DWMWCP_ROUNDSMALL
+    if (rounded) theme::setWindowBorderColour(tooltips_, border);
+    SetWindowSubclass(tooltips_, tooltipFrameProc, 1, rounded); // The font and padding come from createFonts (styleTooltips).
+    for (const int id : {SidebarToggle, Library, Recording, Settings, SaveReplay, StartReplay, SortClips, GroupFolders, LargeTiles, SmallTiles, OpenFolder, DesktopReset, MicrophoneReset,
+                         ReplayReset, ResolutionReset, FrameRateReset, QualityReset, BitrateReset, CodecReset, RenameGame}) {
+        TOOLINFOW tool{toolInfoSize};
         tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
         tool.hwnd = window_;
         tool.uId = reinterpret_cast<UINT_PTR>(control(id));
@@ -206,6 +249,117 @@ void App::createControls() {
         SendMessageW(tooltips_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
     }
     updateSidebarToggleText();
+}
+
+// Tooltips look like the app's value bubble: the raised surface, ink text, the small font and padding (colours set in
+// createControls). The font and padding follow the DPI, so createFonts sets them, after createControls.
+void App::styleTooltips() {
+    if (!tooltips_) return;
+    SendMessageW(tooltips_, WM_SETFONT, reinterpret_cast<WPARAM>(fontOf(Font::Small)), FALSE);
+    RECT margin{px(9), px(4), px(9), px(4)}; // The value bubble's padding.
+    SendMessageW(tooltips_, TTM_SETMARGIN, 0, reinterpret_cast<LPARAM>(&margin));
+    SendMessageW(tooltips_, TTM_UPDATE, 0, 0); // A tip already showing takes the new font and margins (DPI change).
+}
+
+// The system draws a black frame round a tooltip. With DWM's outline (`rounded`) it takes the surface colour, otherwise
+// one border-coloured pixel suits the dark surface.
+LRESULT CALLBACK App::tooltipFrameProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR rounded) {
+    if (message == WM_NCPAINT) {
+        RECT frame{};
+        GetWindowRect(window, &frame);
+        OffsetRect(&frame, -frame.left, -frame.top);
+        const HDC dc = GetWindowDC(window);
+        SetDCBrushColor(dc, rounded ? raised : border);
+        FrameRect(dc, &frame, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        ReleaseDC(window, dc);
+        return 0;
+    }
+    if (message == WM_NCDESTROY) RemoveWindowSubclass(window, tooltipFrameProc, 1);
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+
+namespace {
+constexpr UINT_PTR lockedToolId = 0x4C4B; // Tooltip tools: this and the next ones, one per locked row.
+constexpr size_t lockedToolLimit = 0x100; // Keeps the ids below the meters' (0x4D54); a page has far fewer rows.
+}
+
+bool App::isLockedTool(UINT_PTR id) const { return id >= lockedToolId && id < lockedToolId + lockedTools_; }
+
+bool App::lockedTooltipAt(POINT point) const {
+    return std::any_of(lockedToolRects_.begin(), lockedToolRects_.end(),
+                       [&](const RECT& rect) { return PtInRect(&rect, point) != FALSE; });
+}
+
+// A kept replay is cleared, not stopped; the sidebar button says the same.
+const wchar_t* App::lockedToolText() const {
+    return recording_ == capture::RecorderState::Stopped ? L"clear the retained replay to change this setting" :
+        L"stop replay to change this setting";
+}
+
+const wchar_t* App::lockedHeadingNote() const {
+    return recording_ == capture::RecorderState::Stopped ? L"clear the retained replay to unlock" : L"stop replay to unlock";
+}
+
+bool App::recordingControlEnabled(int id, bool editable) const {
+    const bool desktop = audio_.desktop.enabled(), microphone = audio_.microphone.enabled();
+    switch (id) {
+    case AutoCaptureSource: return !closing_; // The list only affects the next time a game comes to the front.
+    case Bitrate: return editable && scopeVideo().quality == capture::Quality::Custom;
+    // Discord can be left out wherever Windows can split it (a chosen output: if Discord plays elsewhere).
+    case RecordDiscord: return editable && desktop && !discordUnavailable_;
+    case DesktopVolume: case DesktopVolumeLabel: return editable && desktop;
+    case Suppression: case Gate: case MicrophoneVolume: case MicrophoneVolumeLabel: return editable && microphone;
+    default:
+        for (const auto& field : gateFields)
+            if (field.id == id) return editable && microphone && audio_.micFilters.noiseGate;
+        return editable;
+    }
+}
+
+bool App::rowLockedByReplay(const Row& row) const {
+    if (recording_ == capture::RecorderState::Off) return false;
+    const bool editableIfOff = !closing_; // Busy passes; stopping replay is still what unlocks the row.
+    return std::any_of(row.ids.begin(), row.ids.end(),
+        [&](int id) { return !recordingControlEnabled(id, false) && recordingControlEnabled(id, editableIfOff); });
+}
+
+void App::updateLockedTooltips() {
+    if (!tooltips_) return;
+    std::vector<RECT> rows;
+    // Fullscreen playback is only on the Library page, so the page check covers it.
+    if (recording_ != capture::RecorderState::Off && state_.page == Page::Recording) {
+        const int left = contentLeft(), scroll = scroll_[static_cast<int>(Page::Recording)], bottom = footerTop();
+        for (const auto& section : pages_[static_cast<size_t>(Page::Recording)]) {
+            for (const auto& row : section.rows) {
+                if (!rowLockedByReplay(row)) continue;
+                const int top = row.y - scroll, end = std::min(row.y + row.height - scroll, bottom);
+                if (end > top && rows.size() < lockedToolLimit)
+                    rows.push_back({px(left + section.x), px(top), px(left + section.x + section.width), px(end)});
+            }
+        }
+    }
+    // Replay off: the rectangles are already empty, so most layouts and scrolls send nothing.
+    if (rows.empty() && !lockedToolsShown_) return;
+    // Tools are added as rows need them and kept; one the control refuses is tried again on the next update.
+    while (lockedTools_ < rows.size()) {
+        TOOLINFOW tool{toolInfoSize};
+        tool.uFlags = 0; // The main window relays once, for meter and locked-row tools alike.
+        tool.hwnd = window_;
+        tool.uId = lockedToolId + lockedTools_;
+        tool.lpszText = LPSTR_TEXTCALLBACKW; // lockedToolText: it depends on whether the replay is kept.
+        if (!SendMessageW(tooltips_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool))) break;
+        ++lockedTools_;
+    }
+    lockedToolsShown_ = false;
+    lockedToolRects_.assign(rows.begin(), rows.begin() + std::min(rows.size(), lockedTools_));
+    for (size_t i = 0; i < lockedTools_; ++i) {
+        TOOLINFOW tool{toolInfoSize};
+        tool.hwnd = window_;
+        tool.uId = lockedToolId + i;
+        if (i < rows.size()) tool.rect = rows[i]; // Unused tools get an empty rectangle and never show.
+        lockedToolsShown_ = lockedToolsShown_ || i < rows.size();
+        SendMessageW(tooltips_, TTM_NEWTOOLRECTW, 0, reinterpret_cast<LPARAM>(&tool));
+    }
 }
 
 // Keyboard focus shows an outline; a click hides it again.
@@ -329,32 +483,40 @@ void App::refreshControls() {
     if (!control(StartReplay)) return;
     const bool off = recording_ == capture::RecorderState::Off;
     const bool editable = off && !busy_ && !closing_;
-    const int settings[] = {SelectProcess, ThirtySeconds, OneMinute, ThreeMinutes, FiveMinutes,
-        CustomSeconds, DesktopAudio, Microphone, DesktopReset, MicrophoneReset, Suppression, Gate, Resolution, FrameRate, QualityPreset, VideoCodec};
-    for (int id : settings) EnableWindow(control(id), editable);
-    const bool custom = video_.quality == capture::Quality::Custom;
-    EnableWindow(control(Bitrate), editable && custom);
-    EnableWindow(control(Suppression), editable && audio_.microphone.enabled());
-    // Discord can be left out wherever Windows can split it (a chosen output: if Discord plays elsewhere).
-    EnableWindow(control(RecordDiscord), editable && audio_.desktop.enabled() && !discordUnavailable_);
-    EnableWindow(control(Gate), editable && audio_.microphone.enabled());
-    EnableWindow(control(DesktopVolume), editable && audio_.desktop.enabled());
-    EnableWindow(control(MicrophoneVolume), editable && audio_.microphone.enabled());
-    EnableWindow(control(DesktopVolumeLabel), editable && audio_.desktop.enabled());
-    EnableWindow(control(MicrophoneVolumeLabel), editable && audio_.microphone.enabled());
-    for (const auto& field : gateFields) EnableWindow(control(field.id), editable && audio_.microphone.enabled() && audio_.micFilters.noiseGate);
+    // The same rules tell which rows replay alone locks (rowLockedByReplay), so tips and headings follow them.
+    const int settings[] = {SelectProcess, AutoCaptureSource, ThirtySeconds, OneMinute, ThreeMinutes, FiveMinutes,
+        CustomSeconds, DesktopAudio, Microphone, DesktopReset, MicrophoneReset, Suppression, Gate, Resolution, FrameRate,
+        QualityPreset, Bitrate, VideoCodec, UseDefaults, ReplayReset, ResolutionReset, FrameRateReset, QualityReset, BitrateReset, CodecReset, RenameGame, RecordDiscord, DesktopVolume, MicrophoneVolume, DesktopVolumeLabel, MicrophoneVolumeLabel};
+    for (int id : settings) EnableWindow(control(id), recordingControlEnabled(id, editable));
+    for (const auto& field : gateFields) EnableWindow(control(field.id), recordingControlEnabled(field.id, editable));
+    // "settings for" locks with the rest of the page; per-game settings that could not be read leave only all games.
+    EnableWindow(control(SettingsFor), editable && gameSettingsReadable_);
+    setTextIfChanged(control(SettingsFor), L"settings for · " + (gameScope() ? shownGameName(settingsFor_, settingsForLabel_) : std::wstring(L"all games")));
+    const auto shown = scopeVideo(); // The rows show the scope the page edits.
+    // What the source would start with decides whether the fields must be valid (see startReplay).
+    const bool fieldsOk = fieldsReady(sourceVideo());
     const bool gateReady = gateInputValid() || !audio_.microphone.enabled() || !audio_.micFilters.noiseGate;
-    EnableWindow(control(StartReplay), !busy_ && !closing_ && (!off ||
-        ((target_.source.window || target_.source.monitor) && state_.replayInputValid && (bitrateValid_ || !custom) && gateReady)));
+    const bool welcoming = welcome_ && !closing_;
+    EnableWindow(control(StartReplay), !welcoming && !busy_ && !closing_ && (!off ||
+        ((target_.source.window || target_.source.monitor) && fieldsOk && gateReady)));
     EnableWindow(control(SaveReplay), !off && !busy_ && !saving_ && !closing_);
-    EnableWindow(control(ChooseFolder), !busy_ && !saving_ && !closing_);
+    const bool folderFree = !busy_ && !saving_ && !closing_;
+    EnableWindow(control(ChooseFolder), folderFree);
+    EnableWindow(control(WelcomeFolder), folderFree);
+    // Start waits for a folder check the screen began, so "automatically" can take over at once (useAutoCapture).
+    EnableWindow(control(WelcomeStart), folderFree);
+    // Unreadable, or another copy's entry: start would not change it (Settings says why).
+    EnableWindow(control(WelcomeStartup), !closing_ && !startupReadFailed_ && !startupOtherCopy_);
     EnableWindow(control(CloseToTray), !closing_);
     EnableWindow(control(StartWithWindows), !closing_);
     EnableWindow(control(StartMinimised), !closing_ && state_.startWithWindows && !startupReadFailed_);
+    EnableWindow(control(SignInReplay), !closing_ && state_.startWithWindows && !startupReadFailed_);
     EnableWindow(control(DiagnosticLogging), !closing_);
     EnableWindow(control(CompressCopyAfterTrim), !closing_);
     EnableWindow(control(GameColours), !closing_);
     setTextIfChanged(control(GameColours), state_.gameColours ? L"game colours · on" : L"game colours · off");
+    EnableWindow(control(ShortGameNames), !closing_);
+    setTextIfChanged(control(ShortGameNames), state_.shortGameNames ? L"short game names · on" : L"short game names · off");
     EnableWindow(control(AskBeforeBinning), !closing_);
     EnableWindow(control(UpdateCheckSwitch), !closing_);
     const auto updateUi = updateView();
@@ -375,8 +537,6 @@ void App::refreshControls() {
     // The sort icon's text is its tooltip and what a screen reader says: the order, and the date filter when one is set.
     setTextIfChanged(control(SortClips), std::wstring(L"sort · ") + clipOrderLabel(clipGrid_.order()) +
         (clipGrid_.filtering() ? std::wstring(L" · ") + clipPeriodNames[static_cast<int>(clipGrid_.period())] : std::wstring{}));
-    // The list can change while recording; it only affects the next time a game comes to the front.
-    EnableWindow(control(AutoCaptureSource), !closing_);
     const auto games = autoCapture_.games.size();
     setTextIfChanged(control(AutoCaptureSource), std::wstring(target_.source.monitor ? L"auto-capture · games only" :
         target_.source.window ? (autoCapture_.find(target_.path) ? L"auto-capture · on" : L"auto-capture · off") :
@@ -385,12 +545,23 @@ void App::refreshControls() {
     EnableWindow(control(ChimeVolume), !closing_); // Not a recording setting: never locked by replay.
     setTextIfChanged(control(CloseToTray), state_.closeToTray ? L"close to tray · on" : L"close to tray · off");
     setTextIfChanged(control(StartMinimised), state_.startMinimised ? L"start minimised · on" : L"start minimised · off");
+    setTextIfChanged(control(SignInReplay), state_.signInReplay ? L"start replay · on" : L"start replay · off");
     setTextIfChanged(control(StartWithWindows), startupReadFailed_ ? L"startup · unavailable" :
         startupOtherCopy_ ? L"startup · other copy" : state_.startWithWindows ? L"start with windows · on" : L"start with windows · off");
     EnableWindow(control(AssignHotkey), !closing_);
     EnableWindow(control(AssignScreenshot), !closing_);
-    setTextIfChanged(control(AssignHotkey), assigning_ && assigningShortcut_ == saveShortcut ? L"press keys…" : L"assign save shortcut");
-    setTextIfChanged(control(AssignScreenshot), assigning_ && assigningShortcut_ == screenshotShortcut ? L"press keys…" : L"assign screenshot shortcut");
+    // The button shows the current keys; while assigning, what is held so far.
+    const auto shortcutKeys = [&](int shortcut) {
+        if (!assigning_ || assigningShortcut_ != shortcut) return describe(hotkeys_[shortcut]);
+        const auto held = heldModifiersText(heldModifiers_);
+        return held.empty() ? std::wstring(L"press a new key") : held;
+    };
+    setTextIfChanged(control(AssignHotkey), L"save shortcut · " + shortcutKeys(saveShortcut));
+    setTextIfChanged(control(AssignScreenshot), L"screenshot shortcut · " + shortcutKeys(screenshotShortcut));
+    EnableWindow(control(AutoCaptureStart), !closing_);
+    EnableWindow(control(AutoCaptureOffers), !closing_);
+    setTextIfChanged(control(AutoCaptureStart), autoCaptureOn_ ? L"start listed games automatically · on" : L"start listed games automatically · off");
+    setTextIfChanged(control(AutoCaptureOffers), autoCapturePrompt_ ? L"offer new fullscreen games · on" : L"offer new fullscreen games · off");
     setTextIfChanged(control(StartReplay), busy_ ? L"please wait…" : off ? L"enable replay" :
         recording_ == capture::RecorderState::Stopped ? L"clear retained replay" : L"stop replay");
     setTextIfChanged(control(SaveReplay), saving_ ? L"saving…" : L"save replay");
@@ -399,10 +570,19 @@ void App::refreshControls() {
     setTextIfChanged(control(Suppression), audio_.micFilters.noiseSuppression ? L"noise suppression · on" : L"noise suppression · off");
     setTextIfChanged(control(Gate), audio_.micFilters.noiseGate ? L"noise gate · on" : L"noise gate · off");
     setTextIfChanged(control(RecordDiscord), audio_.hideDiscord ? L"record discord · off" : L"record discord · on");
-    setTextIfChanged(control(Resolution), std::wstring(L"resolution · ") + resolutionNames[static_cast<int>(video_.resolution)]);
-    setTextIfChanged(control(FrameRate), video_.fps == 60 ? L"frame rate · 60 fps" : L"frame rate · 30 fps");
-    setTextIfChanged(control(QualityPreset), std::wstring(L"quality · ") + qualityNames[static_cast<int>(video_.quality)]);
-    setTextIfChanged(control(VideoCodec), (std::wstring(L"codec · ") + capture::codecName(video_.codec)));
+    setTextIfChanged(control(Resolution), std::wstring(L"resolution · ") + resolutionNames[static_cast<int>(shown.resolution)]);
+    setTextIfChanged(control(FrameRate), shown.fps == 60 ? L"frame rate · 60 fps" : L"frame rate · 30 fps");
+    setTextIfChanged(control(QualityPreset), std::wstring(L"quality · ") + qualityNames[static_cast<int>(shown.quality)]);
+    setTextIfChanged(control(VideoCodec), (std::wstring(L"codec · ") + capture::codecName(shown.codec)));
+    for (const int id : {SidebarToggle, Library, Recording, Settings}) EnableWindow(control(id), !welcoming);
+    setTextIfChanged(control(WelcomeShortcut), L"save shortcut · " + shortcutKeys(saveShortcut)); // As Settings shows it.
+    setTextIfChanged(control(WelcomeFolder), L"clip folder · " + lower(clipFolder_.wstring()));
+    setTextIfChanged(control(WelcomeAuto), welcomeAutomatic_ ? L"recording starts automatically · selected" : L"recording starts automatically");
+    setTextIfChanged(control(WelcomeManual), welcomeAutomatic_ ? L"recording starts manually" : L"recording starts manually · selected");
+    setTextIfChanged(control(WelcomeUpdates), welcomeUpdates_ ? L"check updates automatically · on" : L"check updates automatically · off");
+    setTextIfChanged(control(WelcomeLength), L"replay length · " + formatReplayDuration(welcomeSeconds_));
+    setTextIfChanged(control(WelcomeStartup), welcomeStartup_ ? L"start with windows · on" : L"start with windows · off");
+    setTextIfChanged(control(WelcomeTray), welcomeTray_ ? L"close to tray · on" : L"close to tray · off");
 }
 
 LRESULT CALLBACK App::volumeProc(HWND slider, UINT message, WPARAM wParam, LPARAM lParam,
@@ -490,7 +670,8 @@ LRESULT CALLBACK App::buttonProc(HWND button, UINT message, WPARAM wParam, LPARA
         InvalidateRect(button, nullptr, FALSE);
     } else if (message == WM_SETFOCUS) {
         app->reveal(button);
-    } else if (message == WM_KILLFOCUS && (GetDlgCtrlID(button) == AssignHotkey || GetDlgCtrlID(button) == AssignScreenshot)) {
+    } else if (message == WM_KILLFOCUS && (GetDlgCtrlID(button) == AssignHotkey || GetDlgCtrlID(button) == AssignScreenshot ||
+                                           GetDlgCtrlID(button) == WelcomeShortcut)) {
         app->finishAssigning(std::nullopt); // Clicking elsewhere or switching apps cancels.
     } else if (message == WM_NCDESTROY) {
         RemoveWindowSubclass(button, buttonProc, 1);
@@ -635,7 +816,16 @@ LRESULT CALLBACK App::editProc(HWND edit, UINT message, WPARAM wParam, LPARAM lP
     } else if (message == WM_KILLFOCUS) {
         if (gate) app->hideGateBubble();
         if (volume) app->endVolumeTyping(id); // Applies the value as a slider drag would.
-        else if (id != ClipSearch) app->saveSettings(); // A number field is written to the file when left; typing only validates.
+        else if (id != ClipSearch) {
+            // A game's typed value goes to its own file; the page then shows its notes and reset arrows once.
+            const bool typed = app->typedSeconds_ || app->typedBitrate_;
+            const bool stored = app->commitScopeFields();
+            app->saveSettings(); // A number field is written to the file when left; typing only validates.
+            if (typed && stored) {
+                app->refreshControls();
+                app->refreshPages();
+            }
+        }
     }
     if (app->hoverVolume_ != hover || message == WM_SETFOCUS || message == WM_KILLFOCUS) app->invalidateFieldFrame(edit);
     return result;

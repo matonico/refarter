@@ -47,7 +47,7 @@ int main() {
                 view.out = 60;
                 const float w = width * scale;
                 const auto l = computeLayout(w, 600 * scale, view, clip);
-                const D2D1_RECT_F* all[] = {&l.play, &l.time, &l.track, &l.mute, &l.volume, &l.trim, &l.folder, &l.fullscreen,
+                const D2D1_RECT_F* all[] = {&l.play, &l.time, &l.track, &l.mute, &l.volume, &l.speed, &l.trim, &l.folder, &l.fullscreen,
                                             &l.save, &l.replace, &l.cancel, &l.compress, &l.group};
                 bool sound = true;
                 for (const auto* r : all) sound = sound && sane(*r);
@@ -60,6 +60,11 @@ int main() {
                     check(!overlap(l.compress, l.time), "compress slot clear of the time");
                     check(!overlap(l.mute, l.time) && !overlap(l.volume, l.time) && !overlap(l.mute, l.compress) && !overlap(l.volume, l.compress) &&
                               !overlap(l.volume, l.cancel) && !overlap(l.mute, l.volume), "volume controls clear of time, compress, cancel and each other");
+                    check(!overlap(l.speed, l.time) && !overlap(l.speed, l.group) && !overlap(l.speed, l.track) && !overlap(l.speed, l.mute) &&
+                              !overlap(l.speed, l.compress),
+                          "trim bar speed clear of its neighbours");
+                    if (!empty(l.speed)) check(hitTest(l, view, clip, (l.speed.left + l.speed.right) / 2, (l.speed.top + l.speed.bottom) / 2) == Part::Speed,
+                                               "trim bar speed is hit");
                     if (l.volume.right > l.volume.left) check(hitTest(l, view, clip, (l.volume.left + l.volume.right) / 2, (l.volume.top + l.volume.bottom) / 2) == Part::Volume &&
                         hitTest(l, view, clip, (l.mute.left + l.mute.right) / 2, (l.mute.top + l.mute.bottom) / 2) == Part::Mute, "trim bar volume and mute are hit");
                     check(width < 960 || (l.compress.top >= l.controls.top && l.compress.bottom <= l.controls.bottom), "compress stays on the controls row at a typical width");
@@ -97,24 +102,60 @@ int main() {
         check(l.compress.top >= l.strip.bottom && l.compress.bottom <= l.bar.bottom, "narrow: compress on its own row under the strip");
         check(l.sourceCount == 3 && !overlap(l.group, l.cancel), "narrow: switches remain");
     }
-    {   // Narrower still: the switches have priority; the volume rail goes first, then the mute button, never the switches.
+    {   // Narrower still: the switches have priority; the volume rail goes first, then the speed, then the mute button,
+        // never the switches.
         View view;
         view.editing = true;
         bool railDropped = false;
-        for (int width = 500; width <= 700; ++width) {
-            const auto l = computeLayout(static_cast<float>(width), 600, view, clip);
-            const bool group = !empty(l.group), mute = !empty(l.mute), rail = !empty(l.volume);
-            check(!rail || mute, "the rail is dropped before the mute button");
+        for (int w = 500; w <= 900; ++w) {
+            const auto l = computeLayout(static_cast<float>(w), 600, view, clip);
+            const bool group = !empty(l.group), mute = !empty(l.mute), rail = !empty(l.volume), speed = !empty(l.speed);
+            check(!rail || speed, "the rail is dropped before the speed");
+            check(!speed || mute, "the speed is dropped before the mute button");
+            check(!rail || l.volume.right - l.volume.left >= 40, "the rail is never narrower than 40 px");
             check(!mute || group, "the mute button never stays while the switches are hidden");
-            check(!overlap(l.mute, l.group) && !overlap(l.volume, l.group) && !overlap(l.mute, l.time) && !overlap(l.volume, l.cancel) &&
-                      !overlap(l.mute, l.compress) && !overlap(l.volume, l.compress), "narrow: nothing overlaps");
-            railDropped = railDropped || (group && mute && !rail);
+            const D2D1_RECT_F* row[] = {&l.time, &l.group, &l.speed, &l.mute, &l.volume, &l.compress, &l.cancel};
+            for (const auto* a : row) for (const auto* b : row) check(a == b || !overlap(*a, *b), "narrow: nothing overlaps");
+            railDropped = railDropped || (group && speed && !rail);
         }
-        check(railDropped, "narrow: some width keeps the switches and the mute button without the rail");
+        check(railDropped, "narrow: some width keeps the switches, speed and mute button without the rail");
+    }
+    {   // While the compress box stays in the row, a narrower window never gives the rail more room: for every source kind
+        // and scale, through both label forms.
+        ClipInfo fourSources = clip;
+        fourSources.tracks = {L"desktop", L"microphone", L"discord", L"game"};
+        fourSources.checked = {true, true, false, true};
+        ClipInfo plainSources = clip;
+        plainSources.toggles = false;
+        plainSources.checked = {true, false, false};
+        ClipInfo oneSource = clip;
+        oneSource.tracks = {L"desktop"};
+        oneSource.checked = {true};
+        oneSource.toggles = false;
+        for (const ClipInfo* info : {&clip, &fourSources, &plainSources, &oneSource}) {
+            for (const float scale : {1.f, 1.25f, 1.5f, 2.f}) {
+                View view;
+                view.editing = true;
+                view.scale = scale;
+                float previous = 1e9f;
+                bool full = false, short_ = false, inRow = false;
+                for (int w = 1400; w >= 500; --w) {
+                    const auto l = computeLayout(w * scale, 600 * scale, view, *info);
+                    if (l.compress.bottom <= l.bar.bottom) break; // On its own row under the strip, which frees the row again.
+                    inRow = true;
+                    (l.compressShort ? short_ : full) = true;
+                    const float rail = l.volume.right - l.volume.left;
+                    check(rail <= previous + 0.01f, "the rail only narrows as the window narrows");
+                    previous = rail;
+                }
+                check(inRow && full && short_,"the narrowing loop sees both label forms in the row");
+            }
+        }
     }
     {   // The player's real widths: the window's minimum (1080) and default (1120) client width less the expanded (196) or
         // collapsed (64) sidebar and two 24 px content gaps, and fullscreen. Trimming is one row: play, time, the switches (or
-        // the pill), the mute button and rail, the compress slot (the short label allowed, never its own row) and the buttons.
+        // the pill), the speed, the mute button and rail (which may give way at the minimum), the compress slot (the short
+        // label allowed, never its own row) and the buttons.
         constexpr float minimumWidth = 1080, maxSwitches = 4; // desktop, microphone, discord and a game track (or game output)
         ClipInfo four = clip;
         four.tracks = {L"desktop", L"microphone", L"discord", L"game"};
@@ -143,19 +184,26 @@ int main() {
                     const auto l = computeLayout(width * scale, 700 * scale, view, info);
                     const D2D1_RECT_F& sources = kind < 2 ? l.group : l.track;
                     const float mid = middle(l.controls);
-                    const D2D1_RECT_F* items[] = {&l.play, &l.time, &sources, &l.mute, &l.volume, &l.compress, &l.cancel, &l.replace, &l.save};
+                    const D2D1_RECT_F* items[] = {&l.play, &l.time, &sources, &l.speed, &l.mute, &l.volume, &l.compress, &l.cancel, &l.replace, &l.save};
                     for (const auto* a : items) for (const auto* b : items) check(a == b || !overlap(*a, *b), "real widths: nothing overlaps");
                     for (const auto* r : items) check(sane(*r), "real widths: nothing is inverted");
                     check(std::abs(height(l.controls) - 52 * scale) < 1, "real widths: one row of controls");
                     for (const auto* r : items) check(empty(*r) || std::abs(middle(*r) - mid) < 1, "real widths: everything centred on the controls");
-                    check(!empty(l.mute) && !empty(l.volume), "real widths: mute button and volume rail are shown");
+                    check(!empty(l.mute) && !empty(l.speed), "real widths: speed and mute button are shown");
+                    // At the minimum with the sidebar expanded, four switches or the pill leave the rail no room; three narrow it.
+                    const bool tightest = (kind == 1 || kind == 2) && width == minimumWidth - 196 - 48 && !fullscreen;
+                    check(empty(l.volume) == tightest, "real widths: the rail gives way only for four switches or the pill at the minimum");
+                    check(empty(l.volume) || l.volume.right - l.volume.left >= 40 * scale - 0.01f, "real widths: the rail is at least 40 px");
                     check(!empty(l.compress) && l.compress.top >= l.controls.top && l.compress.bottom <= l.controls.bottom, "real widths: compress in the row");
-                    check(l.mute.left >= sources.right && l.volume.left >= l.mute.right && l.compress.left >= l.volume.right, "real widths: sources, volume, compress in order");
+                    check(l.speed.left >= sources.right && l.mute.left >= l.speed.right && l.compress.left >= std::max(l.mute.right, l.volume.right),
+                          "real widths: sources, speed, volume, compress in order");
+                    check(empty(l.volume) || l.volume.left >= l.mute.right, "real widths: the rail after the mute button");
+                    check(hitTest(l, view, info, (l.speed.left + l.speed.right) / 2, middle(l.speed)) == Part::Speed, "real widths: speed is hit");
                     if (kind == 0) check(l.sourceCount == 3 && !empty(l.group), "real widths: three switches shown");
                     if (kind == 1) check(l.sourceCount == maxSwitches && !empty(l.group), "real widths: four switches shown");
                     if (kind == 2) check(!empty(l.track) && l.sourceCount == 0, "real widths: the pill is shown");
                     if (kind == 3) check(empty(l.group) && empty(l.track), "real widths: a single track has no switches");
-                    check(hitTest(l, view, info, (l.volume.left + l.volume.right) / 2, middle(l.volume)) == Part::Volume &&
+                    check((empty(l.volume) || hitTest(l, view, info, (l.volume.left + l.volume.right) / 2, middle(l.volume)) == Part::Volume) &&
                               hitTest(l, view, info, (l.mute.left + l.mute.right) / 2, middle(l.mute)) == Part::Mute, "real widths: volume and mute are hit");
                     if (kind == 1) check(hitTest(l, view, info, (l.sources[3].left + l.sources[3].right) / 2, middle(l.sources[3])) == Part::Source3, "real widths: the fourth switch is hit");
                     if (kind != 3 && width == minimumWidth - 196 - 48 && !fullscreen) check(l.compressShort, "the minimum window uses the short compress label");

@@ -23,7 +23,9 @@ constexpr int padding = 24, maxTextWidth = 360, minWidth = 320, buttonHeight = 3
 constexpr COLORREF accentPressed = RGB(255, 170, 119); // Held down: slightly lighter than the resting accent, so the press shows.
 // The heading and the message are real static controls; the buttons use the dialog result as their id
 // (IDOK, IDYES, IDNO, IDCANCEL), which is also what UI Automation reports as their automation id.
-constexpr int headingId = 200, messageId = 201, checkId = 202;
+constexpr int headingId = 200, messageId = 201, checkId = 202, fieldId = 204; // 203 is contentBoxBodyId.
+constexpr int fieldHeight = 34, fieldInset = 10; // nameBox's text field: its box, and the edit's inset within it.
+constexpr int fieldFocus = -2; // focus_ while the text field has the keyboard focus (-1 is the checkbox).
 constexpr int checkBox = 16, checkGap = 8, checkToButtons = 16; // The optional checkbox: box size, box-to-label gap, gap to the buttons.
 constexpr int barHeight = 6; // A progress dialog's bar.
 constexpr COLORREF checkOutline = RGB(58, 62, 72);
@@ -103,7 +105,21 @@ public:
         checkValue_ = checked && *checked;
         if (checkLabel_.empty() || !checked) checked_ = nullptr;
     }
+    // A one-line text field under the message (nameBox), with `value` typed in and selected. It has the focus first,
+    // and the first button (`save`) is the default, so Enter in the field saves; Esc and the second button cancel.
+    void addField(const wchar_t* save, std::wstring value, int limit) {
+        buttons_ = {{save ? save : L"save", IDOK}, {L"cancel", IDCANCEL}};
+        cancel_ = result_ = IDCANCEL;
+        primary_ = 0;
+        focus_ = fieldFocus;
+        fieldText_ = std::move(value);
+        fieldLimit_ = limit;
+        hasField_ = true;
+    }
+    bool fieldMade() const { return field_ != nullptr; }
+    const std::wstring& fieldText() const { return fieldText_; }
     ~Dialog() {
+        if (fieldBrush_) DeleteObject(fieldBrush_);
         if (small_) DeleteObject(small_);
         if (body_) DeleteObject(body_);
         if (title_) DeleteObject(title_);
@@ -123,6 +139,7 @@ public:
         if (icon != 0) MessageBeep(icon);
         if (progress_ >= 0) setProgress(0);
         if (handle_) *handle_ = window_;
+        if (field_) SendMessageW(field_, EM_SETSEL, 0, -1);
         while (!done_) {
             MSG message{};
             const BOOL status = GetMessageW(&message, nullptr, 0, 0);
@@ -141,6 +158,10 @@ public:
         const bool userInRefarter = front && GetAncestor(front, GA_ROOTOWNER) == GetAncestor(window_, GA_ROOTOWNER);
         if (handle_) *handle_ = nullptr;
         if (checked_) *checked_ = checkValue_;
+        if (field_) {
+            fieldText_.assign(static_cast<size_t>(GetWindowTextLengthW(field_)) + 1, L'\0');
+            fieldText_.resize(static_cast<size_t>(GetWindowTextW(field_, fieldText_.data(), static_cast<int>(fieldText_.size()))));
+        }
         if (disabled) EnableWindow(root_, TRUE);
         clearDescription();
         DestroyWindow(window_);
@@ -181,7 +202,20 @@ public:
             case progressDone:
                 if (dialog->progress_ >= 0) { dialog->ownerClosed_ = true; dialog->finish(IDOK); }
                 return 0;
+            case WM_CTLCOLOREDIT:
+                if (dialog->field_ && reinterpret_cast<HWND>(lParam) == dialog->field_) {
+                    SetTextColor(reinterpret_cast<HDC>(wParam), ink);
+                    SetBkColor(reinterpret_cast<HDC>(wParam), raised);
+                    return reinterpret_cast<LRESULT>(dialog->fieldBrush_);
+                }
+                break;
             case WM_COMMAND:
+                // The field's outline shows where the focus is; a click in the field moves the focus there.
+                if (LOWORD(wParam) == fieldId && (HIWORD(wParam) == EN_SETFOCUS || HIWORD(wParam) == EN_KILLFOCUS)) {
+                    if (HIWORD(wParam) == EN_SETFOCUS) dialog->focus_ = fieldFocus;
+                    InvalidateRect(window, &dialog->fieldRect_, FALSE);
+                    return 0;
+                }
                 // A button was pressed, with the mouse, Enter/Space, or an accessibility client's invoke.
                 if (HIWORD(wParam) == BN_CLICKED && LOWORD(wParam) == checkId) {
                     dialog->checkValue_ = SendMessageW(dialog->checkWindow_, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -293,6 +327,10 @@ private:
         if (headingHeight) y += headingHeight + px(8);
         textRect_ = {px(padding), y, px(padding) + textWidth, y + textHeight};
         y += textHeight + (textHeight || headingHeight ? px(padding) : 0);
+        if (hasField_) {
+            fieldRect_ = {px(padding), y, px(padding) + textWidth, y + px(fieldHeight)};
+            y += px(fieldHeight) + px(padding);
+        }
         if (progress_ >= 0) {
             barRect_ = {px(padding), y, px(padding) + textWidth, y + px(barHeight)};
             y += px(barHeight) + px(padding);
@@ -353,6 +391,7 @@ private:
         move(contentWindow_ ? contentWindow_ : GetDlgItem(window_, messageId), textRect_, contentWindow_ ? nullptr : body_);
         for (const auto& button : buttons_) move(button.window, button.rect, body_);
         move(checkWindow_, checkRect_, small_);
+        move(field_, fieldEditRect(), body_);
         InvalidateRect(window_, nullptr, FALSE);
     }
 
@@ -406,6 +445,17 @@ private:
                 SendMessageW(checkWindow_, BM_SETCHECK, checkValue_ ? BST_CHECKED : BST_UNCHECKED, 0);
                 SetWindowSubclass(checkWindow_, checkProc, 0, reinterpret_cast<DWORD_PTR>(this));
             }
+        }
+        if (hasField_) {
+            const RECT edit = fieldEditRect();
+            field_ = CreateWindowExW(0, L"EDIT", fieldText_.c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_LEFT,
+                edit.left, edit.top, edit.right - edit.left, edit.bottom - edit.top, window_,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(fieldId)), instance, nullptr);
+            if (field_) {
+                SendMessageW(field_, WM_SETFONT, reinterpret_cast<WPARAM>(body_), FALSE);
+                SendMessageW(field_, EM_LIMITTEXT, static_cast<WPARAM>(fieldLimit_), 0);
+                if (!fieldBrush_) fieldBrush_ = CreateSolidBrush(raised);
+            } else focus_ = primary_;
         }
         // The dialog's default push button (also what Enter would press in a system dialog).
         SendMessageW(window_, DM_SETDEFID, static_cast<WPARAM>(buttons_[primary_].result), 0);
@@ -533,13 +583,25 @@ private:
         if (window_) PostMessageW(window_, WM_NULL, 0, 0); // Wakes the loop when the answer arrived as a sent message.
     }
 
-    // The window holding the keyboard focus: the checkbox (focus_ -1) or a button.
-    HWND focusWindow() const { return focus_ < 0 ? checkWindow_ : buttons_[focus_].window; }
+    // The window holding the keyboard focus: the text field (fieldFocus), the checkbox (-1) or a button.
+    HWND focusWindow() const { return focus_ == fieldFocus ? field_ : focus_ < 0 ? checkWindow_ : buttons_[focus_].window; }
 
-    // Tab order: the checkbox (when there is one), then the buttons.
+    // The field's edit control inside its outlined box, centred on the body font's line.
+    RECT fieldEditRect() const {
+        const int line = px(18);
+        const int top = fieldRect_.top + (fieldRect_.bottom - fieldRect_.top - line) / 2;
+        return {fieldRect_.left + px(fieldInset), top, fieldRect_.right - px(fieldInset), top + line};
+    }
+
+    // Tab order: the text field or the checkbox (a dialog has at most one of them), then the buttons.
     void moveFocus(int step) {
-        const int first = checkWindow_ ? -1 : 0, count = static_cast<int>(buttons_.size()) - first;
-        focus_ = first + (focus_ - first + step + count) % count;
+        std::vector<int> order;
+        if (field_) order.push_back(fieldFocus);
+        else if (checkWindow_) order.push_back(-1);
+        for (int i = 0; i < static_cast<int>(buttons_.size()); ++i) order.push_back(i);
+        const auto at = std::find(order.begin(), order.end(), focus_);
+        const int count = static_cast<int>(order.size()), index = at == order.end() ? 0 : static_cast<int>(at - order.begin());
+        focus_ = order[static_cast<size_t>((index + step + count) % count)];
         keyboard_ = true;
         SetFocus(focusWindow());
         for (const auto& button : buttons_) if (button.window) InvalidateRect(button.window, nullptr, FALSE);
@@ -548,6 +610,24 @@ private:
 
     // Keys are taken in this loop, so the app's own Esc/Enter/Tab routing never sees them.
     bool key(const MSG& message) {
+        // The text field types its own keys (arrows, Home/End, Space, Backspace); only these answer or move the focus.
+        if (field_ && message.hwnd == field_) {
+            if (message.message != WM_KEYDOWN && message.message != WM_SYSKEYDOWN) return false;
+            switch (message.wParam) {
+            case VK_ESCAPE: finish(cancel_); return true;
+            case VK_RETURN: finish(buttons_[primary_].result); return true;
+            case VK_TAB: moveFocus(GetKeyState(VK_SHIFT) < 0 ? -1 : 1); return true;
+            case VK_F4:
+                if (message.message != WM_SYSKEYDOWN) return false;
+                finish(cancel_);
+                return true;
+            case 'A': // The classic edit control has no select-all key. AltGr (Ctrl+Alt) still types its letter.
+                if (GetKeyState(VK_CONTROL) >= 0 || GetKeyState(VK_MENU) < 0) return false;
+                SendMessageW(field_, EM_SETSEL, 0, -1);
+                return true;
+            }
+            return false;
+        }
         // A caller's body scrolls with the wheel wherever the pointer is, and with the scrolling keys.
         if (contentWindow_ && message.message == WM_MOUSEWHEEL && message.hwnd != contentWindow_) {
             SendMessageW(contentWindow_, WM_MOUSEWHEEL, message.wParam, message.lParam);
@@ -567,8 +647,9 @@ private:
             case VK_F4: if (message.message == WM_SYSKEYDOWN) finish(cancel_); break;
             case VK_RETURN: finish(buttons_[focus_ < 0 ? primary_ : focus_].result); break; // Enter on the box presses the default.
             case VK_SPACE:
-                if (focus_ < 0) { keyboard_ = true; SendMessageW(checkWindow_, BM_CLICK, 0, 0); } // Toggles the box.
-                else finish(buttons_[focus_].result);
+                if (focus_ == -1) { keyboard_ = true; SendMessageW(checkWindow_, BM_CLICK, 0, 0); } // Toggles the box.
+                else if (focus_ >= 0) finish(buttons_[focus_].result);
+                else if (field_) SetFocus(field_); // The field's place: keys go back to it.
                 break;
             case VK_TAB: moveFocus(GetKeyState(VK_SHIFT) < 0 ? -1 : 1); break;
             case VK_LEFT: moveFocus(-1); break;
@@ -595,6 +676,7 @@ private:
             done.right = barRect_.left + MulDiv(barRect_.right - barRect_.left, progress_, 100);
             if (done.right - done.left >= px(barHeight)) roundRect(dc, done, radius, accent, accent); // Narrower would not round.
         }
+        if (field_) roundRect(dc, fieldRect_, px(7), raised, GetFocus() == field_ ? accent : border);
         if (!roundedByDwm_) {
             const auto brush = CreateSolidBrush(border);
             FrameRect(dc, &client, brush);
@@ -692,6 +774,12 @@ private:
     bool checkValue_ = false;
     HWND checkWindow_ = nullptr;
     RECT checkRect_{};
+    bool hasField_ = false;  // nameBox: a text field under the message.
+    HWND field_ = nullptr;
+    RECT fieldRect_{};       // Its outlined box; the edit sits inside it (fieldEditRect).
+    std::wstring fieldText_; // The starting text, then what was typed once the dialog has closed.
+    int fieldLimit_ = 0;
+    HBRUSH fieldBrush_ = nullptr;
     std::vector<Button> buttons_;
     RECT headingRect_{}, textRect_{}; // textRect_ also holds a caller's body.
     std::function<HWND(HWND, RECT)> content_; // Makes the body in place of the message (contentBox).
@@ -746,6 +834,16 @@ bool progressBox(HWND owner, const wchar_t* text, const wchar_t* caption, const 
     Dialog dialog(owner, text, caption, cancelLabel, handle);
     dialog.run();
     return dialog.closedByOwner();
+}
+
+bool nameBox(HWND owner, const wchar_t* text, const wchar_t* caption, const wchar_t* save, std::wstring& name, int limit) {
+    if (suppressed > 0) return false; // Nothing opens during a bounded wait: cancelled.
+    Dialog dialog(owner, text, caption, static_cast<UINT>(MB_OKCANCEL));
+    dialog.addField(save, name, limit);
+    // Without its field (the system box stood in, or the edit could not be made) nothing was typed: cancelled.
+    if (dialog.run() != IDOK || !dialog.fieldMade()) return false;
+    name = dialog.fieldText();
+    return true;
 }
 
 void contentBox(HWND owner, const wchar_t* caption, int width, int height,

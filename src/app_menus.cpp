@@ -3,7 +3,9 @@
 #include "codec_choice.h"
 #include "message_box.h"
 #include "notes_view.h"
+#include "path_list.h"
 #include "popup_menu.h"
+#include "replay_duration.h"
 #include "source_names.h"
 #include "text.h"
 #include "window_target.h"
@@ -17,39 +19,62 @@
 
 namespace refarter {
 
-namespace {
 // The source picker's windows, enumerated only while a menu opens: sorted, with a distinct menu label in displayName.
-std::vector<RecordingTarget> runningWindows() {
+std::vector<RecordingTarget> App::runningWindows() const {
     std::vector<RecordingTarget> targets;
     EnumWindows([](HWND window, LPARAM param) -> BOOL {
         if (auto target = windowTarget(window)) reinterpret_cast<std::vector<RecordingTarget>*>(param)->push_back(std::move(*target));
         return TRUE;
     }, reinterpret_cast<LPARAM>(&targets));
     std::stable_sort(targets.begin(), targets.end(), [](const auto& a, const auto& b) { return a.displayName < b.displayName; });
-    std::vector<SourceName> names;
-    for (const auto& target : targets) names.push_back({target.title, target.name});
-    auto labels = sourceLabels(names);
-    for (size_t i = 0; i < targets.size(); ++i) targets[i].displayName = std::move(labels[i]);
+    labelSources(targets);
     return targets;
 }
-} // namespace
 
+void App::labelSources(std::vector<RecordingTarget>& targets) const {
+    std::vector<SourceName> names;
+    // The custom name, else the short name whatever the switch says now: turning it on later must not make two picked
+    // windows alike. (A game renamed after its window was picked is told apart from the next pick on.)
+    for (const auto& target : targets) {
+        const auto* custom = gameNames_.find(target.path);
+        names.push_back({target.title, target.name, custom ? lower(custom->name) : gameName(storedGameName(target), target.path)});
+    }
+    auto labels = sourceLabels(names);
+    for (size_t i = 0; i < targets.size(); ++i) targets[i].displayName = std::move(labels[i]);
+}
+
+// The video menus show and change the scope the page edits: all games, or the chosen game (see setScopeValue).
 void App::chooseResolution() {
     PopupMenu styled;
     const auto menu = styled.root;
+    const auto shown = scopeVideo();
     for (int i = 0; i < static_cast<int>(std::size(resolutionNames)); ++i) styled.append(menu, i + 1, resolutionNames[i],
-        static_cast<int>(video_.resolution) == i ? MFS_CHECKED : MFS_ENABLED);
+        static_cast<int>(shown.resolution) == i ? MFS_CHECKED : MFS_ENABLED);
     RECT rect{}; GetWindowRect(control(Resolution), &rect);
     const auto selected = trackMenu(menu, rect.left, rect.bottom);
-    if (selected && !pickerStale()) video_.resolution = static_cast<capture::Resolution>(selected - 1);
+    if (selected && !pickerStale()) setScopeValue(ResolutionReset, static_cast<int>(selected - 1));
 }
 
 void App::chooseFrameRate() {
     PopupMenu styled;
+    const auto shown = scopeVideo();
     for (const int fps : {30, 60})
-        styled.append(styled.root, fps, std::to_wstring(fps) + L" fps", video_.fps == fps ? MFS_CHECKED : MFS_ENABLED);
+        styled.append(styled.root, fps, std::to_wstring(fps) + L" fps", shown.fps == fps ? MFS_CHECKED : MFS_ENABLED);
     RECT rect{}; GetWindowRect(control(FrameRate), &rect);
-    if (const auto selected = trackMenu(styled.root, rect.left, rect.bottom); selected && !pickerStale()) video_.fps = static_cast<int>(selected);
+    if (const auto selected = trackMenu(styled.root, rect.left, rect.bottom); selected && !pickerStale()) setScopeValue(FrameRateReset, static_cast<int>(selected));
+}
+
+// The welcome screen's replay length: the four presets of the Recording page, applied by start.
+void App::chooseWelcomeLength() {
+    PopupMenu styled;
+    for (const int seconds : {30, 60, 180, 300})
+        styled.append(styled.root, seconds, formatReplayDuration(seconds), welcomeSeconds_ == seconds ? MFS_CHECKED : MFS_ENABLED);
+    RECT rect{}; GetWindowRect(control(WelcomeLength), &rect);
+    const auto selected = trackMenu(styled.root, rect.left, rect.bottom);
+    if (!selected || !welcome_ || closing_) return;
+    welcomeSeconds_ = static_cast<int>(selected);
+    refreshControls();
+    InvalidateRect(control(WelcomeLength), nullptr, FALSE);
 }
 
 bool App::pickerStale() const {
@@ -62,12 +87,13 @@ void App::chooseQuality() {
     const auto menu = styled.root;
     const wchar_t* entries[] = {L"small · lightest files, softer in fast action", L"balanced · good for most games",
         L"high · stays sharp in fast action", L"custom · a fixed bitrate you set"};
+    const auto shown = scopeVideo();
     for (int i = 0; i < 4; ++i) {
-        styled.append(menu, i + 1, entries[i], static_cast<int>(video_.quality) == i ? MFS_CHECKED : MFS_ENABLED);
+        styled.append(menu, i + 1, entries[i], static_cast<int>(shown.quality) == i ? MFS_CHECKED : MFS_ENABLED);
     }
     RECT rect{}; GetWindowRect(control(QualityPreset), &rect);
     if (const auto selected = trackMenu(menu, rect.left, rect.bottom); selected && !pickerStale())
-        video_.quality = static_cast<capture::Quality>(selected - 1);
+        setScopeValue(QualityReset, static_cast<int>(selected - 1));
 }
 
 namespace {
@@ -77,12 +103,12 @@ constexpr CodecText codecTexts[] = {
     {capture::Codec::H264, L"plays everywhere",
      L"every phone, browser, chat app and editor plays it. smooth editing. every supported gpu records it.",
      L"biggest files. fast motion can look blocky at low bitrates."},
-    {capture::Codec::HEVC, L"smaller files, fewer apps play it",
-     L"about a third smaller than h.264. most recent gpus record it.",
-     L"many browsers and chat apps can't play it. windows may need a paid extension."},
+    {capture::Codec::HEVC, L"fewer apps play it",
+     L"about 10% smaller than h.264. most recent gpus record it.",
+     L"a little softer than h.264. many browsers and chat apps can't play it. windows may need a paid extension."},
     {capture::Codec::AV1, L"smallest files",
-     L"about half the size of h.264, and fast motion stays sharp. discord and youtube play it.",
-     L"needs an rtx 40, rx 7000, arc or newer gpu. older iphones and older editors may not play it."},
+     L"about 25% smaller than h.264. discord and youtube play it.",
+     L"a little softer than h.264. needs an rtx 40, rx 7000, arc or newer gpu. older iphones and older editors may not play it."},
 };
 
 // The probe's reason as part of a sentence in the help's markdown: one line (a Windows error message may span several),
@@ -105,6 +131,7 @@ void App::chooseCodec() {
     PopupMenu styled;
     const auto menu = styled.root;
     const auto recommended = recommendedCodec(codecSupport(capture::Codec::AV1), probing_);
+    const auto shown = scopeVideo();
     for (UINT i = 0; i < std::size(codecTexts); ++i) {
         const auto& entry = codecTexts[i];
         const auto state = codecState(entry.codec, codecSupport(entry.codec), probing_);
@@ -120,7 +147,7 @@ void App::chooseCodec() {
         case CodecState::TestFailed: text += L"couldn't record a test clip"; break; // The help says why.
         }
         styled.append(menu, i + 1, std::move(text),
-            (state == CodecState::Records ? MFS_ENABLED : MFS_DISABLED) | (video_.codec == entry.codec ? MFS_CHECKED : 0));
+            (state == CodecState::Records ? MFS_ENABLED : MFS_DISABLED) | (shown.codec == entry.codec ? MFS_CHECKED : 0));
     }
     constexpr UINT Help = 100;
     styled.separator(menu);
@@ -128,7 +155,7 @@ void App::chooseCodec() {
     RECT rect{}; GetWindowRect(control(VideoCodec), &rect);
     if (const auto selected = trackMenu(menu, rect.left, rect.bottom)) {
         if (selected >= 1 && selected <= std::size(codecTexts)) {
-            if (!pickerStale()) video_.codec = codecTexts[selected - 1].codec;
+            if (!pickerStale()) setScopeValue(CodecReset, static_cast<int>(codecTexts[selected - 1].codec));
         } else if (selected == Help) {
             showCodecHelp();
         }
@@ -137,24 +164,51 @@ void App::chooseCodec() {
 
 void App::showCodecHelp() {
     if (closing_ || dialogOpen()) return;
+    const auto blocks = notes::parse(codecHelpMarkdown());
+
+    // Other dialogs wait while it is open, but a save still runs (as with what's new).
+    infoOpen_ = true;
+    NotesView view;
+    // Up to 800 px tall (the dialog keeps within the screen), then shrunk to the text so nothing scrolls.
+    contentBox(window_, L"which codec should i pick?", 520, 800, [&](HWND parent, RECT area) {
+        const HWND body = view.create(parent, contentBoxBodyId, L"which codec should i pick?");
+        if (!body) return body;
+        view.setBackground(surface);
+        if (!view.setStyle(GetDpiForWindow(parent))) { // Without fonts the body would be blank: the dialog shows plain text.
+            DestroyWindow(body);
+            return static_cast<HWND>(nullptr);
+        }
+        view.setNotes(blocks);
+        SetWindowPos(body, nullptr, area.left, area.top, area.right - area.left, area.bottom - area.top, SWP_NOZORDER | SWP_SHOWWINDOW);
+        return body;
+    }, [&] { return view.contentHeight(); }, L"got it", notes::plainText(blocks));
+    infoOpen_ = false;
+    resumeHeldDialogs(); // A save under the dialog may have queued an error or the storage question.
+}
+
+std::wstring App::codecHelpMarkdown() const {
     const auto recommended = recommendedCodec(codecSupport(capture::Codec::AV1), probing_);
     // Each codec's rate at the current quality, frame rate and encoded size; nothing while no source gives a size. Custom
-    // quality is one fixed rate for every codec, so it is said once instead.
-    const auto output = encodedSize();
+    // quality is one fixed rate for every codec, so it is said once instead. The values are the page's scope: all
+    // games, or the chosen game's effective ones.
+    const auto video = scopeRecordVideo(); // A game's refused codec as the h.264 it records.
+    const auto basis = scopeSize(); // The chosen game's window, or the screen until that game has been the source.
+    const auto output = encodedSize(video, basis.size);
     const bool rates = output.width > 0 && output.height > 0;
-    const bool custom = video_.quality == capture::Quality::Custom;
+    const bool custom = video.quality == capture::Quality::Custom;
     std::wstring markdown;
     if (rates) {
         // An invalid custom field holds no rate yet: quoting the last valid one would contradict it.
         if (custom && bitrateValid_) {
-            const auto rate = codecRate(video_, video_.codec, output);
+            const auto rate = codecRate(video, video.codec, output);
             markdown += L"at custom quality every codec records at " + std::to_wstring(rate.averageMbps) + L" mbps (about " +
-                std::to_wstring(rate.mbPerMinute) + L" mb of video a minute), so hevc and av1 make sharper clips at that size, "
+                std::to_wstring(rate.mbPerMinute) + L" mb of video a minute), so av1 makes sharper clips at that size, "
                 L"not smaller ones.\n\n";
         } else if (!custom) {
             const auto size = std::to_wstring(output.width) + L"×" + std::to_wstring(output.height);
-            markdown += L"sizes are for your settings: " + std::wstring(qualityNames[static_cast<int>(video_.quality)]) +
-                L" quality, " + size + L", " + std::to_wstring(video_.fps) + L" fps.\n\n";
+            markdown += L"sizes are for your settings: " + std::wstring(qualityNames[static_cast<int>(video.quality)]) +
+                L" quality, " + size + (basis.guessed ? L" (your screen, until " + reasonText(shownGameName(settingsFor_, settingsForLabel_)) + L" is chosen as a source)" : L"") +
+                L", " + std::to_wstring(video.fps) + L" fps.\n\n";
         }
     }
     for (const auto& entry : codecTexts) {
@@ -163,7 +217,7 @@ void App::showCodecHelp() {
         markdown += L"- **good:** " + std::wstring(entry.good) + L"\n";
         markdown += L"- **watch out:** " + std::wstring(entry.watchOut) + L"\n";
         if (rates && !custom) {
-            const auto rate = codecRate(video_, entry.codec, output);
+            const auto rate = codecRate(video, entry.codec, output);
             markdown += L"- **size:** about " + std::to_wstring(rate.averageMbps) + L" mbps, up to " +
                 std::to_wstring(rate.peakMbps) + L" in fast motion (about " + std::to_wstring(rate.mbPerMinute) +
                 L" mb of video a minute)\n";
@@ -189,26 +243,7 @@ void App::showCodecHelp() {
         if (!local.empty()) markdown += L"- **on this pc:** " + local + L"\n";
         markdown += L"\n";
     }
-    const auto blocks = notes::parse(markdown);
-
-    // Other dialogs wait while it is open, but a save still runs (as with what's new).
-    infoOpen_ = true;
-    NotesView view;
-    // Up to 800 px tall (the dialog keeps within the screen), then shrunk to the text so nothing scrolls.
-    contentBox(window_, L"which codec should i pick?", 520, 800, [&](HWND parent, RECT area) {
-        const HWND body = view.create(parent, contentBoxBodyId, L"which codec should i pick?");
-        if (!body) return body;
-        view.setBackground(surface);
-        if (!view.setStyle(GetDpiForWindow(parent))) { // Without fonts the body would be blank: the dialog shows plain text.
-            DestroyWindow(body);
-            return static_cast<HWND>(nullptr);
-        }
-        view.setNotes(blocks);
-        SetWindowPos(body, nullptr, area.left, area.top, area.right - area.left, area.bottom - area.top, SWP_NOZORDER | SWP_SHOWWINDOW);
-        return body;
-    }, [&] { return view.contentHeight(); }, L"got it", notes::plainText(blocks));
-    infoOpen_ = false;
-    resumeHeldDialogs(); // A save under the dialog may have queued an error or the storage question.
+    return markdown;
 }
 
 void App::chooseSource() {
@@ -235,17 +270,36 @@ void App::chooseSource() {
         styled.append(menu, static_cast<UINT>(firstMonitor + i), std::move(name),
                       target_.source.monitor == displays[i] ? MFS_CHECKED : MFS_ENABLED);
     }
+    // Back to automatic mode: clears the chosen source so listed games start replay themselves.
+    const auto automatic = static_cast<UINT>(firstMonitor + displays.size());
+    styled.separator(menu);
+    const bool waiting = !target_.source.window && !target_.source.monitor && autoCaptureOn_ && autoCaptureReadable_;
+    styled.append(menu, automatic, L"auto-capture listed games",
+                  (canUseAutoCapture() ? MFS_ENABLED : MFS_DISABLED) | (waiting ? MFS_CHECKED : 0));
     RECT rect{}; GetWindowRect(control(SelectProcess), &rect);
     const auto selection = trackMenu(menu, rect.left, rect.bottom);
+    if (selection == automatic) return useAutoCapture(); // Rechecks the state itself.
     if (pickerStale()) return;
     if (selection && selection < firstMonitor) {
         target_ = std::move(targets[selection - 1]);
-        sourceMonitor_.clear(); // Games are remembered through the auto-capture list instead.
+        setSourceMonitor({}); // Games are remembered through the auto-capture list instead.
     } else if (selection >= firstMonitor && selection - firstMonitor < displays.size()) {
         target_ = {{nullptr, displays[selection - firstMonitor]}, 0, {}, L"monitor " + std::to_wstring(selection - firstMonitor + 1), L"whole monitor"};
-        sourceMonitor_ = monitorDevice(target_.source.monitor);
+        setSourceMonitor(monitorDevice(target_.source.monitor));
     }
-    if (selection) setStatus(L"source selected · enable replay when ready", true);
+    if (selection) {
+        setStatus(L"source selected · enable replay when ready", true);
+        followSource(); // The page opens on the new source's own settings, if it has them.
+        refreshPages(); // The new status too, even when followSource had nothing to change.
+    }
+}
+
+// A sign-in retry still waiting must not start on a source the user only picked, and Settings' start replay note
+// follows the source (followSource refreshes only when the page's scope moves).
+void App::setSourceMonitor(std::wstring device) {
+    sourceMonitor_ = std::move(device);
+    cancelSignInReplay();
+    refreshPages();
 }
 
 void App::chooseAudioDevice(bool desktop) {
@@ -290,56 +344,110 @@ void App::chooseAudioDevice(bool desktop) {
 }
 
 void App::chooseAutoCapture() {
-    enum { ThisGame = 1, Automatic, Offers, UseAutomatic, FirstGame = 100, FirstRunning = 10'000 };
+    // Just the list: ticked games (click to remove), then ways to add one. The switches live in Settings,
+    // and returning to auto-capture from a monitor is in the source picker.
+    enum { ThisGame = 1, FirstGame = 100, FirstRunning = 10'000 };
     PopupMenu styled;
     const auto menu = styled.root;
     const bool game = target_.source.window && !target_.path.empty();
-    const bool listed = game && autoCapture_.find(target_.path);
     // Copies: an auto-start while the menu is open may change the source.
-    const auto path = target_.path, label = target_.displayName;
+    // The game's stored name, or the whole title it would be added with (not the picker's label and suffixes).
+    const auto path = target_.path, label = storedGameName(target_);
     const auto games = autoCapture_.games;
-    std::vector<RecordingTarget> running;
     const UINT editable = autoCaptureReadable_ ? MFS_ENABLED : MFS_DISABLED;
-    if (!autoCaptureReadable_) styled.append(menu, 0, L"the auto-capture list could not be read · nothing is changed", MFS_DISABLED);
-    if (game) styled.append(menu, ThisGame, L"auto-capture " + lower(target_.displayName), editable | (listed ? MFS_CHECKED : 0));
-    else if (target_.source.monitor) {
-        // Listed games name monitor clips (App::saveName); they start replay themselves only after "use auto-capture".
-        // No game window is the source here, so running windows are offered instead, read once as the menu opens.
-        styled.append(menu, 0, L"games on this list also name monitor clips", MFS_DISABLED);
-        running = runningWindows();
-        const auto add = styled.submenu();
-        for (size_t i = 0; i < running.size(); ++i)
-            styled.append(add, static_cast<UINT>(FirstRunning + i), running[i].displayName,
-                          editable | (autoCapture_.find(running[i].path) ? MFS_CHECKED : 0));
-        if (running.empty()) styled.append(add, 0, L"no available game windows · open your game and try again", MFS_DISABLED);
-        styled.append(menu, 0, L"add a running game", MFS_ENABLED, add);
-    }
-    else styled.append(menu, 0, L"choose a game window to add it", MFS_DISABLED);
-    styled.append(menu, UseAutomatic, L"use auto-capture", canUseAutoCapture() ? MFS_ENABLED : MFS_DISABLED);
-    styled.separator(menu);
-    if (games.empty()) styled.append(menu, 0, L"no games on the list yet", MFS_DISABLED);
+    if (!autoCaptureReadable_) styled.append(menu, 0, L"the list could not be read", MFS_DISABLED);
     for (size_t i = 0; i < games.size(); ++i)
-        styled.append(menu, static_cast<UINT>(FirstGame + i), lower(games[i].label) + L" · click to remove",
-                      editable | MFS_CHECKED);
+        styled.append(menu, static_cast<UINT>(FirstGame + i), shownGameName(games[i].path, games[i].label), editable | MFS_CHECKED);
+    if (games.empty()) styled.append(menu, 0, L"no games yet", MFS_DISABLED);
     styled.separator(menu);
-    styled.append(menu, Automatic, L"start listed games automatically", autoCaptureOn_ ? MFS_CHECKED : MFS_ENABLED);
-    styled.append(menu, Offers, L"offer new fullscreen games", autoCapturePrompt_ ? MFS_CHECKED : MFS_ENABLED);
+    if (game && !autoCapture_.find(path)) styled.append(menu, ThisGame, L"+ " + shownName(displayGameName(path, label)), editable);
+    // Running windows, read once as the menu opens; listed ones are ticked and a click removes them.
+    const auto running = runningWindows();
+    const auto add = styled.submenu();
+    for (size_t i = 0; i < running.size(); ++i)
+        styled.append(add, static_cast<UINT>(FirstRunning + i), oneLineLabel(running[i].displayName),
+                      editable | (autoCapture_.find(running[i].path) ? MFS_CHECKED : 0));
+    if (running.empty()) styled.append(add, 0, L"no game windows open", MFS_DISABLED);
+    styled.append(menu, 0, L"+ add running game", MFS_ENABLED, add);
     RECT rect{}; GetWindowRect(control(AutoCaptureSource), &rect);
     const auto selected = trackMenu(menu, rect.left, rect.bottom);
-    if (selected == UseAutomatic) useAutoCapture();
-    else if (selected == ThisGame) setAutoCaptured(path, label, !listed);
+    if (selected == ThisGame) setAutoCaptured(path, label, true);
     else if (selected >= FirstRunning && selected - FirstRunning < running.size()) {
-        // A ticked game is removed, as from the list below; the label is the plain name, without the picker's suffixes.
+        // A ticked game is removed, as from the list below; the label is the title, without the picker's suffixes.
         const auto& window = running[selected - FirstRunning];
-        setAutoCaptured(window.path, friendlySourceName(window.title, window.name), !autoCapture_.find(window.path));
+        setAutoCaptured(window.path, storedGameName(window), !autoCapture_.find(window.path));
     } else if (selected >= FirstGame && selected - FirstGame < games.size()) {
         setAutoCaptured(games[selected - FirstGame].path, {}, false);
-    } else if (selected == Automatic) {
-        autoCaptureOn_ = !autoCaptureOn_;
-        auto_.updateHook();
-    } else if (selected == Offers) {
-        autoCapturePrompt_ = !autoCapturePrompt_;
-        auto_.updateHook();
+    }
+}
+
+namespace {
+// What a game sets itself, in the page's order: " · 1080p · high · 1 min". Its bitrate only while it records at custom
+// quality (`custom`): otherwise the bitrate changes nothing (see ownValuesApply).
+std::wstring ownValues(const GameVideo& own, bool custom) {
+    std::wstring text;
+    if (own.resolution) text += std::wstring(L" · ") + resolutionNames[static_cast<int>(*own.resolution)];
+    if (own.fps) text += L" · " + std::to_wstring(*own.fps) + L" fps";
+    if (own.quality) text += std::wstring(L" · ") + qualityNames[static_cast<int>(*own.quality)];
+    if (own.bitrateMbps && custom) text += L" · " + std::to_wstring(*own.bitrateMbps) + L" mbps";
+    if (own.codec) text += std::wstring(L" · ") + capture::codecName(*own.codec);
+    if (own.replaySeconds) text += L" · " + formatReplayDuration(*own.replaySeconds);
+    return text;
+}
+} // namespace
+
+// "settings for": which game the Recording page edits. Choosing one never changes the source and creates nothing
+// until a value is changed.
+void App::chooseSettingsFor() {
+    enum : UINT { AllGames = 1, FirstOwn = 100, FirstListed = 5'000, FirstRunning = 10'000 };
+    PopupMenu styled;
+    const auto menu = styled.root;
+    const auto chosen = [this](const std::wstring& path) {
+        return gameScope() && samePath(path, settingsFor_) ? MFS_CHECKED : MFS_ENABLED;
+    };
+    // Copies: an auto-start while the menu is open may change the source or the lists.
+    const auto own = gameSettings_.games;
+    std::vector<AutoCaptureGame> listed; // Listed games without their own values, then the source game if it is neither.
+    for (const auto& game : autoCapture_.games)
+        if (!gameSettings_.find(game.path)) listed.push_back(game);
+    if (target_.source.window && !target_.path.empty() && !gameSettings_.find(target_.path) && !autoCapture_.find(target_.path))
+        listed.push_back({target_.path, storedGameName(target_)});
+    const auto running = runningWindows(); // As auto-capture's "add a running game": read once as the menu opens.
+    styled.append(menu, AllGames, L"all games · defaults", gameScope() ? MFS_ENABLED : MFS_CHECKED);
+    if (!own.empty()) {
+        styled.separator(menu);
+        styled.append(menu, 0, L"own settings", MFS_DISABLED);
+        for (size_t i = 0; i < own.size(); ++i)
+            styled.append(menu, static_cast<UINT>(FirstOwn + i), shownGameName(own[i].path, own[i].label) +
+                ownValues(own[i].video, resolveVideo(video_, state_.replaySeconds, &own[i].video).quality == capture::Quality::Custom),
+                chosen(own[i].path));
+    }
+    if (!listed.empty()) {
+        styled.separator(menu);
+        // Listed games and possibly the unlisted source game: "listed" would say the source is auto-captured.
+        styled.append(menu, 0, L"other games · using all games", MFS_DISABLED);
+        for (size_t i = 0; i < listed.size(); ++i)
+            styled.append(menu, static_cast<UINT>(FirstListed + i), shownGameName(listed[i].path, listed[i].label), chosen(listed[i].path));
+    }
+    styled.separator(menu);
+    const auto add = styled.submenu();
+    for (size_t i = 0; i < running.size(); ++i)
+        styled.append(add, static_cast<UINT>(FirstRunning + i), oneLineLabel(running[i].displayName), chosen(running[i].path));
+    if (running.empty()) styled.append(add, 0, L"no available game windows · open your game and try again", MFS_DISABLED);
+    styled.append(menu, 0, L"add a running game", MFS_ENABLED, add);
+    RECT rect{}; GetWindowRect(control(SettingsFor), &rect);
+    const auto selected = trackMenu(menu, rect.left, rect.bottom);
+    if (!selected || pickerStale() || !gameSettingsReadable_) return;
+    if (selected == AllGames) setScope({}, {});
+    else if (selected >= FirstOwn && selected - FirstOwn < own.size()) {
+        const auto& entry = own[selected - FirstOwn];
+        setScope(entry.path, entry.label);
+    } else if (selected >= FirstListed && selected - FirstListed < listed.size())
+        setScope(listed[selected - FirstListed].path, listed[selected - FirstListed].label);
+    else if (selected >= FirstRunning && selected - FirstRunning < running.size()) {
+        // A known game keeps its name; another is named as auto-capture would name it.
+        const auto& window = running[selected - FirstRunning];
+        setScope(window.path, storedGameName(window));
     }
 }
 
@@ -376,6 +484,7 @@ void App::chooseClipOrder() {
 }
 
 UINT App::trackMenu(HMENU menu, int x, int y) {
+    if (answerMenu_) return answerMenu_(menu); // A test chooses; a modal menu would hold it.
     return showPopupMenu(window_, menu, {x, y}, dpi_);
 }
 

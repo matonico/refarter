@@ -6,6 +6,7 @@
 
 #include "clip_timing.h"
 #include "clip_writer.h"
+#include "codec_probe.h"
 #include "frame_converter.h"
 #include "frame_pacer.h"
 #include "frame_rate_budget.h"
@@ -211,6 +212,8 @@ struct Recorder::Pipeline {
     std::unique_ptr<FrameConverter> converter;
     std::unique_ptr<SurfacePool> surfaces;
     std::unique_ptr<VideoEncoder> encoder;
+    bool tenBit = false; // The converter and encoder run 10-bit (see prefersTenBit).
+    std::atomic<bool> tenBitHalted = false; // A resize refused P010; later frames are ignored until teardown.
     std::unique_ptr<GraphicsCapture> capture;
     std::atomic<std::uint64_t> captured = 0, encoded = 0, skipped = 0, dropped = 0;
     FramePacer pacer; // Legacy comparison; both selectors are frame-thread state.
@@ -309,14 +312,27 @@ std::optional<std::wstring> Recorder::start(CaptureSource source, const VideoSet
         // per slot keeps motion even, yet a 240 Hz game recorded at 60 fps costs
         // about 120 copies a second instead of 240.
         p->capture = std::make_unique<GraphicsCapture>(source, p->gpu.device.get(), second * 45 / 100 / settings.fps,
-            [this, p](const CapturedFrame& frame) {
+            [this, p, codec = settings.codec](const CapturedFrame& frame) {
+                if (p->tenBitHalted) return;
                 try {
                     p->onFrame(frame);
                 } catch (const winrt::hresult_error& e) {
                     ++p->dropped;
+                    // A resize the video processor cannot convert to P010 would drop every frame from now on. Stop,
+                    // keeping the replay so far; the next start on this GPU records 8-bit.
+                    if (p->tenBit && p->converter && p->converter->tenBitRefused()) {
+                        p->tenBitHalted = true; // Once: no further conversions, log lines or stops.
+                        refuseTenBit(codec, p->gpu.luid);
+                        diagnosticLog().write(DiagnosticEvent::TenBitFallback, e.code(), static_cast<unsigned>(codec), 10);
+                        stopped(L"this size can't record 10-bit · enable replay again to record 8-bit");
+                        return;
+                    }
                     const auto removed = p->gpu.device->GetDeviceRemovedReason();
                     if (FAILED(removed)) stopped(L"the graphics device was reset (" + describe(winrt::hresult_error(removed)) + L")");
-                    else if (e.code() == E_OUTOFMEMORY) stopped(L"out of video memory");
+                } catch (const std::bad_alloc&) {
+                    // winrt::check_hresult throws E_OUTOFMEMORY as std::bad_alloc, so this is where it arrives.
+                    ++p->dropped;
+                    stopped(L"out of video memory");
                 }
             },
             [this, p, game = source.window != nullptr](HRESULT cause) {
@@ -353,6 +369,7 @@ std::optional<std::wstring> Recorder::start(CaptureSource source, const VideoSet
             if (ready == GraphicsCapture::StartupResult::Closed) return L"the selected game closed before recording could start";
             if (ready == GraphicsCapture::StartupResult::Timeout)
                 return L"the selected game is minimised or not providing frames · return to the game and enable replay again";
+            initialSurface = p->capture->initialSurfaceSize(); // The restored frame's size, which the converter will see.
         }
         p->output = capture::outputSize(settings.resolution, p->capture->size());
         encodedSize = p->output;
@@ -375,19 +392,66 @@ std::optional<std::wstring> Recorder::start(CaptureSource source, const VideoSet
             return L"this quality and replay length need more memory than is safe to reserve; lower one of them";
         }
         p->buffer = std::make_unique<ReplayBuffer>(retainSeconds * second, worstCase * 3 / 2);
-        stage(L"colour converter", 4);
-        p->converter = std::make_unique<FrameConverter>(p->gpu.device.get(), p->gpu.context.get(), p->output, settings.fps);
-        stage(L"encoder surfaces", 5);
-        p->surfaces = std::make_unique<SurfacePool>(*p->converter, surfaceCount);
-        stage(L"video encoder", 6);
-        p->encoder = std::make_unique<VideoEncoder>(p->gpu.device.get(), p->gpu.luid,
-            EncoderConfig{p->output, settings.fps, settings.codec, p->bitrate},
-            [p](PacketPtr packet) {
-                if (p->timing) p->timing->record({TimingKind::Encoded, 0, captureClock(), packet->time, 0, packet->data.size()});
-                ++p->encoded;
-                p->buffer->push(std::move(packet));
-            },
-            [this](HRESULT hr) { stopped(L"the video encoder stopped (" + describe(winrt::hresult_error(hr)) + L")"); });
+        // 10-bit first where the codec prefers it (unless it already failed this run); a converter or encoder that
+        // refuses it gets 8-bit instead.
+        // The write check runs once per GPU and codec, so a writer that refuses 10-bit is found before a save fails.
+        // Its own stage ID (8): 4-7 are taken.
+        bool tryTenBit = prefersTenBit(settings.codec) && !tenBitRefused(settings.codec, p->gpu.luid);
+        bool tenBitFailed = false; // Refused once 8-bit opens below.
+        HRESULT tenBitError = S_OK;
+        unsigned tenBitStage = 0;
+        if (tryTenBit) {
+            stage(L"10-bit check", 8);
+            const auto written = checkTenBitWrites(settings.codec, p->gpu, startupCancel);
+            if (startupCancel && WaitForSingleObject(startupCancel, 0) == WAIT_OBJECT_0) return L"starting replay cancelled";
+            if (!written.writes) {
+                tryTenBit = false;
+                tenBitFailed = written.refusal;
+                tenBitError = written.error;
+                tenBitStage = stageId;
+            }
+        }
+        for (const bool tenBit : {tryTenBit, false}) {
+            try {
+                stage(L"colour converter", 4);
+                p->converter = std::make_unique<FrameConverter>(p->gpu.device.get(), p->gpu.context.get(), p->output, settings.fps, tenBit,
+                                                              initialSurface);
+                stage(L"encoder surfaces", 5);
+                p->surfaces = std::make_unique<SurfacePool>(*p->converter, surfaceCount);
+                stage(L"video encoder", 6);
+                p->encoder = std::make_unique<VideoEncoder>(p->gpu.device.get(), p->gpu.luid,
+                    EncoderConfig{p->output, settings.fps, settings.codec, p->bitrate, tenBit},
+                    [p](PacketPtr packet) {
+                        if (p->timing) p->timing->record({TimingKind::Encoded, 0, captureClock(), packet->time, 0, packet->data.size()});
+                        ++p->encoded;
+                        p->buffer->push(std::move(packet));
+                    },
+                    [this, p, tenBit, codec = settings.codec, gpu = p->gpu.luid](HRESULT hr) {
+                        // A 10-bit encoder that accepted its types but failed before any output (not a lost device,
+                        // exhausted memory or a busy encoder): the next start checks 10-bit again; a second such failure
+                        // refuses it, since 8-bit cannot be tried from here.
+                        if (tenBit && p->encoded == 0 && !notTenBitsFault(hr, p->gpu.device.get()) && tenBitEncoderFailed(codec, gpu))
+                            diagnosticLog().write(DiagnosticEvent::TenBitFallback, hr, static_cast<unsigned>(codec), 9);
+                        stopped(L"the video encoder stopped (" + describe(winrt::hresult_error(hr)) + L")");
+                    });
+                p->tenBit = tenBit;
+                break;
+            } catch (const winrt::hresult_error& e) {
+                // A lost device or exhausted memory is not a 10-bit refusal; report it as it is.
+                if (!tenBit || notTenBitsFault(e.code(), p->gpu.device.get())) throw;
+                tenBitFailed = true;
+                tenBitError = e.code();
+                tenBitStage = stageId;
+                p->surfaces.reset();
+                p->converter.reset();
+            }
+        }
+        if (tenBitFailed) {
+            // Only now that 8-bit opened is it a 10-bit refusal (a busy encoder fails both): later starts on this GPU
+            // skip the 10-bit attempt, as the codec check does. No second check encode, so a first start stays short.
+            refuseTenBit(settings.codec, p->gpu.luid);
+            diagnosticLog().write(DiagnosticEvent::TenBitFallback, tenBitError, static_cast<unsigned>(settings.codec), tenBitStage);
+        }
         {
             std::lock_guard lock(stateMutex_);
             state_ = RecorderState::Buffering;
@@ -676,6 +740,7 @@ std::optional<std::wstring> Recorder::saveClip(const std::filesystem::path& path
         ClipFormat format{pipeline_->output, pipeline_->settings.fps, pipeline_->bitrate.averageKbps, codec,
                           pipeline_->encoder ? pipeline_->encoder->sequenceHeader() : pipeline_->sequenceHeader, now};
         format.preserveCaptureTime = pipeline_->preserveCaptureTime;
+        format.tenBit = pipeline_->tenBit;
         if (auto inBand = annexb::parameterSets(codec, packets.front()->data); !inBand.empty()) format.sequenceHeader = std::move(inBand);
         // Audio for exactly the clip's span, on the shared capture clock. Copied out of the rings here, on the
         // recording worker, so a save queued behind a slow one still has its sound; mixed on the save thread.

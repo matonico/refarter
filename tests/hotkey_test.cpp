@@ -21,8 +21,18 @@ int main() {
     check(checkHotkey({MOD_SHIFT, VK_PAUSE}) == P::None, "shift + pause accepted");
     check(checkHotkey({MOD_ALT, 'R'}) == P::None, "alt + letter accepted");
     check(checkHotkey({MOD_WIN | MOD_SHIFT, '5'}) == P::None, "win + shift + digit accepted");
-    check(checkHotkey({0, 'R'}) == P::NeedsModifier, "bare letter rejected");
-    check(checkHotkey({MOD_SHIFT, 'R'}) == P::NeedsModifier, "shift + letter rejected");
+    check(checkHotkey({0, 'R'}) == P::None && watchedOnly({0, 'R'}), "bare letter accepted, watched only");
+    check(checkHotkey({0, VK_OEM_PLUS}) == P::None && watchedOnly({0, VK_OEM_PLUS}), "bare = accepted, watched only");
+    check(checkHotkey({MOD_SHIFT, 'R'}) == P::None && watchedOnly({MOD_SHIFT, 'R'}), "shift + letter watched only");
+    check(!watchedOnly({MOD_CONTROL, 'R'}) && !watchedOnly({MOD_ALT, VK_OEM_PLUS}) && !watchedOnly({MOD_WIN | MOD_SHIFT, '5'}),
+          "ctrl, alt or win registers");
+    for (const UINT key : {VK_RETURN, VK_TAB, VK_SPACE, VK_ESCAPE, VK_BACK, VK_LEFT, VK_DOWN, VK_HOME, VK_DELETE}) {
+        check(checkHotkey({0, key}) == P::NeedsModifier, "bare navigation key rejected");
+        check(checkHotkey({MOD_SHIFT, key}) == P::NeedsModifier, "shift + navigation key rejected");
+        check(checkHotkey({MOD_CONTROL, key}) == P::None, "ctrl + navigation key accepted");
+    }
+    check(checkHotkey({0, VK_PROCESSKEY}) == P::Invalid && checkHotkey({MOD_CONTROL, VK_PACKET}) == P::Invalid, "ime stand-in keys rejected");
+    check(!watchedOnly({0, VK_F9}) && !watchedOnly({MOD_SHIFT, VK_PAUSE}) && !watchedOnly({0, VK_SCROLL}), "standalone keys register");
     check(checkHotkey({MOD_CONTROL, VK_SHIFT}) == P::ModifierOnly, "modifier-only rejected");
     check(checkHotkey({MOD_CONTROL, VK_LWIN}) == P::ModifierOnly, "win key rejected as final key");
     check(checkHotkey({MOD_CONTROL, VK_F12}) == P::Reserved, "f12 reserved");
@@ -36,12 +46,15 @@ int main() {
     check(parseHotkey(L"ctrl + num plus") == Hotkey{MOD_CONTROL, VK_ADD}, "numpad plus parses");
     check(parseHotkey(L"alt + key 192") == Hotkey{MOD_ALT, VK_OEM_3}, "numeric key parses");
     check(parseHotkey(L"f9") == Hotkey{0, VK_F9}, "bare function key parses");
-    for (const auto invalid : {L"", L"ctrl", L"ctrl + shift", L"r", L"ctrl + r + t", L"ctrl + ", L"ctrl + banana",
+    check(parseHotkey(L"r") == Hotkey{0, 'R'}, "bare letter parses");
+    check(parseHotkey(L"key 187") == Hotkey{0, VK_OEM_PLUS}, "bare punctuation parses");
+    for (const auto invalid : {L"", L"ctrl", L"ctrl + shift", L"shift", L"ctrl + r + t", L"ctrl + ", L"ctrl + banana",
                                L"alt + f4", L"ctrl + f12", L"ctrl + key", L"ctrl + key 9999999", L"ctrl + key 1"}) {
         check(!parseHotkey(invalid), "invalid config value accepted");
     }
     for (const Hotkey hotkey : {defaultHotkey, Hotkey{MOD_ALT | MOD_WIN, 'K'}, Hotkey{MOD_CONTROL, VK_ADD},
-                                Hotkey{MOD_SHIFT, VK_SCROLL}, Hotkey{MOD_ALT, VK_OEM_3}, Hotkey{MOD_CONTROL, VK_NUMPAD7}}) {
+                                Hotkey{MOD_SHIFT, VK_SCROLL}, Hotkey{MOD_ALT, VK_OEM_3}, Hotkey{MOD_CONTROL, VK_NUMPAD7},
+                                Hotkey{0, VK_OEM_PLUS}, Hotkey{MOD_SHIFT, '5'}}) {
         check(parseHotkey(hotkeyText(hotkey)) == hotkey, "config round trip");
     }
     check(hotkeyText(defaultHotkey) == L"ctrl + shift + f10", "default text");

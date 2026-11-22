@@ -17,6 +17,10 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/made%20by-3%20bros-FF914D?style=for-the-badge" alt="Made by 3 bros">
+</p>
+
+<p align="center">
   <a href="https://github.com/matonico/Refarter/releases/latest"><strong>Download for Windows</strong></a> ·
   <a href="#get-started">Get started</a> ·
   <a href="#faq">FAQ</a>

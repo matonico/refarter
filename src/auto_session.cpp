@@ -113,7 +113,7 @@ void AutoSession::onForeground(HWND window) {
     // in case exclusive fullscreen hid it.
     if (plan.reshowCard) {
         offers_.markReshown();
-        showCard(*target, offers_.pending()->label);
+        showCard(*target);
     }
     switch (plan.action) {
     case ForegroundAction::Listed:
@@ -147,8 +147,9 @@ bool AutoSession::detectedAlive() const {
 
 void AutoSession::fillTray(TrayFlyoutModel& model) const {
     const auto ctx = host_.context();
-    model.detected = lower(detected_.displayName);
-    model.autoCapture = ctx.list->find(detected_.path) != nullptr;
+    // Under the name the footer and menus show: its stored name (or title), shown short while that is on.
+    model.detected = host_.shown(detected_.path, host_.name(detected_));
+    model.autoCapture = !detected_.path.empty() && ctx.list->find(detected_.path) != nullptr;
     model.autoCaptureEnabled = ctx.readable;
 }
 
@@ -158,7 +159,7 @@ void AutoSession::tryAutoCapture(RecordingTarget target) {
     const bool suppressed = ctx.autoOn && !wholeMonitor && suppressed_.contains(target.pid);
     const auto decision = decideAutoStart(ctx.autoOn, wholeMonitor, suppressed, replayState(ctx.recording), ctx.busy);
     if (decision == StartDecision::Ignore) return; // Never interrupts a running replay.
-    const auto label = lower(target.displayName);
+    const auto label = host_.shown(target.path, target.displayName);
     if (decision == StartDecision::BlockedByRetained) {
         // Never discard an unsaved replay to start another.
         host_.status(L"save or clear the retained replay to auto-capture " + label);
@@ -174,16 +175,20 @@ void AutoSession::tryAutoCapture(RecordingTarget target) {
     host_.status(L"auto-capture · starting " + label + L"…");
 }
 
-void AutoSession::showCard(const RecordingTarget& target, const std::wstring& label) {
-    card_.show(GetModuleHandleW(nullptr), MonitorFromWindow(target.source.window, MONITOR_DEFAULTTOPRIMARY), label,
-               [this](AutoCaptureCard::Answer answer) { answerOffer(answer); });
+void AutoSession::showCard(const RecordingTarget& where) {
+    const auto* offer = offers_.pending();
+    if (!offer) return;
+    // The card shows the offered game's name as menus do ("add" stores its label itself). A re-shown card appears
+    // where the app now in front is, but still names, adds or declines the offered game.
+    card_.show(GetModuleHandleW(nullptr), MonitorFromWindow(where.source.window, MONITOR_DEFAULTTOPRIMARY),
+               host_.shown(offer->path, offer->label), [this](AutoCaptureCard::Answer answer) { answerOffer(answer); });
 }
 
 void AutoSession::offer(RecordingTarget target) {
     const auto ctx = host_.context();
     // Once per app and session; "not this one" is remembered across sessions.
-    if (!offers_.begin(target.path, lower(target.displayName), target.pid, ctx.prompt, ctx.list->isDeclined(target.path), card_.visible())) return;
-    showCard(target, offers_.pending()->label);
+    if (!offers_.begin(target.path, host_.name(target), target.pid, ctx.prompt, ctx.list->isDeclined(target.path), card_.visible())) return;
+    showCard(target);
 }
 
 void AutoSession::answerOffer(AutoCaptureCard::Answer answer) {

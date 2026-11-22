@@ -23,11 +23,12 @@ struct EncoderConfig {
     int fps = 60;
     Codec codec = Codec::H264;
     Bitrate bitrate{50'000, 50'000, true};
+    bool tenBit = false; // P010 input and a 10-bit profile; the samples must hold P010 textures. Not for H.264.
 };
 
 // Subtype and profile shared by the encoder output and the MP4 writer.
 const GUID& mediaSubtype(Codec codec);
-UINT32 mediaProfile(Codec codec);
+UINT32 mediaProfile(Codec codec, bool tenBit);
 
 // The GPU's hardware video encoder (NVENC, AMF or Quick Sync) through Media
 // Foundation: H.264, HEVC or AV1. Input frames stay in GPU memory. The encoder

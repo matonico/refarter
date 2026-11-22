@@ -40,6 +40,20 @@ std::vector<double> timestamps(const std::filesystem::path& path, int& width, in
     while (auto picture = file.next()) times.push_back(picture.time);
     return times;
 }
+// The export's rule (averageRate in clip_export.cpp): the stream's average rate, rounded.
+int averageFps(const std::filesystem::path& path) {
+    AVFormatContext* input = nullptr;
+    int fps = maxExportFps;
+    if (avformat_open_input(&input, reinterpret_cast<const char*>(path.u8string().c_str()), nullptr, nullptr) == 0 && avformat_find_stream_info(input, nullptr) >= 0) {
+        const int index = av_find_best_stream(input, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        if (index >= 0) {
+            const AVRational rate = input->streams[index]->avg_frame_rate; // Without it the export never drops pictures.
+            if (rate.num > 0 && rate.den > 0) fps = std::max(1, static_cast<int>(std::lround(av_q2d(rate))));
+        }
+    }
+    avformat_close_input(&input);
+    return fps;
+}
 bool noPartial(const std::filesystem::path& folder) {
     for (const auto& file : std::filesystem::directory_iterator(folder)) if (file.path().extension() == L".part") return false;
     return true;
@@ -117,10 +131,11 @@ int wmain(int argc, wchar_t** argv) {
     }
     check(sourceTimes, "every output timestamp belongs to a source picture");
     check(output.size() <= original.size(), "compression never invents extra pictures");
-    if (sw == ow && sh == oh) {
+    // Unless the frame rate is reduced, every export (scaled or native) keeps every source picture.
+    if (!reducesFps(averageFps(source))) {
         bool same = original.size() == output.size();
         for (std::size_t i = 0; same && i < output.size(); ++i) same = std::abs(original[i] - output[i]) < 0.00001;
-        check(same, "native-resolution export preserves every source timestamp");
+        check(same, "export preserves every source timestamp");
     }
     std::cout << "bytes " << size << ", frames " << output.size() << "/" << original.size() << '\n';
     return failures ? 1 : 0;

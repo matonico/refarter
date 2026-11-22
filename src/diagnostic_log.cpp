@@ -23,7 +23,7 @@ constexpr std::array names{
     "compression cancelled", "compression error", "compression stage", "compression libraries",
     "compression time base", "compression source frame rate", "compression system error",
     "compression luma sample", "compression decoded luma", "compression scaled luma", "encoder time repaired",
-    "meter foreground hook failed"
+    "meter foreground hook failed", "game settings used", "ten-bit fallback", "downscaler fallback"
 };
 static_assert(names.size() == static_cast<std::size_t>(DiagnosticEvent::Count));
 struct Entry { SYSTEMTIME time; DiagnosticEvent event; HRESULT result; unsigned first, second; };
@@ -113,6 +113,12 @@ struct DiagnosticLog::State {
                     std::snprintf(detail, sizeof(detail), "stage=%u", entry.first); break;
                 case DiagnosticEvent::StartFailed:
                     std::snprintf(detail, sizeof(detail), "retry_on_foreground=%u", entry.first); break;
+                case DiagnosticEvent::GameSettingsUsed:
+                    std::snprintf(detail, sizeof(detail), "codec_fallback=%u", entry.first); break;
+                case DiagnosticEvent::TenBitFallback:
+                    // Stage: 4-6 the start stage that refused P010, 8 the write check before a start, 9 the encoder failed
+                    // before output, 10 a resize the video processor could not convert to P010, 0 the codec check.
+                    std::snprintf(detail, sizeof(detail), "codec=%u stage=%u", entry.first, entry.second); break;
                 case DiagnosticEvent::EncoderTimeRepaired:
                     std::snprintf(detail, sizeof(detail), "codec=%u stamped=%u", entry.first, entry.second); break;
                 case DiagnosticEvent::CompressionAttempt:
@@ -129,7 +135,7 @@ struct DiagnosticLog::State {
                 case DiagnosticEvent::CompressionColour:
                     std::snprintf(detail, sizeof(detail), "colour_space=%u range=%u", entry.first, entry.second); break;
                 case DiagnosticEvent::CompressionRate:
-                    std::snprintf(detail, sizeof(detail), "bitrate=%u limit_30_fps=%u", entry.first, entry.second); break;
+                    std::snprintf(detail, sizeof(detail), "bitrate=%u fps=%u", entry.first, entry.second); break;
                 case DiagnosticEvent::CompressionDecoder:
                     std::snprintf(detail, sizeof(detail), "hardware=%u codec_id=%u", entry.first, entry.second); break;
                 case DiagnosticEvent::CompressionDecodeDevice:

@@ -139,9 +139,14 @@ void App::revalidateMonitor() {
     // is there under a new handle. The device name is the identity; the handle is only compared against it.
     if (target_.source.window || sourceMonitor_.empty()) return;
     if (target_.source.monitor && monitorDevice(target_.source.monitor) == sourceMonitor_) return;
-    for (const auto monitor : displayMonitors()) {
-        if (monitorDevice(monitor) != sourceMonitor_) continue;
-        target_.source.monitor = monitor;
+    const auto displays = displayMonitors();
+    for (size_t i = 0; i < displays.size(); ++i) {
+        if (monitorDevice(displays[i]) != sourceMonitor_) continue;
+        // Off, the whole target as the picker names it now: a monitor connected only after start-up has no name yet.
+        // A replay kept over sleep keeps the name it was recorded under.
+        if (recording_ == capture::RecorderState::Off)
+            target_ = {{nullptr, displays[i]}, 0, {}, L"monitor " + std::to_wstring(i + 1), L"whole monitor"};
+        else target_.source.monitor = displays[i];
         return;
     }
     target_.source.monitor = nullptr; // Not connected; sourceMonitor_ stays so the choice is remembered.
@@ -169,7 +174,7 @@ void App::finishResume() {
     case ResumeAction::Restart:
         sleepRestart_ = true;
         setStatus(L"restarting replay after sleep…");
-        if (!startReplay()) {
+        if (!startReplay(false)) {
             sleepRestart_ = false;
             setStatus(L"could not restart · start it again");
         }

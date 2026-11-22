@@ -28,12 +28,13 @@ enum class UpdateChoice { Ask, On, Off };
 inline constexpr const wchar_t* updateChoiceNames[] = {L"ask", L"on", L"off"};
 
 // Every choice from the Recording and Settings pages that survives a restart.
-// The save shortcut is stored beside these, in [shortcuts] (see hotkey.h).
+// The shortcuts are stored beside these, in [shortcuts] (see hotkey.h).
 struct UserSettings {
     std::wstring sourceMonitor; // Device name, e.g. \\.\DISPLAY1; empty when a game or nothing was chosen.
     int replaySeconds = 180;
     bool autoCapture = true;        // Listed games start replay when they come to the front.
     bool autoCapturePrompt = true;  // Offer new fullscreen apps for the list (a card that never takes focus).
+    bool shortGameNames = true;     // Games are shown by their short name; stored names never change.
     capture::VideoSettings video;
     capture::AudioDevice desktopAudio{capture::AudioDevice::Mode::SystemDefault};
     capture::AudioDevice microphone;
@@ -55,7 +56,9 @@ struct UserSettings {
     bool closeToTray = false;         // Closing the window hides it in the tray.
     bool startWithWindows = false;    // Parsed and written for the file only; the Run registry key (refreshStartup) is the source, never this value.
     bool startMinimised = true;       // Sign-in starts in the tray; ordinary launches still open the window.
+    bool signInReplay = false;        // Sign-in starts replay on the remembered monitor; ordinary launches never do.
     bool sidebarCollapsed = false;    // The sidebar shows icons only.
+    bool welcomePending = false;      // [window] welcome_pending: a fresh install's welcome screen has not been seen yet.
     bool diagnosticLogging = false;  // Opt-in local session events, never media or personal paths.
     UpdateChoice updateCheck = UpdateChoice::Ask; // [updates] check: the daily release check is opt-in.
     std::wstring availableUpdateTag, availableUpdateUrl; // Last known newer release, retained across restarts.
@@ -133,6 +136,7 @@ inline std::vector<SettingEntry> settingEntries(const UserSettings& s) {
         {L"recording", L"replay_seconds", std::to_wstring(s.replaySeconds)},
         {L"recording", L"auto_capture", flag(s.autoCapture)},
         {L"recording", L"auto_capture_prompt", flag(s.autoCapturePrompt)},
+        {L"recording", L"short_game_names", flag(s.shortGameNames)},
         {L"video", L"resolution", resolutionNames[static_cast<int>(s.video.resolution)]},
         {L"video", L"fps", std::to_wstring(s.video.fps)},
         {L"video", L"quality", qualityNames[static_cast<int>(s.video.quality)]},
@@ -167,7 +171,9 @@ inline std::vector<SettingEntry> settingEntries(const UserSettings& s) {
         {L"window", L"close_to_tray", flag(s.closeToTray)},
         {L"window", L"start_with_windows", flag(s.startWithWindows)},
         {L"window", L"start_minimised", flag(s.startMinimised)},
+        {L"window", L"start_replay", flag(s.signInReplay)},
         {L"window", L"sidebar", s.sidebarCollapsed ? L"collapsed" : L"expanded"},
+        {L"window", L"welcome_pending", flag(s.welcomePending)},
         {L"diagnostics", L"logging", flag(s.diagnosticLogging)},
         {L"updates", L"check", updateChoiceNames[static_cast<int>(s.updateCheck)]},
         {L"updates", L"last_check", std::to_wstring(s.lastUpdateCheck)},
@@ -194,6 +200,7 @@ inline UserSettings readSettings(const std::map<std::wstring, std::wstring>& val
     s.replaySeconds = parseReplaySeconds(get(L"recording/replay_seconds")).value_or(s.replaySeconds);
     s.autoCapture = toggle(L"recording/auto_capture", s.autoCapture);
     s.autoCapturePrompt = toggle(L"recording/auto_capture_prompt", s.autoCapturePrompt);
+    s.shortGameNames = toggle(L"recording/short_game_names", s.shortGameNames);
     s.video.replaySeconds = s.replaySeconds;
     s.video.resolution = static_cast<capture::Resolution>(pick(get(L"video/resolution"), resolutionNames, static_cast<int>(s.video.resolution)));
     // The page offers 30 and 60 fps.
@@ -259,7 +266,9 @@ inline UserSettings readSettings(const std::map<std::wstring, std::wstring>& val
     s.closeToTray = toggle(L"window/close_to_tray", s.closeToTray);
     s.startWithWindows = toggle(L"window/start_with_windows", s.startWithWindows);
     s.startMinimised = toggle(L"window/start_minimised", s.startMinimised);
+    s.signInReplay = toggle(L"window/start_replay", s.signInReplay);
     s.sidebarCollapsed = lower(get(L"window/sidebar")) == L"collapsed";
+    s.welcomePending = toggle(L"window/welcome_pending", false);
     s.diagnosticLogging = toggle(L"diagnostics/logging", false);
     s.updateCheck = static_cast<UpdateChoice>(pick(get(L"updates/check"), updateChoiceNames, static_cast<int>(s.updateCheck)));
     s.lastUpdateCheck = parseUnixSeconds(get(L"updates/last_check"));

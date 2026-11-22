@@ -55,7 +55,9 @@ int main() {
     changed.closeToTray = true;
     changed.startWithWindows = true;
     changed.startMinimised = false;
+    changed.signInReplay = true;
     changed.sidebarCollapsed = true;
+    changed.welcomePending = true;
     changed.diagnosticLogging = true;
     changed.autoCapture = false;
     changed.autoCapturePrompt = false;
@@ -101,7 +103,24 @@ int main() {
     check(defaults.startMinimised && bad.startMinimised, "fresh and old settings start minimised by default");
     check(!readSettings(parseConfig(L"[window]\nstart_minimised = off\n")).startMinimised, "visible sign-in launch is read");
     check(readSettings(parseConfig(L"[window]\nstart_minimised = invalid\n")).startMinimised, "invalid startup visibility keeps the tray default");
+    check(!defaults.signInReplay && !bad.signInReplay, "fresh and old settings never start replay at sign-in");
+    check(readSettings(parseConfig(L"[window]\nstart_replay = on\n")).signInReplay, "sign-in replay is read");
     check(!bad.diagnosticLogging, "old settings leave diagnostic logging off");
+    check(defaults.shortGameNames, "short game names are on by default");
+    check(bad.shortGameNames, "old settings show short game names");
+    {
+        UserSettings whole;
+        whole.shortGameNames = false;
+        check(!roundTrip(whole).shortGameNames, "short game names off round trips");
+        check(roundTrip(UserSettings{}).shortGameNames, "short game names on round trips");
+        check(!readSettings(parseConfig(L"[recording]\nshort_game_names = off\n")).shortGameNames, "off is read as off");
+        check(readSettings(parseConfig(L"[recording]\nshort_game_names = maybe\n")).shortGameNames, "an invalid value keeps the default on");
+        check(readSettings(parseConfig(L"[general]\nshort_game_names = off\n")).shortGameNames, "the key only counts under [recording]");
+        bool written = false;
+        for (const auto& entry : settingEntries(whole))
+            if (std::wstring(entry.section) == L"recording" && std::wstring(entry.key) == L"short_game_names") written = entry.value == L"off";
+        check(written, "the switch is written as [recording] short_game_names");
+    }
     check(bad.askBeforeBinning, "old settings still ask before binning");
     check(!bad.compressCopyAfterTrim, "old settings leave compress & copy off");
     check(bad.gameColours, "old settings show game colours");
